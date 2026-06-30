@@ -19,23 +19,31 @@ const mime = require('mime-types');
 const app = express();
 
 // ============================================================
-//  1. CORS – PRODUCTION SETUP
+//  1. CORS – PRODUCTION SETUP (FIXED!)
 // ============================================================
-// Add your frontend domain(s) here
+// ✅ CORRECTED: Added your actual Netlify URL
 const allowedOrigins = [
-  'https://graceful-marshmallow-d90826.netlify.app/',
-  'https://your-frontend-domain.vercel.app',
-  'http://localhost:3000',
-  'http://localhost:5500', 
+  'https://graceful-marshmallow-d90826.netlify.app', // ✅ Your Netlify frontend
+  'http://localhost:3000', // Local dev (optional)
+  'http://localhost:5500', // VS Code Live Server (optional)
 ];
 
 app.use(cors({
-  origin: '*',
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps or curl)
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      console.warn('Blocked by CORS:', origin);
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
+  optionsSuccessStatus: 200,
 }));
-app.options('*', cors());
 
 // Handle preflight requests explicitly
 app.options('*', cors());
@@ -530,7 +538,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
         tier: tier,
         userId: user.id,
       },
-      callback_url: process.env.FRONTEND_URL ? `${process.env.FRONTEND_URL}/dashboard?success=true` : 'https://your-frontend.com/dashboard?success=true',
+      callback_url: process.env.FRONTEND_URL ? `${process.env.FRONTEND_URL}/dashboard?success=true` : 'https://graceful-marshmallow-d90826.netlify.app/?success=true',
     }),
   });
 
