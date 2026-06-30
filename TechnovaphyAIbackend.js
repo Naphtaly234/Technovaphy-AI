@@ -1,5 +1,5 @@
 // ============================================================
-//  TECHNOVAPHY AI – COMPLETE BACKEND (FINAL DIAGNOSTIC)
+//  TECHNOVAPHY AI – COMPLETE BACKEND (ALL FEATURES)
 // ============================================================
 require('dotenv').config();
 
@@ -25,6 +25,9 @@ app.use(cors({
     optionsSuccessStatus: 200
 }));
 
+// ============================================================
+//  MIDDLEWARE
+// ============================================================
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
@@ -39,41 +42,52 @@ app.use('/api/auth/login', authLimiter);
 app.use('/api/auth/register', authLimiter);
 
 // ============================================================
-//  ENVIRONMENT VARIABLES
+//  ENVIRONMENT VARIABLES – STRICT CHECK
 // ============================================================
+const required = ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'JWT_SECRET', 'GROQ_API_KEY', 'PAYSTACK_SECRET_KEY', 'OPENAI_API_KEY'];
+const missing = required.filter(key => !process.env[key]);
+if (missing.length) {
+    console.error('❌ Missing required environment variables:', missing.join(', '));
+    console.error('   Please set all of them in Render.');
+    process.exit(1);
+}
+
 const PORT = process.env.PORT || 3001;
-const JWT_SECRET = process.env.JWT_SECRET || 'your_secret_key_change_me';
+const JWT_SECRET = process.env.JWT_SECRET;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const FRONTEND_URL = process.env.FRONTEND_URL || 'https://your-netlify-url.netlify.app';
 
-if (!SUPABASE_URL) {
-    console.error('❌ SUPABASE_URL is required');
-    process.exit(1);
-}
-
-// Determine which key to use (prefer service role)
-const USE_KEY = SUPABASE_SERVICE_ROLE_KEY || SUPABASE_ANON_KEY;
-const KEY_TYPE = SUPABASE_SERVICE_ROLE_KEY ? 'Service Role' : 'Anon (limited)';
-
-if (!USE_KEY) {
-    console.error('❌ No Supabase key found. Set SUPABASE_SERVICE_ROLE_KEY or SUPABASE_ANON_KEY');
-    process.exit(1);
-}
-
-console.log(`✅ Using Supabase key type: ${KEY_TYPE}`);
-console.log(`✅ Supabase URL: ${SUPABASE_URL}`);
+console.log(`✅ Using Supabase Service Role Key (length: ${SUPABASE_SERVICE_ROLE_KEY.length})`);
 
 // ============================================================
 //  SUPABASE CLIENT
 // ============================================================
-const supabase = createClient(SUPABASE_URL, USE_KEY);
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 // ============================================================
-//  CONSTANTS & HELPERS (ALL FEATURES)
+//  TEST DATABASE CONNECTION ON STARTUP
+// ============================================================
+(async function initDb() {
+    try {
+        const { error } = await supabase.from('users').select('id').limit(1);
+        if (error) {
+            console.error('❌ Database connection failed:', error.message);
+            console.error('   Make sure table "users" exists in public schema and key is correct.');
+            process.exit(1);
+        }
+        console.log('✅ Database connected successfully.');
+    } catch (e) {
+        console.error('❌ Fatal database error:', e.message);
+        process.exit(1);
+    }
+})();
+
+// ============================================================
+//  CONSTANTS & HELPERS
 // ============================================================
 const TIER_LIMITS = { free: 200, starter: 550, pro: 2500, enterprise: Infinity };
 const TIER_NAMES = {
@@ -84,6 +98,7 @@ const TIER_NAMES = {
 };
 const HOURLY_LIMIT_FREE = 5;
 
+// ---------- User Helpers ----------
 async function findUser(email) {
     const { data, error } = await supabase
         .from('users')
@@ -147,7 +162,30 @@ function getLimit(tier) {
     return TIER_LIMITS[tier] || 200;
 }
 
-// File upload
+// ---------- Conversation Memory ----------
+async function getConversation(userId) {
+    const { data, error } = await supabase
+        .from('conversations')
+        .select('messages')
+        .eq('user_id', userId)
+        .maybeSingle();
+    if (error && error.code !== 'PGRST116') throw error;
+    return data ? data.messages : [];
+}
+
+async function saveConversation(userId, messages) {
+    // Upsert: insert or update
+    const { error } = await supabase
+        .from('conversations')
+        .upsert({
+            user_id: userId,
+            messages: messages,
+            updated_at: new Date().toISOString()
+        }, { onConflict: 'user_id' });
+    if (error) throw new Error('Failed to save conversation: ' + error.message);
+}
+
+// ---------- File Upload ----------
 const storage = multer.memoryStorage();
 const fileFilter = (req, file, cb) => {
     const allowedTypes = [
@@ -228,58 +266,7 @@ app.get('/api/health', (req, res) => res.json({ status: 'ok', message: 'Backend 
 app.get('/api/ping', (req, res) => res.json({ status: 'ok', message: 'Backend is reachable!' }));
 
 // ============================================================
-//  DATABASE TEST – TRY TO FIND THE TABLE
-// ============================================================
-app.get('/api/test-db', async (req, res) => {
-    try {
-        // Try to query from 'public.users'
-        let { count, error } = await supabase
-            .from('users')
-            .select('*', { count: 'exact', head: true });
-
-        if (error) {
-            // If table not found, try 'auth.users'
-            const { count: count2, error: error2 } = await supabase
-                .from('auth.users')
-                .select('*', { count: 'exact', head: true });
-
-            if (error2) {
-                return res.status(500).json({
-                    success: false,
-                    error: error2.message,
-                    key_type: KEY_TYPE,
-                    hint: `Table "users" not found in public or auth schema. Please create it in public schema.`
-                });
-            } else {
-                return res.json({
-                    success: true,
-                    message: `✅ Connected to auth.users (${count2} rows)`,
-                    count: count2,
-                    schema: 'auth',
-                    key_type: KEY_TYPE
-                });
-            }
-        }
-
-        res.json({
-            success: true,
-            message: `✅ Connected to public.users (${count} rows)`,
-            count: count,
-            schema: 'public',
-            key_type: KEY_TYPE
-        });
-    } catch (err) {
-        res.status(500).json({
-            success: false,
-            error: err.message,
-            key_type: KEY_TYPE,
-            hint: `If you are using the anon key, disable RLS on the users table or use the service role key.`
-        });
-    }
-});
-
-// ============================================================
-//  AUTH ROUTES (ALL ORIGINAL)
+//  AUTH ROUTES
 // ============================================================
 app.post('/api/auth/register', async (req, res) => {
     try {
@@ -312,6 +299,10 @@ app.post('/api/auth/register', async (req, res) => {
             .single();
 
         if (error) throw new Error('Database insert: ' + error.message);
+        // Create empty conversation entry for this user
+        await supabase
+            .from('conversations')
+            .insert({ user_id: data.id, messages: [] });
         res.status(201).json({ message: 'User created', userId: data.id });
     } catch (err) {
         console.error('Registration error:', err);
@@ -380,7 +371,7 @@ app.post('/api/auth/update-memory', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CHAT STREAM (FULL)
+//  CHAT STREAM (WITH CONVERSATION MEMORY)
 // ============================================================
 app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) => {
     try {
@@ -414,12 +405,17 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
             }
         }
 
-        let messages;
+        let newMessages;
         try {
-            messages = JSON.parse(req.body.messages);
+            newMessages = JSON.parse(req.body.messages); // array of {role, content}
         } catch (e) {
             return res.status(400).json({ error: 'Invalid messages format' });
         }
+
+        // Load existing conversation history
+        let conversation = await getConversation(user.id);
+        // Append new messages
+        conversation = conversation.concat(newMessages);
 
         const files = req.files || [];
         let fileContent = '';
@@ -429,11 +425,11 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
         }
 
         if (fileContent) {
-            const lastUserMsg = messages[messages.length - 1];
+            const lastUserMsg = conversation[conversation.length - 1];
             if (lastUserMsg && lastUserMsg.role === 'user') {
                 lastUserMsg.content += `\n\n[Uploaded ${files.length} file(s): ${files.map(f => f.originalname).join(', ')}]\n${fileContent}`;
             } else {
-                messages.push({
+                conversation.push({
                     role: 'user',
                     content: `[Uploaded ${files.length} file(s): ${files.map(f => f.originalname).join(', ')}]\n${fileContent}`
                 });
@@ -450,7 +446,7 @@ ${memoryPrompt}`;
 
         const groqMessages = [
             { role: 'system', content: systemPrompt },
-            ...messages.map(m => ({ role: m.role, content: m.content }))
+            ...conversation
         ];
 
         res.setHeader('Content-Type', 'text/event-stream');
@@ -497,6 +493,13 @@ ${memoryPrompt}`;
             }
         }
 
+        // Append assistant reply to conversation
+        conversation.push({ role: 'assistant', content: fullContent });
+
+        // Save updated conversation to database
+        await saveConversation(user.id, conversation);
+
+        // Update usage counters
         const newMonthlyUsage = (user.usage_count || 0) + 1;
         const newHourlyUsage = (user.hourly_quota_used || 0) + 1;
         await supabase
@@ -523,7 +526,7 @@ ${memoryPrompt}`;
 });
 
 // ============================================================
-//  IMAGE GENERATION
+//  IMAGE GENERATION (OpenAI DALL‑E) – REQUIRED
 // ============================================================
 app.post('/api/generate-image', auth, async (req, res) => {
     try {
@@ -556,7 +559,7 @@ app.post('/api/generate-image', auth, async (req, res) => {
 });
 
 // ============================================================
-//  PAYMENT – Paystack Checkout
+//  PAYMENT – Paystack Checkout (REQUIRED)
 // ============================================================
 app.post('/api/create-checkout', auth, async (req, res) => {
     try {
@@ -603,7 +606,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
                     tier: tier,
                     userId: user.id,
                 },
-                callback_url: process.env.FRONTEND_URL || 'https://your-netlify-url.netlify.app/?success=true',
+                callback_url: `${FRONTEND_URL}/?success=true`,
             }),
         });
 
