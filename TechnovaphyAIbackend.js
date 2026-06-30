@@ -1,5 +1,5 @@
 // ============================================================
-//  TECHNOVAPHY AI – COMPLETE BACKEND (FINAL)
+//  TECHNOVAPHY AI – COMPLETE BACKEND (FINAL DIAGNOSTIC)
 // ============================================================
 require('dotenv').config();
 
@@ -15,7 +15,7 @@ const pdfParse = require('pdf-parse');
 const app = express();
 
 // ============================================================
-//  1. CORS
+//  CORS
 // ============================================================
 app.use(cors({
     origin: '*',
@@ -25,9 +25,6 @@ app.use(cors({
     optionsSuccessStatus: 200
 }));
 
-// ============================================================
-//  2. MIDDLEWARE
-// ============================================================
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
@@ -42,7 +39,7 @@ app.use('/api/auth/login', authLimiter);
 app.use('/api/auth/register', authLimiter);
 
 // ============================================================
-//  3. ENVIRONMENT VARIABLES
+//  ENVIRONMENT VARIABLES
 // ============================================================
 const PORT = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET || 'your_secret_key_change_me';
@@ -53,27 +50,30 @@ const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-// Validate required
 if (!SUPABASE_URL) {
     console.error('❌ SUPABASE_URL is required');
     process.exit(1);
 }
-const SUPABASE_KEY = SUPABASE_SERVICE_ROLE_KEY || SUPABASE_ANON_KEY;
-if (!SUPABASE_KEY) {
-    console.error('❌ Either SUPABASE_SERVICE_ROLE_KEY or SUPABASE_ANON_KEY is required');
+
+// Determine which key to use (prefer service role)
+const USE_KEY = SUPABASE_SERVICE_ROLE_KEY || SUPABASE_ANON_KEY;
+const KEY_TYPE = SUPABASE_SERVICE_ROLE_KEY ? 'Service Role' : 'Anon (limited)';
+
+if (!USE_KEY) {
+    console.error('❌ No Supabase key found. Set SUPABASE_SERVICE_ROLE_KEY or SUPABASE_ANON_KEY');
     process.exit(1);
 }
 
-console.log(`✅ Using key type: ${SUPABASE_SERVICE_ROLE_KEY ? 'Service Role' : 'Anon'}`);
+console.log(`✅ Using Supabase key type: ${KEY_TYPE}`);
 console.log(`✅ Supabase URL: ${SUPABASE_URL}`);
 
 // ============================================================
-//  4. SUPABASE CLIENT
+//  SUPABASE CLIENT
 // ============================================================
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+const supabase = createClient(SUPABASE_URL, USE_KEY);
 
 // ============================================================
-//  5. CONSTANTS & HELPERS (ALL FEATURES)
+//  CONSTANTS & HELPERS (ALL FEATURES)
 // ============================================================
 const TIER_LIMITS = { free: 200, starter: 550, pro: 2500, enterprise: Infinity };
 const TIER_NAMES = {
@@ -203,7 +203,7 @@ function generateSuggestions(lastMessage) {
 }
 
 // ============================================================
-//  6. AUTH MIDDLEWARE
+//  AUTH MIDDLEWARE
 // ============================================================
 const auth = async (req, res, next) => {
     const authHeader = req.headers.authorization;
@@ -221,44 +221,65 @@ const auth = async (req, res, next) => {
 };
 
 // ============================================================
-//  7. PUBLIC ENDPOINTS
+//  PUBLIC ENDPOINTS
 // ============================================================
 app.get('/', (req, res) => res.send('TechNovaphy AI Backend is running'));
 app.get('/api/health', (req, res) => res.json({ status: 'ok', message: 'Backend is live!' }));
 app.get('/api/ping', (req, res) => res.json({ status: 'ok', message: 'Backend is reachable!' }));
 
 // ============================================================
-//  8. DATABASE TEST ENDPOINT (NO AUTH)
+//  DATABASE TEST – TRY TO FIND THE TABLE
 // ============================================================
 app.get('/api/test-db', async (req, res) => {
     try {
-        const { count, error } = await supabase
+        // Try to query from 'public.users'
+        let { count, error } = await supabase
             .from('users')
             .select('*', { count: 'exact', head: true });
+
         if (error) {
-            return res.status(500).json({
-                success: false,
-                error: error.message,
-                hint: 'Check that table "users" exists in public schema and your key has permissions.'
-            });
+            // If table not found, try 'auth.users'
+            const { count: count2, error: error2 } = await supabase
+                .from('auth.users')
+                .select('*', { count: 'exact', head: true });
+
+            if (error2) {
+                return res.status(500).json({
+                    success: false,
+                    error: error2.message,
+                    key_type: KEY_TYPE,
+                    hint: `Table "users" not found in public or auth schema. Please create it in public schema.`
+                });
+            } else {
+                return res.json({
+                    success: true,
+                    message: `✅ Connected to auth.users (${count2} rows)`,
+                    count: count2,
+                    schema: 'auth',
+                    key_type: KEY_TYPE
+                });
+            }
         }
+
         res.json({
             success: true,
-            message: `✅ Connected to users table (${count} rows)`,
+            message: `✅ Connected to public.users (${count} rows)`,
             count: count,
-            schema: 'public'
+            schema: 'public',
+            key_type: KEY_TYPE
         });
     } catch (err) {
         res.status(500).json({
             success: false,
             error: err.message,
-            hint: 'Check SUPABASE_URL and key correctness.'
+            key_type: KEY_TYPE,
+            hint: `If you are using the anon key, disable RLS on the users table or use the service role key.`
         });
     }
 });
 
 // ============================================================
-//  9. AUTH ROUTES
+//  AUTH ROUTES (ALL ORIGINAL)
 // ============================================================
 app.post('/api/auth/register', async (req, res) => {
     try {
@@ -359,7 +380,7 @@ app.post('/api/auth/update-memory', auth, async (req, res) => {
 });
 
 // ============================================================
-//  10. CHAT STREAM (all features)
+//  CHAT STREAM (FULL)
 // ============================================================
 app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) => {
     try {
@@ -502,7 +523,7 @@ ${memoryPrompt}`;
 });
 
 // ============================================================
-//  11. IMAGE GENERATION
+//  IMAGE GENERATION
 // ============================================================
 app.post('/api/generate-image', auth, async (req, res) => {
     try {
@@ -535,7 +556,7 @@ app.post('/api/generate-image', auth, async (req, res) => {
 });
 
 // ============================================================
-//  12. PAYMENT – Paystack Checkout
+//  PAYMENT – Paystack Checkout
 // ============================================================
 app.post('/api/create-checkout', auth, async (req, res) => {
     try {
@@ -607,7 +628,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
 });
 
 // ============================================================
-//  13. PAYSTACK WEBHOOK
+//  PAYSTACK WEBHOOK
 // ============================================================
 app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), async (req, res) => {
     try {
@@ -643,6 +664,6 @@ app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), as
 });
 
 // ============================================================
-//  14. START
+//  START
 // ============================================================
 app.listen(PORT, () => console.log(`🚀 TechNovaphy AI Backend running on port ${PORT}`));
