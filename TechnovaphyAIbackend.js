@@ -1,4 +1,6 @@
-
+// ============================================================
+//  TECHNOVAPHY AI – UNBEATABLE BACKEND (CORS FIXED)
+// ============================================================
 require('dotenv').config();
 
 const express = require('express');
@@ -17,14 +19,34 @@ const mime = require('mime-types');
 const app = express();
 
 // ============================================================
-//  1. CORS – PERMISSIVE (fixes "Failed to fetch")
+//  1. CORS – PRODUCTION SETUP
 // ============================================================
+// Add your frontend domain(s) here
+const allowedOrigins = [
+  'https://magical-babka-3c90b3.netlify.app', // 👈 REPLACE with your Netlify URL
+  'https://your-frontend-domain.vercel.app',
+  'http://localhost:3000', // Local dev (optional)
+  'http://localhost:5500', // VS Code Live Server (optional)
+];
+
 app.use(cors({
-  origin: '*',
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps or curl)
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      console.warn('Blocked by CORS:', origin);
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
+  optionsSuccessStatus: 200,
 }));
+
+// Handle preflight requests explicitly
 app.options('*', cors());
 
 // ============================================================
@@ -218,8 +240,12 @@ const auth = async (req, res, next) => {
 };
 
 // ============================================================
-//  7. HEALTH CHECK
+//  7. HEALTH CHECK & ROOT
 // ============================================================
+app.get('/', (req, res) => {
+  res.send('TechNovaphy AI Backend is running');
+});
+
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', message: 'TechNovaphy AI backend is live!' });
 });
@@ -575,4 +601,4 @@ app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), as
 // ============================================================
 //  13. START SERVER
 // ============================================================
-app.listen(PORT, () => console.log(`🚀 TechNovaphy AI –Backend running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 TechNovaphy AI – Unbeatable Backend running on port ${PORT}`));
