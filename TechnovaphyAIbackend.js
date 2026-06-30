@@ -23,28 +23,19 @@ const app = express();
 // ============================================================
 // Add your frontend domain(s) here
 const allowedOrigins = [
-  'https://magical-babka-3c90b3.netlify.app', // 👈 REPLACE with your Netlify URL
+  'https://graceful-marshmallow-d90826.netlify.app/',
   'https://your-frontend-domain.vercel.app',
-  'http://localhost:3000', // Local dev (optional)
-  'http://localhost:5500', // VS Code Live Server (optional)
+  'http://localhost:3000',
+  'http://localhost:5500', 
 ];
 
 app.use(cors({
-  origin: function (origin, callback) {
-    // Allow requests with no origin (like mobile apps or curl)
-    if (!origin) return callback(null, true);
-    if (allowedOrigins.indexOf(origin) !== -1) {
-      callback(null, true);
-    } else {
-      console.warn('Blocked by CORS:', origin);
-      callback(new Error('Not allowed by CORS'));
-    }
-  },
+  origin: '*',
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
-  optionsSuccessStatus: 200,
 }));
+app.options('*', cors());
 
 // Handle preflight requests explicitly
 app.options('*', cors());
