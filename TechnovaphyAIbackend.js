@@ -1,11 +1,11 @@
-// ============================================================
-//  TECHNOVAPHY AI – UNBEATABLE BACKEND
-//  Beats Claude, ChatGPT, and Gemini in features, speed, and price.
-// ============================================================
+
 require('dotenv').config();
 
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const morgan = require('morgan');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcrypt');
 const { v4: uuidv4 } = require('uuid');
@@ -17,21 +17,42 @@ const mime = require('mime-types');
 const app = express();
 
 // ============================================================
-//  CORS – Allow any frontend (can restrict later)
+//  1. SECURITY MIDDLEWARE (Helmet, CORS, Rate Limiting)
 // ============================================================
+
+// Helmet: sets secure HTTP headers
+app.use(helmet());
+
+// Morgan: request logging (optional, but helpful)
+app.use(morgan('combined'));
+
+// CORS: restrict to your frontend domain
+const allowedOrigins = process.env.FRONTEND_URL
+  ? [process.env.FRONTEND_URL]
+  : ['https://your-frontend-domain.com']; // Change this!
 app.use(cors({
-  origin: '*',
+  origin: allowedOrigins,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
 }));
 app.options('*', cors());
 
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// Request size limits
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ limit: '10mb', extended: true }));
+
+// Rate limiting on auth endpoints (prevent brute‑force)
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 10, // 10 attempts per window
+  message: 'Too many login attempts. Please try again later.',
+});
+app.use('/api/auth/login', authLimiter);
+app.use('/api/auth/register', authLimiter);
 
 // ============================================================
-//  ENVIRONMENT VARIABLES
+//  2. ENVIRONMENT VARIABLES
 // ============================================================
 const PORT = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET || 'your_secret_key';
@@ -44,7 +65,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 // ============================================================
-//  CONSTANTS
+//  3. CONSTANTS
 // ============================================================
 const TIER_LIMITS = {
   free: 200,
@@ -60,10 +81,10 @@ const TIER_NAMES = {
   enterprise: 'Enterprise ($120/mo) – Unlimited',
 };
 
-const HOURLY_LIMIT_FREE = 5; // 5 messages per hour for free tier
+const HOURLY_LIMIT_FREE = 5;
 
 // ============================================================
-//  HELPERS
+//  4. HELPERS
 // ============================================================
 async function findUser(email) {
   const { data, error } = await supabase
@@ -128,6 +149,28 @@ function getLimit(tier) {
   return TIER_LIMITS[tier] || 200;
 }
 
+// File upload security: only allow safe types
+const storage = multer.memoryStorage();
+const fileFilter = (req, file, cb) => {
+  const allowedTypes = [
+    'image/jpeg', 'image/png', 'image/webp',
+    'application/pdf',
+    'text/plain', 'text/csv',
+    'application/msword',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+  ];
+  if (allowedTypes.includes(file.mimetype)) {
+    cb(null, true);
+  } else {
+    cb(new Error('Unsupported file type'), false);
+  }
+};
+const upload = multer({
+  storage: storage,
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB
+  fileFilter: fileFilter,
+});
+
 async function extractFileContent(file) {
   const mimeType = file.mimetype;
   const buffer = file.buffer;
@@ -162,7 +205,7 @@ function generateSuggestions(lastMessage) {
 }
 
 // ============================================================
-//  AUTH MIDDLEWARE
+//  5. AUTH MIDDLEWARE
 // ============================================================
 const auth = async (req, res, next) => {
   const authHeader = req.headers.authorization;
@@ -180,14 +223,14 @@ const auth = async (req, res, next) => {
 };
 
 // ============================================================
-//  HEALTH CHECK – for debugging
+//  6. HEALTH CHECK
 // ============================================================
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', message: 'TechNovaphy AI backend is live!' });
 });
 
 // ============================================================
-//  AUTH ROUTES (no email verification)
+//  7. AUTH ROUTES (no email verification)
 // ============================================================
 app.post('/api/auth/register', async (req, res) => {
   const { email, password, ageConfirmed } = req.body;
@@ -212,7 +255,6 @@ app.post('/api/auth/register', async (req, res) => {
     memory: '',
   }).select().single();
   if (error) return res.status(500).json({ error: error.message });
-
   res.status(201).json({ message: 'User created', userId: data.id });
 });
 
@@ -222,7 +264,8 @@ app.post('/api/auth/login', async (req, res) => {
   if (!user) return res.status(401).json({ error: 'Invalid credentials' });
   const valid = await bcrypt.compare(password, user.password_hash);
   if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
-  const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '30d' });
+  // JWT expires in 7 days (more secure than 30 days)
+  const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '7d' });
   res.json({ token, verified: true });
 });
 
@@ -260,14 +303,8 @@ app.post('/api/auth/update-memory', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CHAT WITH GROQ + FILE UPLOADS + HOURLY QUOTA
+//  8. CHAT WITH GROQ + FILE UPLOADS + HOURLY QUOTA
 // ============================================================
-const storage = multer.memoryStorage();
-const upload = multer({
-  storage: storage,
-  limits: { fileSize: 10 * 1024 * 1024 },
-});
-
 app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) => {
   let user = req.user;
   user = await resetMonthlyUsageIfNeeded(user);
@@ -405,7 +442,7 @@ ${memoryPrompt}`;
 });
 
 // ============================================================
-//  IMAGE GENERATION (DALL‑E)
+//  9. IMAGE GENERATION (DALL‑E)
 // ============================================================
 app.post('/api/generate-image', auth, async (req, res) => {
   const { prompt } = req.body;
@@ -436,14 +473,8 @@ app.post('/api/generate-image', auth, async (req, res) => {
 });
 
 // ============================================================
-//  PAYMENT – Paystack Checkout (Idempotent)
+//  10. PAYMENT – Paystack Checkout (Idempotent)
 // ============================================================
-const PAYSTACK_PLANS = {
-  starter: 'PLN_starter_17',
-  pro: 'PLN_pro_34',
-  enterprise: 'PLN_enterprise_120',
-};
-
 app.post('/api/create-checkout', auth, async (req, res) => {
   const { idempotencyKey, tier } = req.body;
   const user = req.user;
@@ -488,7 +519,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
         tier: tier,
         userId: user.id,
       },
-      callback_url: 'https://your-frontend.com/dashboard?success=true',
+      callback_url: process.env.FRONTEND_URL ? `${process.env.FRONTEND_URL}/dashboard?success=true` : 'https://your-frontend.com/dashboard?success=true',
     }),
   });
 
@@ -509,7 +540,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
 });
 
 // ============================================================
-//  PAYSTACK WEBHOOK (to confirm payment and upgrade user)
+//  11. PAYSTACK WEBHOOK
 // ============================================================
 app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), async (req, res) => {
   const signature = req.headers['x-paystack-signature'];
@@ -548,6 +579,6 @@ app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), as
 });
 
 // ============================================================
-//  START SERVER
+//  12. START SERVER
 // ============================================================
-app.listen(PORT, () => console.log(`🚀 TechNovaphy AI –Backend running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 TechNovaphy AI – Backend running on port ${PORT}`));
