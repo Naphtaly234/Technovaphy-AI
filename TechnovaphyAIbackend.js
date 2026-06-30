@@ -1,5 +1,5 @@
 // ============================================================
-//  TECHNOVAPHY AI – COMPLETE BACKEND (ALL FEATURES)
+//  TECHNOVAPHY AI – COMPLETE BACKEND (FIXED)
 // ============================================================
 require('dotenv').config();
 
@@ -55,17 +55,20 @@ if (missing.length) {
 const PORT = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET;
 const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+// ✅ FIX: Use service role key, fallback to anon key if missing (but service role is required)
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 console.log('✅ All required env vars are set');
+console.log(`✅ Supabase URL: ${SUPABASE_URL}`);
+console.log(`✅ Supabase key type: ${process.env.SUPABASE_SERVICE_ROLE_KEY ? 'Service Role' : process.env.SUPABASE_ANON_KEY ? 'Anon' : 'None'}`);
 
 // ============================================================
-//  4. SUPABASE CLIENT
+//  4. SUPABASE CLIENT – USING THE CORRECT KEY
 // ============================================================
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 // ============================================================
 //  5. CONSTANTS
