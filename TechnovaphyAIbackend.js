@@ -1,4 +1,4 @@
-// server.js – Complete backend with Groq + Supabase + Stripe
+// server.js – Complete backend with Groq + Supabase + Stripe + File Upload + Image Gen
 require('dotenv').config();
 
 const express = require('express');
@@ -7,21 +7,26 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcrypt');
 const { v4: uuidv4 } = require('uuid');
 const { createClient } = require('@supabase/supabase-js');
+const multer = require('multer');
+const pdfParse = require('pdf-parse');
+const mime = require('mime-types');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 // ============================================================
-//  ENVIRONMENT VARIABLES (NEVER hardcode API keys!)
+//  ENVIRONMENT VARIABLES
 // ============================================================
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const JWT_SECRET = process.env.JWT_SECRET || 'your_secret_key';
 const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;  // optional for image generation
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 // ============================================================
 //  MESSAGE LIMITS
@@ -87,6 +92,36 @@ function getLimit(tier) {
 }
 
 // ============================================================
+//  FILE EXTRACTION HELPER
+// ============================================================
+async function extractFileContent(file) {
+  const mimeType = file.mimetype;
+  const buffer = file.buffer;
+
+  if (mimeType === 'application/pdf') {
+    try {
+      const data = await pdfParse(buffer);
+      return data.text;
+    } catch (e) {
+      return `[PDF could not be read: ${e.message}]`;
+    }
+  } else if (mimeType.startsWith('image/')) {
+    // return base64 for vision models (if you have one)
+    const base64 = buffer.toString('base64');
+    return `[Image: ${file.originalname} (${(file.size/1024).toFixed(1)}KB) – base64 data available for vision models]`;
+  } else if (mimeType === 'text/plain' || mimeType === 'text/csv') {
+    return buffer.toString('utf-8');
+  } else {
+    // try to read as text
+    try {
+      return buffer.toString('utf-8');
+    } catch (e) {
+      return `[File: ${file.originalname} - ${(file.size/1024).toFixed(1)}KB]`;
+    }
+  }
+}
+
+// ============================================================
 //  AUTH MIDDLEWARE
 // ============================================================
 const auth = async (req, res, next) => {
@@ -108,8 +143,9 @@ const auth = async (req, res, next) => {
 //  AUTH ROUTES
 // ============================================================
 app.post('/api/auth/register', async (req, res) => {
-  const { email, password } = req.body;
+  const { email, password, ageConfirmed } = req.body;
   if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+  if (!ageConfirmed) return res.status(400).json({ error: 'You must be 18 or older' });
   const existing = await findUser(email);
   if (existing) return res.status(400).json({ error: 'Email already exists' });
 
@@ -152,9 +188,15 @@ app.get('/api/user/profile', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CHAT WITH GROQ (Free, Fast, Claude‑like)
+//  CHAT WITH GROQ (Free, Fast, Claude‑like) + FILE UPLOADS
 // ============================================================
-app.post('/api/chat/stream', auth, async (req, res) => {
+const storage = multer.memoryStorage();
+const upload = multer({
+  storage: storage,
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
+});
+
+app.post('/api/chat/stream', auth, upload.array('files', 5), async (req, res) => {
   let user = req.user;
   user = await resetUsageIfNeeded(user);
 
@@ -168,10 +210,38 @@ app.post('/api/chat/stream', auth, async (req, res) => {
     });
   }
 
-  const { messages } = req.body;
+  // Parse messages from form data
+  let messages;
+  try {
+    messages = JSON.parse(req.body.messages);
+  } catch (e) {
+    return res.status(400).json({ error: 'Invalid messages format' });
+  }
+
+  const files = req.files || [];
+  let fileContent = '';
+
+  // Process uploaded files
+  for (const file of files) {
+    const content = await extractFileContent(file);
+    fileContent += `\n\n--- File: ${file.originalname} ---\n${content}\n--- End of ${file.originalname} ---`;
+  }
+
+  // Attach file content to the last user message
+  if (fileContent) {
+    const lastUserMsg = messages[messages.length - 1];
+    if (lastUserMsg && lastUserMsg.role === 'user') {
+      lastUserMsg.content += `\n\n[User uploaded ${files.length} file(s): ${files.map(f => f.originalname).join(', ')}]\n${fileContent}`;
+    } else {
+      messages.push({
+        role: 'user',
+        content: `[Uploaded ${files.length} file(s): ${files.map(f => f.originalname).join(', ')}]\n${fileContent}`
+      });
+    }
+  }
 
   const systemPrompt = `You are a helpful, concise, and professional AI assistant for TechNovaphy.
-You answer questions about IT, web development, cloud, and business technology.
+You can analyze uploaded files (PDFs, images, text files) and answer questions about their content.
 Be direct, use bullet points when helpful, and keep responses clear and actionable.`;
 
   const groqMessages = [
@@ -238,7 +308,42 @@ Be direct, use bullet points when helpful, and keep responses clear and actionab
 });
 
 // ============================================================
-//  STRIPE CHECKOUT (Idempotent)
+//  IMAGE GENERATION ENDPOINT (OpenAI DALL‑E)
+// ============================================================
+app.post('/api/generate-image', auth, async (req, res) => {
+  const { prompt } = req.body;
+  if (!prompt) return res.status(400).json({ error: 'Prompt is required' });
+  if (!OPENAI_API_KEY) return res.status(503).json({ error: 'Image generation not configured' });
+
+  try {
+    const response = await fetch('https://api.openai.com/v1/images/generations', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${OPENAI_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        prompt: prompt,
+        n: 1,
+        size: '512x512',
+        model: 'dall-e-2', // or dall-e-3 for better quality
+      }),
+    });
+
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.error?.message || 'Image generation failed');
+    }
+
+    res.json({ url: data.data[0].url });
+  } catch (error) {
+    console.error('Image gen error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================
+//  STRIPE CHECKOUT (Idempotent) – unchanged
 // ============================================================
 const PRICE_IDS = {
   starter: 'price_starter_17',
@@ -265,6 +370,10 @@ app.post('/api/create-checkout', auth, async (req, res) => {
     return res.status(409).json({ error: 'Payment is being processed' });
   }
 
+  if (!STRIPE_SECRET_KEY) {
+    return res.status(503).json({ error: 'Payment service not configured' });
+  }
+
   const stripe = require('stripe')(STRIPE_SECRET_KEY);
   const session = await stripe.checkout.sessions.create({
     payment_method_types: ['card'],
@@ -289,7 +398,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
 });
 
 // ============================================================
-//  STRIPE WEBHOOK
+//  STRIPE WEBHOOK – unchanged
 // ============================================================
 app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
