@@ -1,4 +1,4 @@
-// server.js – Complete backend with Groq + Supabase + Stripe + File Upload + Image Gen
+// server.js – Complete backend with Groq + Supabase + Stripe + File Upload + Image Gen + Email Verification
 require('dotenv').config();
 
 const express = require('express');
@@ -24,7 +24,12 @@ const JWT_SECRET = process.env.JWT_SECRET || 'your_secret_key';
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;  // optional for image generation
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;  // optional
+
+// EmailJS settings
+const EMAILJS_PUBLIC_KEY = process.env.EMAILJS_PUBLIC_KEY || '2a63sraNwt28lQWml';
+const EMAILJS_SERVICE_ID = process.env.EMAILJS_SERVICE_ID || 'service_fqc51hs';
+const EMAILJS_VERIFY_TEMPLATE = process.env.EMAILJS_VERIFY_TEMPLATE || 'template_verify_abc'; // ← update with your template ID
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
@@ -92,6 +97,35 @@ function getLimit(tier) {
 }
 
 // ============================================================
+//  EMAIL VERIFICATION HELPERS
+// ============================================================
+function generateVerificationCode() {
+  return Math.floor(100000 + Math.random() * 900000).toString();
+}
+
+async function sendVerificationEmail(email, code) {
+  const url = 'https://api.emailjs.com/api/v1.0/email/send';
+  const payload = {
+    service_id: EMAILJS_SERVICE_ID,
+    template_id: EMAILJS_VERIFY_TEMPLATE,
+    user_id: EMAILJS_PUBLIC_KEY,
+    template_params: {
+      to_email: email,
+      code: code,
+    },
+  };
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    throw new Error('Failed to send verification email');
+  }
+  return response;
+}
+
+// ============================================================
 //  FILE EXTRACTION HELPER
 // ============================================================
 async function extractFileContent(file) {
@@ -106,13 +140,11 @@ async function extractFileContent(file) {
       return `[PDF could not be read: ${e.message}]`;
     }
   } else if (mimeType.startsWith('image/')) {
-    // return base64 for vision models (if you have one)
     const base64 = buffer.toString('base64');
     return `[Image: ${file.originalname} (${(file.size/1024).toFixed(1)}KB) – base64 data available for vision models]`;
   } else if (mimeType === 'text/plain' || mimeType === 'text/csv') {
     return buffer.toString('utf-8');
   } else {
-    // try to read as text
     try {
       return buffer.toString('utf-8');
     } catch (e) {
@@ -159,9 +191,34 @@ app.post('/api/auth/register', async (req, res) => {
     tier: 'free',
     usage_count: 0,
     monthly_reset_date: nextMonth.toISOString().split('T')[0],
+    verified: false,
   }).select().single();
   if (error) return res.status(500).json({ error: error.message });
-  res.status(201).json({ message: 'User created' });
+
+  // Generate and store verification code
+  const code = generateVerificationCode();
+  const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
+  const { error: codeError } = await supabase.from('email_verifications').insert({
+    user_id: data.id,
+    code: code,
+    expires_at: expiresAt.toISOString(),
+  });
+  if (codeError) {
+    console.error('Code insertion error:', codeError);
+  }
+
+  // Send verification email (don't block response)
+  try {
+    await sendVerificationEmail(email, code);
+  } catch (e) {
+    console.error('Email send error:', e);
+    // but we still return success, user can resend code later.
+  }
+
+  res.status(201).json({
+    message: 'User created. Check your email for verification code.',
+    userId: data.id,
+  });
 });
 
 app.post('/api/auth/login', async (req, res) => {
@@ -171,7 +228,7 @@ app.post('/api/auth/login', async (req, res) => {
   const valid = await bcrypt.compare(password, user.password_hash);
   if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
   const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '30d' });
-  res.json({ token });
+  res.json({ token, verified: user.verified });
 });
 
 app.get('/api/user/profile', auth, async (req, res) => {
@@ -184,7 +241,57 @@ app.get('/api/user/profile', auth, async (req, res) => {
     usage_count: user.usage_count,
     limit: limit,
     monthly_reset_date: user.monthly_reset_date,
+    verified: user.verified,
   });
+});
+
+app.post('/api/auth/verify-email', async (req, res) => {
+  const { email, code } = req.body;
+  if (!email || !code) return res.status(400).json({ error: 'Email and code required' });
+
+  const user = await findUser(email);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  if (user.verified) return res.json({ message: 'Email already verified' });
+
+  const { data, error } = await supabase
+    .from('email_verifications')
+    .select('*')
+    .eq('user_id', user.id)
+    .eq('code', code)
+    .single();
+
+  if (error || !data) return res.status(400).json({ error: 'Invalid verification code' });
+  if (new Date(data.expires_at) < new Date()) {
+    return res.status(400).json({ error: 'Verification code expired. Request a new one.' });
+  }
+
+  // Mark user as verified
+  await supabase.from('users').update({ verified: true }).eq('id', user.id);
+  // Delete verification record
+  await supabase.from('email_verifications').delete().eq('id', data.id);
+
+  res.json({ message: 'Email verified successfully' });
+});
+
+app.post('/api/auth/resend-verification', async (req, res) => {
+  const { email } = req.body;
+  const user = await findUser(email);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  if (user.verified) return res.json({ message: 'Already verified' });
+
+  // Generate new code
+  const code = generateVerificationCode();
+  const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
+  // Delete old code
+  await supabase.from('email_verifications').delete().eq('user_id', user.id);
+  // Insert new
+  await supabase.from('email_verifications').insert({
+    user_id: user.id,
+    code: code,
+    expires_at: expiresAt.toISOString(),
+  });
+  await sendVerificationEmail(email, code);
+  res.json({ message: 'New verification code sent' });
 });
 
 // ============================================================
@@ -221,13 +328,11 @@ app.post('/api/chat/stream', auth, upload.array('files', 5), async (req, res) =>
   const files = req.files || [];
   let fileContent = '';
 
-  // Process uploaded files
   for (const file of files) {
     const content = await extractFileContent(file);
     fileContent += `\n\n--- File: ${file.originalname} ---\n${content}\n--- End of ${file.originalname} ---`;
   }
 
-  // Attach file content to the last user message
   if (fileContent) {
     const lastUserMsg = messages[messages.length - 1];
     if (lastUserMsg && lastUserMsg.role === 'user') {
@@ -326,7 +431,7 @@ app.post('/api/generate-image', auth, async (req, res) => {
         prompt: prompt,
         n: 1,
         size: '512x512',
-        model: 'dall-e-2', // or dall-e-3 for better quality
+        model: 'dall-e-2',
       }),
     });
 
@@ -343,7 +448,7 @@ app.post('/api/generate-image', auth, async (req, res) => {
 });
 
 // ============================================================
-//  STRIPE CHECKOUT (Idempotent) – unchanged
+//  STRIPE CHECKOUT (Idempotent)
 // ============================================================
 const PRICE_IDS = {
   starter: 'price_starter_17',
@@ -398,7 +503,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
 });
 
 // ============================================================
-//  STRIPE WEBHOOK – unchanged
+//  STRIPE WEBHOOK
 // ============================================================
 app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
