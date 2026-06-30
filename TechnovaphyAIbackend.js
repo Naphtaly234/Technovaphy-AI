@@ -43,25 +43,32 @@ app.use('/api/auth/login', authLimiter);
 app.use('/api/auth/register', authLimiter);
 
 // ============================================================
-//  3. ENVIRONMENT VARIABLES
+//  3. ENVIRONMENT VARIABLES – CHECK ON STARTUP
 // ============================================================
+const required = ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'JWT_SECRET', 'GROQ_API_KEY'];
+const missing = required.filter(key => !process.env[key]);
+if (missing.length) {
+    console.error('❌ Missing required env vars:', missing.join(', '));
+    process.exit(1);
+}
+
 const PORT = process.env.PORT || 3001;
-const JWT_SECRET = process.env.JWT_SECRET || 'your_secret_key';
+const JWT_SECRET = process.env.JWT_SECRET;
 const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !JWT_SECRET) {
-    console.error('❌ Missing required environment variables');
-    process.exit(1);
-}
+console.log('✅ All required env vars are set');
 
+// ============================================================
+//  4. SUPABASE CLIENT
+// ============================================================
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 // ============================================================
-//  4. CONSTANTS
+//  5. CONSTANTS
 // ============================================================
 const TIER_LIMITS = { free: 200, starter: 550, pro: 2500, enterprise: Infinity };
 const TIER_NAMES = {
@@ -73,7 +80,7 @@ const TIER_NAMES = {
 const HOURLY_LIMIT_FREE = 5;
 
 // ============================================================
-//  5. HELPERS (all original)
+//  6. HELPERS
 // ============================================================
 async function findUser(email) {
     const { data, error } = await supabase
@@ -81,7 +88,7 @@ async function findUser(email) {
         .select('*')
         .eq('email', email)
         .maybeSingle();
-    if (error) throw error;
+    if (error) throw new Error('Database error: ' + error.message);
     return data;
 }
 
@@ -91,7 +98,7 @@ async function findUserById(id) {
         .select('*')
         .eq('id', id)
         .maybeSingle();
-    if (error) throw error;
+    if (error) throw new Error('Database error: ' + error.message);
     return data;
 }
 
@@ -194,7 +201,7 @@ function generateSuggestions(lastMessage) {
 }
 
 // ============================================================
-//  6. AUTH MIDDLEWARE
+//  7. AUTH MIDDLEWARE
 // ============================================================
 const auth = async (req, res, next) => {
     const authHeader = req.headers.authorization;
@@ -212,14 +219,14 @@ const auth = async (req, res, next) => {
 };
 
 // ============================================================
-//  7. PUBLIC ENDPOINTS
+//  8. PUBLIC ENDPOINTS
 // ============================================================
-app.get('/', (req, res) => { res.send('TechNovaphy AI Backend is running'); });
-app.get('/api/health', (req, res) => { res.json({ status: 'ok', message: 'Backend is live!' }); });
-app.get('/api/ping', (req, res) => { res.json({ status: 'ok', message: 'Backend is reachable!' }); });
+app.get('/', (req, res) => res.send('TechNovaphy AI Backend is running'));
+app.get('/api/health', (req, res) => res.json({ status: 'ok', message: 'Backend is live!' }));
+app.get('/api/ping', (req, res) => res.json({ status: 'ok', message: 'Backend is reachable!' }));
 
 // ============================================================
-//  8. AUTH ROUTES
+//  9. AUTH ROUTES
 // ============================================================
 app.post('/api/auth/register', async (req, res) => {
     try {
@@ -251,7 +258,7 @@ app.post('/api/auth/register', async (req, res) => {
             .select()
             .single();
 
-        if (error) throw error;
+        if (error) throw new Error('Database insert: ' + error.message);
         res.status(201).json({ message: 'User created', userId: data.id });
     } catch (err) {
         console.error('Registration error:', err);
@@ -274,7 +281,7 @@ app.post('/api/auth/login', async (req, res) => {
         res.json({ token, verified: true });
     } catch (err) {
         console.error('Login error:', err);
-        res.status(500).json({ error: 'Internal server error' });
+        res.status(500).json({ error: err.message });
     }
 });
 
@@ -283,12 +290,10 @@ app.get('/api/user/profile', auth, async (req, res) => {
         let user = req.user;
         user = await resetMonthlyUsageIfNeeded(user);
         user = await checkHourlyQuota(user);
-
         const limit = getLimit(user.tier);
         const hourlyLimit = user.tier === 'free' ? HOURLY_LIMIT_FREE : Infinity;
         const hourlyUsed = user.hourly_quota_used || 0;
         const hourlyRemaining = user.tier === 'free' ? Math.max(0, hourlyLimit - hourlyUsed) : Infinity;
-
         res.json({
             email: user.email,
             tier: user.tier,
@@ -305,7 +310,7 @@ app.get('/api/user/profile', auth, async (req, res) => {
         });
     } catch (err) {
         console.error('Profile error:', err);
-        res.status(500).json({ error: 'Internal server error' });
+        res.status(500).json({ error: err.message });
     }
 });
 
@@ -317,12 +322,12 @@ app.post('/api/auth/update-memory', auth, async (req, res) => {
         res.json({ message: 'Memory updated' });
     } catch (err) {
         console.error('Update memory error:', err);
-        res.status(500).json({ error: 'Internal server error' });
+        res.status(500).json({ error: err.message });
     }
 });
 
 // ============================================================
-//  9. CHAT STREAM
+//  10. CHAT STREAM
 // ============================================================
 app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) => {
     try {
@@ -434,7 +439,7 @@ ${memoryPrompt}`;
                             fullContent += text;
                             res.write(`data: ${JSON.stringify({ type: 'chunk', text })}\n\n`);
                         }
-                    } catch (e) { /* ignore parse errors */ }
+                    } catch (e) { /* ignore */ }
                 }
             }
         }
@@ -456,7 +461,7 @@ ${memoryPrompt}`;
     } catch (err) {
         console.error('Chat stream error:', err);
         if (!res.headersSent) {
-            res.status(500).json({ error: 'Internal server error' });
+            res.status(500).json({ error: err.message });
         } else {
             res.write(`data: ${JSON.stringify({ type: 'error', message: err.message })}\n\n`);
             res.end();
@@ -465,7 +470,7 @@ ${memoryPrompt}`;
 });
 
 // ============================================================
-//  10. IMAGE GENERATION
+//  11. IMAGE GENERATION
 // ============================================================
 app.post('/api/generate-image', auth, async (req, res) => {
     try {
@@ -498,7 +503,7 @@ app.post('/api/generate-image', auth, async (req, res) => {
 });
 
 // ============================================================
-//  11. PAYMENT – Paystack Checkout
+//  12. PAYMENT – Paystack Checkout
 // ============================================================
 app.post('/api/create-checkout', auth, async (req, res) => {
     try {
@@ -565,12 +570,12 @@ app.post('/api/create-checkout', auth, async (req, res) => {
         res.json({ url: data.data.authorization_url });
     } catch (err) {
         console.error('Checkout error:', err);
-        res.status(500).json({ error: 'Internal server error' });
+        res.status(500).json({ error: err.message });
     }
 });
 
 // ============================================================
-//  12. PAYSTACK WEBHOOK
+//  13. PAYSTACK WEBHOOK
 // ============================================================
 app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), async (req, res) => {
     try {
@@ -606,6 +611,6 @@ app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), as
 });
 
 // ============================================================
-//  13. START
+//  14. START
 // ============================================================
 app.listen(PORT, () => console.log(`🚀 TechNovaphy AI Backend running on port ${PORT}`));
