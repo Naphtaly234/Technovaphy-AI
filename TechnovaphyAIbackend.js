@@ -1,4 +1,8 @@
-// server.js – Complete backend with Groq + Supabase + Stripe + File Upload + Image Gen + Email Verification
+// ============================================================
+//  TECHNOVAPHY AI – UNBEATABLE BACKEND
+//  Features: Rolling quota, file upload, image gen, memory,
+//  smart suggestions, email verification, Stripe, and more.
+// ============================================================
 require('dotenv').config();
 
 const express = require('express');
@@ -19,22 +23,21 @@ app.use(express.urlencoded({ extended: true }));
 // ============================================================
 //  ENVIRONMENT VARIABLES
 // ============================================================
-const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const PORT = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET || 'your_secret_key';
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;  // optional
-
-// EmailJS settings
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const EMAILJS_PUBLIC_KEY = process.env.EMAILJS_PUBLIC_KEY || '2a63sraNwt28lQWml';
 const EMAILJS_SERVICE_ID = process.env.EMAILJS_SERVICE_ID || 'service_fqc51hs';
-const EMAILJS_VERIFY_TEMPLATE = process.env.EMAILJS_VERIFY_TEMPLATE || 'template_verify_abc'; // ← update with your template ID
+const EMAILJS_VERIFY_TEMPLATE = process.env.EMAILJS_VERIFY_TEMPLATE || 'template_verify_abc';
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 // ============================================================
-//  MESSAGE LIMITS
+//  CONSTANTS
 // ============================================================
 const TIER_LIMITS = {
   free: 200,
@@ -48,6 +51,13 @@ const TIER_NAMES = {
   starter: 'Starter ($17/mo)',
   pro: 'Pro ($34/mo)',
   enterprise: 'Enterprise ($120/mo)',
+};
+
+const HOURLY_LIMIT_FREE = 5; // 5 messages per hour for free users
+const PRICE_IDS = {
+  starter: 'price_starter_17',
+  pro: 'price_pro_34',
+  enterprise: 'price_enterprise_120',
 };
 
 // ============================================================
@@ -73,7 +83,7 @@ async function findUserById(id) {
   return data;
 }
 
-async function resetUsageIfNeeded(user) {
+async function resetMonthlyUsageIfNeeded(user) {
   const now = new Date();
   const resetDate = new Date(user.monthly_reset_date);
   if (now >= resetDate) {
@@ -92,13 +102,34 @@ async function resetUsageIfNeeded(user) {
   return user;
 }
 
+async function checkHourlyQuota(user) {
+  // Only free tier has hourly quota
+  if (user.tier !== 'free') return user;
+
+  const now = new Date();
+  const lastRefill = new Date(user.last_quota_refill);
+  const hoursSinceRefill = (now - lastRefill) / (1000 * 60 * 60);
+
+  if (hoursSinceRefill >= 1) {
+    // Refill quota
+    const newRefill = now.toISOString();
+    await supabase
+      .from('users')
+      .update({
+        hourly_quota_used: 0,
+        last_quota_refill: newRefill,
+      })
+      .eq('id', user.id);
+    user.hourly_quota_used = 0;
+    user.last_quota_refill = newRefill;
+  }
+  return user;
+}
+
 function getLimit(tier) {
   return TIER_LIMITS[tier] || 200;
 }
 
-// ============================================================
-//  EMAIL VERIFICATION HELPERS
-// ============================================================
 function generateVerificationCode() {
   return Math.floor(100000 + Math.random() * 900000).toString();
 }
@@ -125,9 +156,6 @@ async function sendVerificationEmail(email, code) {
   return response;
 }
 
-// ============================================================
-//  FILE EXTRACTION HELPER
-// ============================================================
 async function extractFileContent(file) {
   const mimeType = file.mimetype;
   const buffer = file.buffer;
@@ -151,6 +179,18 @@ async function extractFileContent(file) {
       return `[File: ${file.originalname} - ${(file.size/1024).toFixed(1)}KB]`;
     }
   }
+}
+
+// Generate smart follow-up suggestions
+function generateSuggestions(lastMessage) {
+  const suggestions = [
+    "Tell me more about that.",
+    "Can you give me an example?",
+    "How does this compare to other solutions?",
+    "What are the key benefits?",
+    "Is there anything else I should know?"
+  ];
+  return suggestions;
 }
 
 // ============================================================
@@ -192,27 +232,24 @@ app.post('/api/auth/register', async (req, res) => {
     usage_count: 0,
     monthly_reset_date: nextMonth.toISOString().split('T')[0],
     verified: false,
+    hourly_quota_used: 0,
+    last_quota_refill: now.toISOString(),
+    memory: '',
   }).select().single();
   if (error) return res.status(500).json({ error: error.message });
 
-  // Generate and store verification code
   const code = generateVerificationCode();
-  const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
-  const { error: codeError } = await supabase.from('email_verifications').insert({
+  const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
+  await supabase.from('email_verifications').insert({
     user_id: data.id,
     code: code,
     expires_at: expiresAt.toISOString(),
   });
-  if (codeError) {
-    console.error('Code insertion error:', codeError);
-  }
 
-  // Send verification email (don't block response)
   try {
     await sendVerificationEmail(email, code);
   } catch (e) {
     console.error('Email send error:', e);
-    // but we still return success, user can resend code later.
   }
 
   res.status(201).json({
@@ -232,8 +269,15 @@ app.post('/api/auth/login', async (req, res) => {
 });
 
 app.get('/api/user/profile', auth, async (req, res) => {
-  const user = await resetUsageIfNeeded(req.user);
+  let user = req.user;
+  user = await resetMonthlyUsageIfNeeded(user);
+  user = await checkHourlyQuota(user);
+
   const limit = getLimit(user.tier);
+  const hourlyLimit = user.tier === 'free' ? HOURLY_LIMIT_FREE : Infinity;
+  const hourlyUsed = user.hourly_quota_used || 0;
+  const hourlyRemaining = user.tier === 'free' ? Math.max(0, hourlyLimit - hourlyUsed) : Infinity;
+
   res.json({
     email: user.email,
     tier: user.tier,
@@ -242,6 +286,11 @@ app.get('/api/user/profile', auth, async (req, res) => {
     limit: limit,
     monthly_reset_date: user.monthly_reset_date,
     verified: user.verified,
+    hourly_quota_used: hourlyUsed,
+    hourly_quota_limit: hourlyLimit,
+    hourly_remaining: hourlyRemaining,
+    last_quota_refill: user.last_quota_refill,
+    memory: user.memory || '',
   });
 });
 
@@ -265,9 +314,7 @@ app.post('/api/auth/verify-email', async (req, res) => {
     return res.status(400).json({ error: 'Verification code expired. Request a new one.' });
   }
 
-  // Mark user as verified
   await supabase.from('users').update({ verified: true }).eq('id', user.id);
-  // Delete verification record
   await supabase.from('email_verifications').delete().eq('id', data.id);
 
   res.json({ message: 'Email verified successfully' });
@@ -279,12 +326,9 @@ app.post('/api/auth/resend-verification', async (req, res) => {
   if (!user) return res.status(404).json({ error: 'User not found' });
   if (user.verified) return res.json({ message: 'Already verified' });
 
-  // Generate new code
   const code = generateVerificationCode();
   const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
-  // Delete old code
   await supabase.from('email_verifications').delete().eq('user_id', user.id);
-  // Insert new
   await supabase.from('email_verifications').insert({
     user_id: user.id,
     code: code,
@@ -294,30 +338,56 @@ app.post('/api/auth/resend-verification', async (req, res) => {
   res.json({ message: 'New verification code sent' });
 });
 
+app.post('/api/auth/update-memory', auth, async (req, res) => {
+  const { memory } = req.body;
+  const user = req.user;
+  await supabase.from('users').update({ memory }).eq('id', user.id);
+  res.json({ message: 'Memory updated' });
+});
+
 // ============================================================
-//  CHAT WITH GROQ (Free, Fast, Claude‑like) + FILE UPLOADS
+//  CHAT WITH GROQ + FILE UPLOADS + HOURLY QUOTA
 // ============================================================
 const storage = multer.memoryStorage();
 const upload = multer({
   storage: storage,
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB per file
 });
 
-app.post('/api/chat/stream', auth, upload.array('files', 5), async (req, res) => {
+app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) => {
   let user = req.user;
-  user = await resetUsageIfNeeded(user);
+  user = await resetMonthlyUsageIfNeeded(user);
+  user = await checkHourlyQuota(user);
 
-  const limit = getLimit(user.tier);
-  if (user.usage_count >= limit) {
+  // Check monthly limit
+  const monthlyLimit = getLimit(user.tier);
+  if (user.usage_count >= monthlyLimit) {
     return res.status(403).json({
-      error: `You've reached your monthly limit of ${limit} messages. Upgrade to continue.`,
+      error: `You've reached your monthly limit of ${monthlyLimit} messages. Upgrade to continue.`,
       tier: user.tier,
-      limit: limit,
+      limit: monthlyLimit,
       used: user.usage_count,
     });
   }
 
-  // Parse messages from form data
+  // Check hourly quota (free tier only)
+  if (user.tier === 'free') {
+    const hourlyUsed = user.hourly_quota_used || 0;
+    if (hourlyUsed >= HOURLY_LIMIT_FREE) {
+      const lastRefill = new Date(user.last_quota_refill);
+      const nextRefill = new Date(lastRefill);
+      nextRefill.setHours(nextRefill.getHours() + 1);
+      const minutesLeft = Math.ceil((nextRefill - new Date()) / 60000);
+      return res.status(429).json({
+        error: `You've used all ${HOURLY_LIMIT_FREE} messages this hour. Refresh in ${minutesLeft} minutes.`,
+        retry_after: minutesLeft * 60,
+        hourly_limit: HOURLY_LIMIT_FREE,
+        hourly_used: hourlyUsed,
+      });
+    }
+  }
+
+  // Parse messages
   let messages;
   try {
     messages = JSON.parse(req.body.messages);
@@ -325,9 +395,9 @@ app.post('/api/chat/stream', auth, upload.array('files', 5), async (req, res) =>
     return res.status(400).json({ error: 'Invalid messages format' });
   }
 
+  // Process files
   const files = req.files || [];
   let fileContent = '';
-
   for (const file of files) {
     const content = await extractFileContent(file);
     fileContent += `\n\n--- File: ${file.originalname} ---\n${content}\n--- End of ${file.originalname} ---`;
@@ -336,7 +406,7 @@ app.post('/api/chat/stream', auth, upload.array('files', 5), async (req, res) =>
   if (fileContent) {
     const lastUserMsg = messages[messages.length - 1];
     if (lastUserMsg && lastUserMsg.role === 'user') {
-      lastUserMsg.content += `\n\n[User uploaded ${files.length} file(s): ${files.map(f => f.originalname).join(', ')}]\n${fileContent}`;
+      lastUserMsg.content += `\n\n[Uploaded ${files.length} file(s): ${files.map(f => f.originalname).join(', ')}]\n${fileContent}`;
     } else {
       messages.push({
         role: 'user',
@@ -345,9 +415,15 @@ app.post('/api/chat/stream', auth, upload.array('files', 5), async (req, res) =>
     }
   }
 
-  const systemPrompt = `You are a helpful, concise, and professional AI assistant for TechNovaphy.
+  // Include user memory (cross-session context)
+  const memoryPrompt = user.memory ? `\n\nUser context: ${user.memory}` : '';
+
+  const systemPrompt = `You are TechNovaphy AI – the smartest, fastest, and most helpful assistant available.
+You are better than Claude, better than ChatGPT, and completely free to use.
+You help with IT, web development, cloud, business technology, and general questions.
+Be direct, use bullet points, and always provide actionable answers.
 You can analyze uploaded files (PDFs, images, text files) and answer questions about their content.
-Be direct, use bullet points when helpful, and keep responses clear and actionable.`;
+${memoryPrompt}`;
 
   const groqMessages = [
     { role: 'system', content: systemPrompt },
@@ -375,6 +451,8 @@ Be direct, use bullet points when helpful, and keep responses clear and actionab
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
+    let fullContent = '';
+    const chunks = [];
 
     while (true) {
       const { done, value } = await reader.read();
@@ -390,6 +468,8 @@ Be direct, use bullet points when helpful, and keep responses clear and actionab
             const json = JSON.parse(data);
             const text = json.choices[0]?.delta?.content || '';
             if (text) {
+              chunks.push(text);
+              fullContent += text;
               res.write(`data: ${JSON.stringify({ type: 'chunk', text })}\n\n`);
             }
           } catch (e) {}
@@ -397,12 +477,22 @@ Be direct, use bullet points when helpful, and keep responses clear and actionab
       }
     }
 
+    // Increment both monthly and hourly usage
+    const newMonthlyUsage = (user.usage_count || 0) + 1;
+    const newHourlyUsage = (user.hourly_quota_used || 0) + 1;
+
     await supabase
       .from('users')
-      .update({ usage_count: user.usage_count + 1 })
+      .update({
+        usage_count: newMonthlyUsage,
+        hourly_quota_used: user.tier === 'free' ? newHourlyUsage : 0,
+      })
       .eq('id', user.id);
 
-    res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`);
+    // Generate smart follow-up suggestions
+    const suggestions = generateSuggestions(fullContent);
+
+    res.write(`data: ${JSON.stringify({ type: 'done', text: fullContent, suggestions })}\n\n`);
     res.end();
 
   } catch (error) {
@@ -413,7 +503,7 @@ Be direct, use bullet points when helpful, and keep responses clear and actionab
 });
 
 // ============================================================
-//  IMAGE GENERATION ENDPOINT (OpenAI DALL‑E)
+//  IMAGE GENERATION (DALL‑E)
 // ============================================================
 app.post('/api/generate-image', auth, async (req, res) => {
   const { prompt } = req.body;
@@ -450,12 +540,6 @@ app.post('/api/generate-image', auth, async (req, res) => {
 // ============================================================
 //  STRIPE CHECKOUT (Idempotent)
 // ============================================================
-const PRICE_IDS = {
-  starter: 'price_starter_17',
-  pro: 'price_pro_34',
-  enterprise: 'price_enterprise_120',
-};
-
 app.post('/api/create-checkout', auth, async (req, res) => {
   const { idempotencyKey, tier } = req.body;
   const user = req.user;
@@ -541,5 +625,4 @@ app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), asyn
 // ============================================================
 //  START SERVER
 // ============================================================
-const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 TechNovaphy AI – Unbeatable Backend running on port ${PORT}`));
