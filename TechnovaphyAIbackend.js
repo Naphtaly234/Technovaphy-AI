@@ -1,5 +1,5 @@
 // ============================================================
-//  TECHNOVAPHY AI – COMPLETE BACKEND (FIXED)
+//  TECHNOVAPHY AI – COMPLETE BACKEND (FINAL, SERVICE ROLE ONLY)
 // ============================================================
 require('dotenv').config();
 
@@ -15,7 +15,7 @@ const pdfParse = require('pdf-parse');
 const app = express();
 
 // ============================================================
-//  1. CORS – EXPLICIT AND BEFORE ANY OTHER MIDDLEWARE
+//  1. CORS – EXPLICIT
 // ============================================================
 app.use(cors({
     origin: '*',
@@ -31,7 +31,6 @@ app.use(cors({
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
-// Rate limiter – returns JSON
 const authLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 10,
@@ -43,32 +42,31 @@ app.use('/api/auth/login', authLimiter);
 app.use('/api/auth/register', authLimiter);
 
 // ============================================================
-//  3. ENVIRONMENT VARIABLES – CHECK ON STARTUP
+//  3. ENVIRONMENT VARIABLES – STRICT CHECKS
 // ============================================================
 const required = ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'JWT_SECRET', 'GROQ_API_KEY'];
 const missing = required.filter(key => !process.env[key]);
 if (missing.length) {
     console.error('❌ Missing required env vars:', missing.join(', '));
+    console.error('   Please set them in Render environment.');
     process.exit(1);
 }
 
 const PORT = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET;
 const SUPABASE_URL = process.env.SUPABASE_URL;
-// ✅ FIX: Use service role key, fallback to anon key if missing (but service role is required)
-const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY; // MUST be set
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 console.log('✅ All required env vars are set');
-console.log(`✅ Supabase URL: ${SUPABASE_URL}`);
-console.log(`✅ Supabase key type: ${process.env.SUPABASE_SERVICE_ROLE_KEY ? 'Service Role' : process.env.SUPABASE_ANON_KEY ? 'Anon' : 'None'}`);
+console.log(`✅ Using Supabase Service Role Key (length: ${SUPABASE_SERVICE_ROLE_KEY.length})`);
 
 // ============================================================
-//  4. SUPABASE CLIENT – USING THE CORRECT KEY
+//  4. SUPABASE CLIENT – FORCE SERVICE ROLE (no fallback)
 // ============================================================
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 // ============================================================
 //  5. CONSTANTS
@@ -83,11 +81,11 @@ const TIER_NAMES = {
 const HOURLY_LIMIT_FREE = 5;
 
 // ============================================================
-//  6. HELPERS
+//  6. HELPERS (with explicit public schema)
 // ============================================================
 async function findUser(email) {
     const { data, error } = await supabase
-        .from('users')
+        .from('users')   // assumes 'users' table is in 'public' schema
         .select('*')
         .eq('email', email)
         .maybeSingle();
