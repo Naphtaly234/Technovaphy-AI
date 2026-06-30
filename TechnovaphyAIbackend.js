@@ -1,5 +1,5 @@
 // ============================================================
-//  TECHNOVAPHY AI – COMPLETE BACKEND (WORKING + CORS FIX)
+//  TECHNOVAPHY AI – ORIGINAL BACKEND (with CORS + JSON rate limit)
 // ============================================================
 require('dotenv').config();
 
@@ -23,14 +23,14 @@ const app = express();
 app.use(cors());
 
 // ============================================================
-//  2. MIDDLEWARE
+//  2. MIDDLEWARE (same as original)
 // ============================================================
 app.use(helmet());
 app.use(morgan('combined'));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
-// Rate limiter – returns JSON (not plain text)
+// Rate limiting – returns JSON instead of plain text
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
@@ -42,7 +42,7 @@ app.use('/api/auth/login', authLimiter);
 app.use('/api/auth/register', authLimiter);
 
 // ============================================================
-//  3. ENVIRONMENT VARIABLES (with fallbacks)
+//  3. ENVIRONMENT VARIABLES
 // ============================================================
 const PORT = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET || 'your_secret_key';
@@ -55,7 +55,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 // ============================================================
-//  4. CONSTANTS
+//  4. CONSTANTS (exactly as you had)
 // ============================================================
 const TIER_LIMITS = {
   free: 200,
@@ -74,7 +74,7 @@ const TIER_NAMES = {
 const HOURLY_LIMIT_FREE = 5;
 
 // ============================================================
-//  5. HELPERS
+//  5. HELPERS (all your original helpers)
 // ============================================================
 async function findUser(email) {
   const { data, error } = await supabase
@@ -213,7 +213,7 @@ const auth = async (req, res, next) => {
 };
 
 // ============================================================
-//  7. HEALTH & TEST ENDPOINTS
+//  7. HEALTH CHECK & ROOT
 // ============================================================
 app.get('/', (req, res) => {
   res.send('TechNovaphy AI Backend is running');
@@ -223,13 +223,15 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', message: 'TechNovaphy AI backend is live!' });
 });
 
-// ✅ PUBLIC PING – use this to test if backend is reachable
+// ============================================================
+//  8. PUBLIC PING – for testing (added for your convenience)
+// ============================================================
 app.get('/api/ping', (req, res) => {
   res.json({ status: 'ok', message: 'Backend is reachable!' });
 });
 
 // ============================================================
-//  8. AUTH ROUTES
+//  9. AUTH ROUTES (your original)
 // ============================================================
 app.post('/api/auth/register', async (req, res) => {
   const { email, password, ageConfirmed } = req.body;
@@ -301,7 +303,7 @@ app.post('/api/auth/update-memory', auth, async (req, res) => {
 });
 
 // ============================================================
-//  9. CHAT STREAM
+//  10. CHAT STREAM (original)
 // ============================================================
 app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) => {
   let user = req.user;
@@ -440,7 +442,7 @@ ${memoryPrompt}`;
 });
 
 // ============================================================
-//  10. IMAGE GENERATION (DALL‑E)
+//  11. IMAGE GENERATION (original)
 // ============================================================
 app.post('/api/generate-image', auth, async (req, res) => {
   const { prompt } = req.body;
@@ -471,7 +473,7 @@ app.post('/api/generate-image', auth, async (req, res) => {
 });
 
 // ============================================================
-//  11. PAYMENT – Paystack Checkout (Idempotent)
+//  12. PAYMENT – Paystack Checkout (original)
 // ============================================================
 app.post('/api/create-checkout', auth, async (req, res) => {
   const { idempotencyKey, tier } = req.body;
@@ -538,7 +540,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
 });
 
 // ============================================================
-//  12. PAYSTACK WEBHOOK
+//  13. PAYSTACK WEBHOOK (original)
 // ============================================================
 app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), async (req, res) => {
   const signature = req.headers['x-paystack-signature'];
@@ -572,6 +574,6 @@ app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), as
 });
 
 // ============================================================
-//  13. START SERVER
+//  14. START SERVER
 // ============================================================
 app.listen(PORT, () => console.log(`🚀 TechNovaphy AI Backend running on port ${PORT}`));
