@@ -15,6 +15,9 @@
     "dotenv": "^16.4.5",
     "multer": "^1.4.5-lts.1",
     "pdf-parse": "^1.1.1",
-    "mime-types": "^2.1.35"
+    "mime-types": "^2.1.35",
+    "helmet": "^7.0.0",
+    "express-rate-limit": "^7.1.5",
+    "morgan": "^1.10.0"
   }
 }
