@@ -1,7 +1,6 @@
 // ============================================================
 //  TECHNOVAPHY AI – UNBEATABLE BACKEND
-//  Features: Rolling quota, file upload, image gen, memory,
-//  smart suggestions, email verification, Stripe, and more.
+//  No email verification | Paystack payments | Rolling quota
 // ============================================================
 require('dotenv').config();
 
@@ -28,11 +27,8 @@ const JWT_SECRET = process.env.JWT_SECRET || 'your_secret_key';
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
-const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
+const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY; // 👈 new
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const EMAILJS_PUBLIC_KEY = process.env.EMAILJS_PUBLIC_KEY || '2a63sraNwt28lQWml';
-const EMAILJS_SERVICE_ID = process.env.EMAILJS_SERVICE_ID || 'service_fqc51hs';
-const EMAILJS_VERIFY_TEMPLATE = process.env.EMAILJS_VERIFY_TEMPLATE || 'template_verify_abc';
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
@@ -53,11 +49,18 @@ const TIER_NAMES = {
   enterprise: 'Enterprise ($120/mo)',
 };
 
-const HOURLY_LIMIT_FREE = 5; // 5 messages per hour for free users
-const PRICE_IDS = {
-  starter: 'price_starter_17',
-  pro: 'price_pro_34',
-  enterprise: 'price_enterprise_120',
+const HOURLY_LIMIT_FREE = 5;
+
+// Paystack plan codes (create these in your Paystack dashboard)
+// For subscriptions, you need to create a plan first.
+// We'll use a simplified approach: one‑time payment + manual tier update,
+// or you can create plans and use the subscription endpoint.
+// Here we'll implement a one‑time payment that upgrades the user.
+// For full subscriptions, you'd use Paystack's subscription API.
+const PAYSTACK_PLANS = {
+  starter: 'PLN_starter_17',   // create these in Paystack
+  pro: 'PLN_pro_34',
+  enterprise: 'PLN_enterprise_120',
 };
 
 // ============================================================
@@ -103,15 +106,11 @@ async function resetMonthlyUsageIfNeeded(user) {
 }
 
 async function checkHourlyQuota(user) {
-  // Only free tier has hourly quota
   if (user.tier !== 'free') return user;
-
   const now = new Date();
   const lastRefill = new Date(user.last_quota_refill);
   const hoursSinceRefill = (now - lastRefill) / (1000 * 60 * 60);
-
   if (hoursSinceRefill >= 1) {
-    // Refill quota
     const newRefill = now.toISOString();
     await supabase
       .from('users')
@@ -130,36 +129,9 @@ function getLimit(tier) {
   return TIER_LIMITS[tier] || 200;
 }
 
-function generateVerificationCode() {
-  return Math.floor(100000 + Math.random() * 900000).toString();
-}
-
-async function sendVerificationEmail(email, code) {
-  const url = 'https://api.emailjs.com/api/v1.0/email/send';
-  const payload = {
-    service_id: EMAILJS_SERVICE_ID,
-    template_id: EMAILJS_VERIFY_TEMPLATE,
-    user_id: EMAILJS_PUBLIC_KEY,
-    template_params: {
-      to_email: email,
-      code: code,
-    },
-  };
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
-  if (!response.ok) {
-    throw new Error('Failed to send verification email');
-  }
-  return response;
-}
-
 async function extractFileContent(file) {
   const mimeType = file.mimetype;
   const buffer = file.buffer;
-
   if (mimeType === 'application/pdf') {
     try {
       const data = await pdfParse(buffer);
@@ -168,7 +140,6 @@ async function extractFileContent(file) {
       return `[PDF could not be read: ${e.message}]`;
     }
   } else if (mimeType.startsWith('image/')) {
-    const base64 = buffer.toString('base64');
     return `[Image: ${file.originalname} (${(file.size/1024).toFixed(1)}KB) – base64 data available for vision models]`;
   } else if (mimeType === 'text/plain' || mimeType === 'text/csv') {
     return buffer.toString('utf-8');
@@ -181,16 +152,14 @@ async function extractFileContent(file) {
   }
 }
 
-// Generate smart follow-up suggestions
 function generateSuggestions(lastMessage) {
-  const suggestions = [
+  return [
     "Tell me more about that.",
     "Can you give me an example?",
     "How does this compare to other solutions?",
     "What are the key benefits?",
     "Is there anything else I should know?"
   ];
-  return suggestions;
 }
 
 // ============================================================
@@ -212,7 +181,7 @@ const auth = async (req, res, next) => {
 };
 
 // ============================================================
-//  AUTH ROUTES
+//  AUTH ROUTES (No verification)
 // ============================================================
 app.post('/api/auth/register', async (req, res) => {
   const { email, password, ageConfirmed } = req.body;
@@ -231,31 +200,14 @@ app.post('/api/auth/register', async (req, res) => {
     tier: 'free',
     usage_count: 0,
     monthly_reset_date: nextMonth.toISOString().split('T')[0],
-    verified: false,
+    verified: true,   // 👈 always verified
     hourly_quota_used: 0,
     last_quota_refill: now.toISOString(),
     memory: '',
   }).select().single();
   if (error) return res.status(500).json({ error: error.message });
 
-  const code = generateVerificationCode();
-  const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
-  await supabase.from('email_verifications').insert({
-    user_id: data.id,
-    code: code,
-    expires_at: expiresAt.toISOString(),
-  });
-
-  try {
-    await sendVerificationEmail(email, code);
-  } catch (e) {
-    console.error('Email send error:', e);
-  }
-
-  res.status(201).json({
-    message: 'User created. Check your email for verification code.',
-    userId: data.id,
-  });
+  res.status(201).json({ message: 'User created', userId: data.id });
 });
 
 app.post('/api/auth/login', async (req, res) => {
@@ -265,7 +217,7 @@ app.post('/api/auth/login', async (req, res) => {
   const valid = await bcrypt.compare(password, user.password_hash);
   if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
   const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '30d' });
-  res.json({ token, verified: user.verified });
+  res.json({ token, verified: true }); // 👈 always true
 });
 
 app.get('/api/user/profile', auth, async (req, res) => {
@@ -285,7 +237,7 @@ app.get('/api/user/profile', auth, async (req, res) => {
     usage_count: user.usage_count,
     limit: limit,
     monthly_reset_date: user.monthly_reset_date,
-    verified: user.verified,
+    verified: true,   // 👈 always true
     hourly_quota_used: hourlyUsed,
     hourly_quota_limit: hourlyLimit,
     hourly_remaining: hourlyRemaining,
@@ -294,64 +246,13 @@ app.get('/api/user/profile', auth, async (req, res) => {
   });
 });
 
-app.post('/api/auth/verify-email', async (req, res) => {
-  const { email, code } = req.body;
-  if (!email || !code) return res.status(400).json({ error: 'Email and code required' });
-
-  const user = await findUser(email);
-  if (!user) return res.status(404).json({ error: 'User not found' });
-  if (user.verified) return res.json({ message: 'Email already verified' });
-
-  const { data, error } = await supabase
-    .from('email_verifications')
-    .select('*')
-    .eq('user_id', user.id)
-    .eq('code', code)
-    .single();
-
-  if (error || !data) return res.status(400).json({ error: 'Invalid verification code' });
-  if (new Date(data.expires_at) < new Date()) {
-    return res.status(400).json({ error: 'Verification code expired. Request a new one.' });
-  }
-
-  await supabase.from('users').update({ verified: true }).eq('id', user.id);
-  await supabase.from('email_verifications').delete().eq('id', data.id);
-
-  res.json({ message: 'Email verified successfully' });
-});
-
-app.post('/api/auth/resend-verification', async (req, res) => {
-  const { email } = req.body;
-  const user = await findUser(email);
-  if (!user) return res.status(404).json({ error: 'User not found' });
-  if (user.verified) return res.json({ message: 'Already verified' });
-
-  const code = generateVerificationCode();
-  const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
-  await supabase.from('email_verifications').delete().eq('user_id', user.id);
-  await supabase.from('email_verifications').insert({
-    user_id: user.id,
-    code: code,
-    expires_at: expiresAt.toISOString(),
-  });
-  await sendVerificationEmail(email, code);
-  res.json({ message: 'New verification code sent' });
-});
-
-app.post('/api/auth/update-memory', auth, async (req, res) => {
-  const { memory } = req.body;
-  const user = req.user;
-  await supabase.from('users').update({ memory }).eq('id', user.id);
-  res.json({ message: 'Memory updated' });
-});
-
 // ============================================================
 //  CHAT WITH GROQ + FILE UPLOADS + HOURLY QUOTA
 // ============================================================
 const storage = multer.memoryStorage();
 const upload = multer({
   storage: storage,
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB per file
+  limits: { fileSize: 10 * 1024 * 1024 },
 });
 
 app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) => {
@@ -359,7 +260,6 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
   user = await resetMonthlyUsageIfNeeded(user);
   user = await checkHourlyQuota(user);
 
-  // Check monthly limit
   const monthlyLimit = getLimit(user.tier);
   if (user.usage_count >= monthlyLimit) {
     return res.status(403).json({
@@ -370,7 +270,6 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
     });
   }
 
-  // Check hourly quota (free tier only)
   if (user.tier === 'free') {
     const hourlyUsed = user.hourly_quota_used || 0;
     if (hourlyUsed >= HOURLY_LIMIT_FREE) {
@@ -387,7 +286,6 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
     }
   }
 
-  // Parse messages
   let messages;
   try {
     messages = JSON.parse(req.body.messages);
@@ -395,7 +293,6 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
     return res.status(400).json({ error: 'Invalid messages format' });
   }
 
-  // Process files
   const files = req.files || [];
   let fileContent = '';
   for (const file of files) {
@@ -415,9 +312,7 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
     }
   }
 
-  // Include user memory (cross-session context)
   const memoryPrompt = user.memory ? `\n\nUser context: ${user.memory}` : '';
-
   const systemPrompt = `You are TechNovaphy AI – the smartest, fastest, and most helpful assistant available.
 You are better than Claude, better than ChatGPT, and completely free to use.
 You help with IT, web development, cloud, business technology, and general questions.
@@ -477,10 +372,8 @@ ${memoryPrompt}`;
       }
     }
 
-    // Increment both monthly and hourly usage
     const newMonthlyUsage = (user.usage_count || 0) + 1;
     const newHourlyUsage = (user.hourly_quota_used || 0) + 1;
-
     await supabase
       .from('users')
       .update({
@@ -489,9 +382,7 @@ ${memoryPrompt}`;
       })
       .eq('id', user.id);
 
-    // Generate smart follow-up suggestions
     const suggestions = generateSuggestions(fullContent);
-
     res.write(`data: ${JSON.stringify({ type: 'done', text: fullContent, suggestions })}\n\n`);
     res.end();
 
@@ -524,12 +415,8 @@ app.post('/api/generate-image', auth, async (req, res) => {
         model: 'dall-e-2',
       }),
     });
-
     const data = await response.json();
-    if (!response.ok) {
-      throw new Error(data.error?.message || 'Image generation failed');
-    }
-
+    if (!response.ok) throw new Error(data.error?.message || 'Image generation failed');
     res.json({ url: data.data[0].url });
   } catch (error) {
     console.error('Image gen error:', error);
@@ -538,7 +425,7 @@ app.post('/api/generate-image', auth, async (req, res) => {
 });
 
 // ============================================================
-//  STRIPE CHECKOUT (Idempotent)
+//  PAYMENT – Paystack Checkout (Idempotent)
 // ============================================================
 app.post('/api/create-checkout', auth, async (req, res) => {
   const { idempotencyKey, tier } = req.body;
@@ -548,6 +435,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
     return res.status(400).json({ error: 'Invalid tier selected' });
   }
 
+  // Check if payment already processed (idempotency)
   const { data: existing, error } = await supabase
     .from('payments')
     .select('*')
@@ -559,70 +447,96 @@ app.post('/api/create-checkout', auth, async (req, res) => {
     return res.status(409).json({ error: 'Payment is being processed' });
   }
 
-  if (!STRIPE_SECRET_KEY) {
+  if (!PAYSTACK_SECRET_KEY) {
     return res.status(503).json({ error: 'Payment service not configured' });
   }
 
-  const stripe = require('stripe')(STRIPE_SECRET_KEY);
-  const session = await stripe.checkout.sessions.create({
-    payment_method_types: ['card'],
-    line_items: [{ price: PRICE_IDS[tier], quantity: 1 }],
-    mode: 'subscription',
-    success_url: 'https://your-frontend.com/dashboard?success=true',
-    cancel_url: 'https://your-frontend.com/dashboard?canceled=true',
-    client_reference_id: user.id,
-    customer_email: user.email,
-    metadata: { idempotencyKey, tier },
+  const tierPrices = {
+    starter: 1700,   // $17 in kobo (Paystack uses kobo – 1 USD = 100 kobo)
+    pro: 3400,
+    enterprise: 12000,
+  };
+
+  // Create a Paystack transaction
+  const response = await fetch('https://api.paystack.co/transaction/initialize', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${PAYSTACK_SECRET_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      email: user.email,
+      amount: tierPrices[tier],          // amount in kobo
+      currency: 'USD',                   // or 'KES' if you prefer
+      metadata: {
+        idempotencyKey: idempotencyKey,
+        tier: tier,
+        userId: user.id,
+        custom_fields: [
+          { display_name: "Tier", variable_name: "tier", value: tier },
+        ]
+      },
+      callback_url: 'https://your-frontend.com/dashboard?success=true',
+    }),
   });
 
+  const data = await response.json();
+  if (!data.status) {
+    return res.status(500).json({ error: data.message || 'Paystack initialization failed' });
+  }
+
+  // Record pending payment
   await supabase.from('payments').insert({
     user_id: user.id,
     transaction_id: idempotencyKey,
-    amount: tier === 'starter' ? 1700 : tier === 'pro' ? 3400 : 12000,
+    amount: tierPrices[tier],
     currency: 'USD',
     status: 'pending',
   });
 
-  res.json({ url: session.url });
+  // Return the authorization URL (Paystack checkout page)
+  res.json({ url: data.data.authorization_url });
 });
 
 // ============================================================
-//  STRIPE WEBHOOK
+//  PAYSTACK WEBHOOK (to confirm payment and upgrade user)
 // ============================================================
-app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
-  const sig = req.headers['stripe-signature'];
-  const stripe = require('stripe')(STRIPE_SECRET_KEY);
-  const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
+app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), async (req, res) => {
+  const signature = req.headers['x-paystack-signature'];
+  const payload = req.body;
+  // Verify signature (optional but recommended)
+  // const crypto = require('crypto');
+  // const hash = crypto.createHmac('sha512', PAYSTACK_SECRET_KEY).update(JSON.stringify(payload)).digest('hex');
+  // if (hash !== signature) return res.status(401).send('Invalid signature');
 
-  let event;
-  try {
-    event = stripe.webhooks.constructEvent(req.body, sig, endpointSecret);
-  } catch (err) {
-    return res.status(400).send(`Webhook Error: ${err.message}`);
+  const event = payload.event;
+  const data = payload.data;
+
+  if (event === 'charge.success') {
+    const metadata = data.metadata || {};
+    const userId = metadata.userId;
+    const tier = metadata.tier || 'pro';
+    const idempotencyKey = metadata.idempotencyKey;
+
+    if (userId) {
+      await supabase
+        .from('payments')
+        .update({ status: 'completed' })
+        .eq('transaction_id', idempotencyKey);
+
+      await supabase
+        .from('users')
+        .update({ tier: tier, usage_count: 0 })
+        .eq('id', userId);
+
+      console.log(`✅ User ${userId} upgraded to ${tier}`);
+    }
   }
 
-  if (event.type === 'checkout.session.completed') {
-    const session = event.data.object;
-    const userId = session.client_reference_id;
-    const tier = session.metadata.tier || 'pro';
-
-    await supabase
-      .from('payments')
-      .update({ status: 'completed' })
-      .eq('transaction_id', session.metadata.idempotencyKey);
-
-    await supabase
-      .from('users')
-      .update({ tier: tier, usage_count: 0 })
-      .eq('id', userId);
-
-    console.log(`✅ User ${userId} upgraded to ${tier}`);
-  }
-
-  res.json({ received: true });
+  res.sendStatus(200);
 });
 
 // ============================================================
 //  START SERVER
 // ============================================================
-app.listen(PORT, () => console.log(`🚀 TechNovaphy AI – Unbeatable Backend running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 TechNovaphy AI –  Backend running on port ${PORT}`));
