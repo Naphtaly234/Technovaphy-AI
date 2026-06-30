@@ -1,5 +1,5 @@
 // ============================================================
-//  TECHNOVAPHY AI – BACKEND (ORIGINAL, WORKING + CORS FIX)
+//  TECHNOVAPHY AI – COMPLETE BACKEND (WORKING + CORS FIX)
 // ============================================================
 require('dotenv').config();
 
@@ -20,17 +20,17 @@ const app = express();
 // ============================================================
 //  1. CORS – WIDE OPEN (allows any origin)
 // ============================================================
-app.use(cors()); // ✅ This is the fix – now your frontend can connect
+app.use(cors());
 
 // ============================================================
-//  2. MIDDLEWARE (same as original)
+//  2. MIDDLEWARE
 // ============================================================
 app.use(helmet());
 app.use(morgan('combined'));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
-// Rate limiting – returns JSON instead of plain text
+// Rate limiter – returns JSON (not plain text)
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
@@ -42,7 +42,7 @@ app.use('/api/auth/login', authLimiter);
 app.use('/api/auth/register', authLimiter);
 
 // ============================================================
-//  3. ENVIRONMENT VARIABLES
+//  3. ENVIRONMENT VARIABLES (with fallbacks)
 // ============================================================
 const PORT = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET || 'your_secret_key';
@@ -74,7 +74,7 @@ const TIER_NAMES = {
 const HOURLY_LIMIT_FREE = 5;
 
 // ============================================================
-//  5. HELPERS (exactly as they were)
+//  5. HELPERS
 // ============================================================
 async function findUser(email) {
   const { data, error } = await supabase
@@ -213,7 +213,7 @@ const auth = async (req, res, next) => {
 };
 
 // ============================================================
-//  7. HEALTH CHECK & ROOT
+//  7. HEALTH & TEST ENDPOINTS
 // ============================================================
 app.get('/', (req, res) => {
   res.send('TechNovaphy AI Backend is running');
@@ -221,6 +221,11 @@ app.get('/', (req, res) => {
 
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', message: 'TechNovaphy AI backend is live!' });
+});
+
+// ✅ PUBLIC PING – use this to test if backend is reachable
+app.get('/api/ping', (req, res) => {
+  res.json({ status: 'ok', message: 'Backend is reachable!' });
 });
 
 // ============================================================
