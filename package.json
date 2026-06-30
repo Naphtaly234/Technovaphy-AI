@@ -1,0 +1,16 @@
+{
+  "name": "technovaphy-ai",
+  "version": "1.0.0",
+  "main": "technovaphyai.js",
+  "scripts": {
+    "start": "node technovaphyai.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "jsonwebtoken": "^9.0.0",
+    "bcrypt": "^5.1.0",
+    "uuid": "^9.0.0",
+    "@supabase/supabase-js": "^2.38.0"
+  }
+}
