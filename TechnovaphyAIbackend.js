@@ -42,18 +42,18 @@ app.use('/api/auth/login', authLimiter);
 app.use('/api/auth/register', authLimiter);
 
 // ============================================================
-//  ENVIRONMENT VARIABLES – STRICT CHECK
+//  ENVIRONMENT VARIABLES – WARN BUT DON'T EXIT
 // ============================================================
-const required = ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'JWT_SECRET', 'GROQ_API_KEY', 'PAYSTACK_SECRET_KEY', 'OPENAI_API_KEY'];
+const required = ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'JWT_SECRET', 'GROQ_API_KEY'];
 const missing = required.filter(key => !process.env[key]);
 if (missing.length) {
-    console.error('❌ Missing required environment variables:', missing.join(', '));
-    console.error('   Please set all of them in Render.');
-    process.exit(1);
+    console.warn('⚠️ Missing required environment variables:', missing.join(', '));
+    console.warn('   Some features may not work.');
 }
+// Optional keys: PAYSTACK_SECRET_KEY, OPENAI_API_KEY
 
 const PORT = process.env.PORT || 3001;
-const JWT_SECRET = process.env.JWT_SECRET;
+const JWT_SECRET = process.env.JWT_SECRET || 'fallback_secret_please_change';
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
@@ -61,7 +61,11 @@ const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://your-netlify-url.netlify.app';
 
-console.log(`✅ Using Supabase Service Role Key (length: ${SUPABASE_SERVICE_ROLE_KEY.length})`);
+if (SUPABASE_SERVICE_ROLE_KEY) {
+    console.log(`✅ Using Supabase Service Role Key (length: ${SUPABASE_SERVICE_ROLE_KEY.length})`);
+} else {
+    console.warn('⚠️ SUPABASE_SERVICE_ROLE_KEY not set. Database operations will fail.');
+}
 
 // ============================================================
 //  SUPABASE CLIENT
@@ -69,7 +73,7 @@ console.log(`✅ Using Supabase Service Role Key (length: ${SUPABASE_SERVICE_ROL
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 // ============================================================
-//  TEST DATABASE CONNECTION ON STARTUP
+//  TEST DATABASE CONNECTION ON STARTUP – WARN ONLY
 // ============================================================
 (async function initDb() {
     try {
@@ -77,12 +81,12 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
         if (error) {
             console.error('❌ Database connection failed:', error.message);
             console.error('   Make sure table "users" exists in public schema and key is correct.');
-            process.exit(1);
+        } else {
+            console.log('✅ Database connected successfully.');
         }
-        console.log('✅ Database connected successfully.');
     } catch (e) {
         console.error('❌ Fatal database error:', e.message);
-        process.exit(1);
+        console.error('   Check Supabase connectivity.');
     }
 })();
 
@@ -100,6 +104,7 @@ const HOURLY_LIMIT_FREE = 5;
 
 // ---------- User Helpers ----------
 async function findUser(email) {
+    if (!SUPABASE_SERVICE_ROLE_KEY) throw new Error('Supabase not configured');
     const { data, error } = await supabase
         .from('users')
         .select('*')
@@ -110,6 +115,7 @@ async function findUser(email) {
 }
 
 async function findUserById(id) {
+    if (!SUPABASE_SERVICE_ROLE_KEY) throw new Error('Supabase not configured');
     const { data, error } = await supabase
         .from('users')
         .select('*')
@@ -120,6 +126,7 @@ async function findUserById(id) {
 }
 
 async function resetMonthlyUsageIfNeeded(user) {
+    if (!SUPABASE_SERVICE_ROLE_KEY) return user;
     const now = new Date();
     const resetDate = new Date(user.monthly_reset_date);
     if (now >= resetDate) {
@@ -140,6 +147,7 @@ async function resetMonthlyUsageIfNeeded(user) {
 
 async function checkHourlyQuota(user) {
     if (user.tier !== 'free') return user;
+    if (!SUPABASE_SERVICE_ROLE_KEY) return user;
     const now = new Date();
     const lastRefill = new Date(user.last_quota_refill);
     const hoursSinceRefill = (now - lastRefill) / (1000 * 60 * 60);
@@ -164,6 +172,7 @@ function getLimit(tier) {
 
 // ---------- Conversation Memory ----------
 async function getConversation(userId) {
+    if (!SUPABASE_SERVICE_ROLE_KEY) return [];
     const { data, error } = await supabase
         .from('conversations')
         .select('messages')
@@ -174,7 +183,7 @@ async function getConversation(userId) {
 }
 
 async function saveConversation(userId, messages) {
-    // Upsert: insert or update
+    if (!SUPABASE_SERVICE_ROLE_KEY) return;
     const { error } = await supabase
         .from('conversations')
         .upsert({
@@ -526,7 +535,7 @@ ${memoryPrompt}`;
 });
 
 // ============================================================
-//  IMAGE GENERATION (OpenAI DALL‑E) – REQUIRED
+//  IMAGE GENERATION (OpenAI DALL‑E) – OPTIONAL
 // ============================================================
 app.post('/api/generate-image', auth, async (req, res) => {
     try {
