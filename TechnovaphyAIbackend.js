@@ -1,6 +1,6 @@
 // ============================================================
 //  TECHNOVAPHY AI – UNBEATABLE BACKEND
-//  No email verification | Paystack payments | Rolling quota
+//  Beats Claude, ChatGPT, and Gemini in features, speed, and price.
 // ============================================================
 require('dotenv').config();
 
@@ -15,7 +15,18 @@ const pdfParse = require('pdf-parse');
 const mime = require('mime-types');
 
 const app = express();
-app.use(cors());
+
+// ============================================================
+//  CORS – Allow any frontend (can restrict later)
+// ============================================================
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true,
+}));
+app.options('*', cors());
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -27,7 +38,7 @@ const JWT_SECRET = process.env.JWT_SECRET || 'your_secret_key';
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
-const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY; // 👈 new
+const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
@@ -43,25 +54,13 @@ const TIER_LIMITS = {
 };
 
 const TIER_NAMES = {
-  free: 'Free',
-  starter: 'Starter ($17/mo)',
-  pro: 'Pro ($34/mo)',
-  enterprise: 'Enterprise ($120/mo)',
+  free: 'Free (5 msgs/hour)',
+  starter: 'Starter ($17/mo) – 550 msg',
+  pro: 'Pro ($34/mo) – 2,500 msg',
+  enterprise: 'Enterprise ($120/mo) – Unlimited',
 };
 
-const HOURLY_LIMIT_FREE = 5;
-
-// Paystack plan codes (create these in your Paystack dashboard)
-// For subscriptions, you need to create a plan first.
-// We'll use a simplified approach: one‑time payment + manual tier update,
-// or you can create plans and use the subscription endpoint.
-// Here we'll implement a one‑time payment that upgrades the user.
-// For full subscriptions, you'd use Paystack's subscription API.
-const PAYSTACK_PLANS = {
-  starter: 'PLN_starter_17',   // create these in Paystack
-  pro: 'PLN_pro_34',
-  enterprise: 'PLN_enterprise_120',
-};
+const HOURLY_LIMIT_FREE = 5; // 5 messages per hour for free tier
 
 // ============================================================
 //  HELPERS
@@ -181,7 +180,14 @@ const auth = async (req, res, next) => {
 };
 
 // ============================================================
-//  AUTH ROUTES (No verification)
+//  HEALTH CHECK – for debugging
+// ============================================================
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok', message: 'TechNovaphy AI backend is live!' });
+});
+
+// ============================================================
+//  AUTH ROUTES (no email verification)
 // ============================================================
 app.post('/api/auth/register', async (req, res) => {
   const { email, password, ageConfirmed } = req.body;
@@ -200,7 +206,7 @@ app.post('/api/auth/register', async (req, res) => {
     tier: 'free',
     usage_count: 0,
     monthly_reset_date: nextMonth.toISOString().split('T')[0],
-    verified: true,   // 👈 always verified
+    verified: true,
     hourly_quota_used: 0,
     last_quota_refill: now.toISOString(),
     memory: '',
@@ -217,7 +223,7 @@ app.post('/api/auth/login', async (req, res) => {
   const valid = await bcrypt.compare(password, user.password_hash);
   if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
   const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '30d' });
-  res.json({ token, verified: true }); // 👈 always true
+  res.json({ token, verified: true });
 });
 
 app.get('/api/user/profile', auth, async (req, res) => {
@@ -237,13 +243,20 @@ app.get('/api/user/profile', auth, async (req, res) => {
     usage_count: user.usage_count,
     limit: limit,
     monthly_reset_date: user.monthly_reset_date,
-    verified: true,   // 👈 always true
+    verified: true,
     hourly_quota_used: hourlyUsed,
     hourly_quota_limit: hourlyLimit,
     hourly_remaining: hourlyRemaining,
     last_quota_refill: user.last_quota_refill,
     memory: user.memory || '',
   });
+});
+
+app.post('/api/auth/update-memory', auth, async (req, res) => {
+  const { memory } = req.body;
+  const user = req.user;
+  await supabase.from('users').update({ memory }).eq('id', user.id);
+  res.json({ message: 'Memory updated' });
 });
 
 // ============================================================
@@ -347,7 +360,6 @@ ${memoryPrompt}`;
     const decoder = new TextDecoder();
     let buffer = '';
     let fullContent = '';
-    const chunks = [];
 
     while (true) {
       const { done, value } = await reader.read();
@@ -363,7 +375,6 @@ ${memoryPrompt}`;
             const json = JSON.parse(data);
             const text = json.choices[0]?.delta?.content || '';
             if (text) {
-              chunks.push(text);
               fullContent += text;
               res.write(`data: ${JSON.stringify({ type: 'chunk', text })}\n\n`);
             }
@@ -427,6 +438,12 @@ app.post('/api/generate-image', auth, async (req, res) => {
 // ============================================================
 //  PAYMENT – Paystack Checkout (Idempotent)
 // ============================================================
+const PAYSTACK_PLANS = {
+  starter: 'PLN_starter_17',
+  pro: 'PLN_pro_34',
+  enterprise: 'PLN_enterprise_120',
+};
+
 app.post('/api/create-checkout', auth, async (req, res) => {
   const { idempotencyKey, tier } = req.body;
   const user = req.user;
@@ -435,7 +452,6 @@ app.post('/api/create-checkout', auth, async (req, res) => {
     return res.status(400).json({ error: 'Invalid tier selected' });
   }
 
-  // Check if payment already processed (idempotency)
   const { data: existing, error } = await supabase
     .from('payments')
     .select('*')
@@ -452,12 +468,11 @@ app.post('/api/create-checkout', auth, async (req, res) => {
   }
 
   const tierPrices = {
-    starter: 1700,   // $17 in kobo (Paystack uses kobo – 1 USD = 100 kobo)
+    starter: 1700,
     pro: 3400,
     enterprise: 12000,
   };
 
-  // Create a Paystack transaction
   const response = await fetch('https://api.paystack.co/transaction/initialize', {
     method: 'POST',
     headers: {
@@ -466,15 +481,12 @@ app.post('/api/create-checkout', auth, async (req, res) => {
     },
     body: JSON.stringify({
       email: user.email,
-      amount: tierPrices[tier],          // amount in kobo
-      currency: 'USD',                   // or 'KES' if you prefer
+      amount: tierPrices[tier],
+      currency: 'USD',
       metadata: {
         idempotencyKey: idempotencyKey,
         tier: tier,
         userId: user.id,
-        custom_fields: [
-          { display_name: "Tier", variable_name: "tier", value: tier },
-        ]
       },
       callback_url: 'https://your-frontend.com/dashboard?success=true',
     }),
@@ -485,7 +497,6 @@ app.post('/api/create-checkout', auth, async (req, res) => {
     return res.status(500).json({ error: data.message || 'Paystack initialization failed' });
   }
 
-  // Record pending payment
   await supabase.from('payments').insert({
     user_id: user.id,
     transaction_id: idempotencyKey,
@@ -494,7 +505,6 @@ app.post('/api/create-checkout', auth, async (req, res) => {
     status: 'pending',
   });
 
-  // Return the authorization URL (Paystack checkout page)
   res.json({ url: data.data.authorization_url });
 });
 
@@ -504,7 +514,8 @@ app.post('/api/create-checkout', auth, async (req, res) => {
 app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), async (req, res) => {
   const signature = req.headers['x-paystack-signature'];
   const payload = req.body;
-  // Verify signature (optional but recommended)
+
+  // Optional: verify signature (uncomment when you have the secret)
   // const crypto = require('crypto');
   // const hash = crypto.createHmac('sha512', PAYSTACK_SECRET_KEY).update(JSON.stringify(payload)).digest('hex');
   // if (hash !== signature) return res.status(401).send('Invalid signature');
@@ -539,4 +550,4 @@ app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), as
 // ============================================================
 //  START SERVER
 // ============================================================
-app.listen(PORT, () => console.log(`🚀 TechNovaphy AI –  Backend running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 TechNovaphy AI –Backend running on port ${PORT}`));
