@@ -550,7 +550,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
                     tier: tier,
                     userId: user.id,
                 },
-                callback_url: process.env.FRONTEND_URL || 'https://graceful-marshmallow-d90826.netlify.app/?success=true',
+                callback_url: process.env.FRONTEND_URL || 'https://your-netlify-url.netlify.app/?success=true',
             }),
         });
 
