@@ -17,42 +17,37 @@ const mime = require('mime-types');
 const app = express();
 
 // ============================================================
-//  1. SECURITY MIDDLEWARE (Helmet, CORS, Rate Limiting)
+//  1. CORS – PERMISSIVE (fixes "Failed to fetch")
 // ============================================================
-
-// Helmet: sets secure HTTP headers
-app.use(helmet());
-
-// Morgan: request logging (optional, but helpful)
-app.use(morgan('combined'));
-
-// CORS: restrict to your frontend domain
-const allowedOrigins = process.env.FRONTEND_URL
-  ? [process.env.FRONTEND_URL]
-  : ['https://your-frontend-domain.com']; // Change this!
 app.use(cors({
-  origin: allowedOrigins,
+  origin: '*',
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
 }));
 app.options('*', cors());
 
+// ============================================================
+//  2. SECURITY MIDDLEWARE (Helmet, Rate Limiting, Logging)
+// ============================================================
+app.use(helmet());
+app.use(morgan('combined'));
+
 // Request size limits
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
-// Rate limiting on auth endpoints (prevent brute‑force)
+// Rate limiting on auth endpoints
 const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 10, // 10 attempts per window
+  windowMs: 15 * 60 * 1000,
+  max: 10,
   message: 'Too many login attempts. Please try again later.',
 });
 app.use('/api/auth/login', authLimiter);
 app.use('/api/auth/register', authLimiter);
 
 // ============================================================
-//  2. ENVIRONMENT VARIABLES
+//  3. ENVIRONMENT VARIABLES
 // ============================================================
 const PORT = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET || 'your_secret_key';
@@ -65,7 +60,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 // ============================================================
-//  3. CONSTANTS
+//  4. CONSTANTS
 // ============================================================
 const TIER_LIMITS = {
   free: 200,
@@ -84,7 +79,7 @@ const TIER_NAMES = {
 const HOURLY_LIMIT_FREE = 5;
 
 // ============================================================
-//  4. HELPERS
+//  5. HELPERS
 // ============================================================
 async function findUser(email) {
   const { data, error } = await supabase
@@ -149,7 +144,7 @@ function getLimit(tier) {
   return TIER_LIMITS[tier] || 200;
 }
 
-// File upload security: only allow safe types
+// File upload security
 const storage = multer.memoryStorage();
 const fileFilter = (req, file, cb) => {
   const allowedTypes = [
@@ -167,7 +162,7 @@ const fileFilter = (req, file, cb) => {
 };
 const upload = multer({
   storage: storage,
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB
+  limits: { fileSize: 10 * 1024 * 1024 },
   fileFilter: fileFilter,
 });
 
@@ -205,7 +200,7 @@ function generateSuggestions(lastMessage) {
 }
 
 // ============================================================
-//  5. AUTH MIDDLEWARE
+//  6. AUTH MIDDLEWARE
 // ============================================================
 const auth = async (req, res, next) => {
   const authHeader = req.headers.authorization;
@@ -223,14 +218,14 @@ const auth = async (req, res, next) => {
 };
 
 // ============================================================
-//  6. HEALTH CHECK
+//  7. HEALTH CHECK
 // ============================================================
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', message: 'TechNovaphy AI backend is live!' });
 });
 
 // ============================================================
-//  7. AUTH ROUTES (no email verification)
+//  8. AUTH ROUTES (no email verification)
 // ============================================================
 app.post('/api/auth/register', async (req, res) => {
   const { email, password, ageConfirmed } = req.body;
@@ -264,7 +259,6 @@ app.post('/api/auth/login', async (req, res) => {
   if (!user) return res.status(401).json({ error: 'Invalid credentials' });
   const valid = await bcrypt.compare(password, user.password_hash);
   if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
-  // JWT expires in 7 days (more secure than 30 days)
   const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '7d' });
   res.json({ token, verified: true });
 });
@@ -303,7 +297,7 @@ app.post('/api/auth/update-memory', auth, async (req, res) => {
 });
 
 // ============================================================
-//  8. CHAT WITH GROQ + FILE UPLOADS + HOURLY QUOTA
+//  9. CHAT WITH GROQ + FILE UPLOADS + HOURLY QUOTA
 // ============================================================
 app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) => {
   let user = req.user;
@@ -442,7 +436,7 @@ ${memoryPrompt}`;
 });
 
 // ============================================================
-//  9. IMAGE GENERATION (DALL‑E)
+//  10. IMAGE GENERATION (DALL‑E)
 // ============================================================
 app.post('/api/generate-image', auth, async (req, res) => {
   const { prompt } = req.body;
@@ -473,7 +467,7 @@ app.post('/api/generate-image', auth, async (req, res) => {
 });
 
 // ============================================================
-//  10. PAYMENT – Paystack Checkout (Idempotent)
+//  11. PAYMENT – Paystack Checkout (Idempotent)
 // ============================================================
 app.post('/api/create-checkout', auth, async (req, res) => {
   const { idempotencyKey, tier } = req.body;
@@ -540,7 +534,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
 });
 
 // ============================================================
-//  11. PAYSTACK WEBHOOK
+//  12. PAYSTACK WEBHOOK
 // ============================================================
 app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), async (req, res) => {
   const signature = req.headers['x-paystack-signature'];
@@ -579,6 +573,6 @@ app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), as
 });
 
 // ============================================================
-//  12. START SERVER
+//  13. START SERVER
 // ============================================================
-app.listen(PORT, () => console.log(`🚀 TechNovaphy AI – Backend running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 TechNovaphy AI –Backend running on port ${PORT}`));
