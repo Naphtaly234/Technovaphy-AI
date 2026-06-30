@@ -1,5 +1,5 @@
 // ============================================================
-//  TECHNOVAPHY AI – COMPLETE BACKEND (ALL FEATURES + DB TEST)
+//  TECHNOVAPHY AI – COMPLETE BACKEND (FINAL)
 // ============================================================
 require('dotenv').config();
 
@@ -15,7 +15,7 @@ const pdfParse = require('pdf-parse');
 const app = express();
 
 // ============================================================
-//  1. CORS – EXPLICIT
+//  1. CORS
 // ============================================================
 app.use(cors({
     origin: '*',
@@ -42,7 +42,7 @@ app.use('/api/auth/login', authLimiter);
 app.use('/api/auth/register', authLimiter);
 
 // ============================================================
-//  3. ENVIRONMENT VARIABLES – WITH FALLBACKS
+//  3. ENVIRONMENT VARIABLES
 // ============================================================
 const PORT = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET || 'your_secret_key_change_me';
@@ -53,6 +53,7 @@ const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
+// Validate required
 if (!SUPABASE_URL) {
     console.error('❌ SUPABASE_URL is required');
     process.exit(1);
@@ -63,7 +64,7 @@ if (!SUPABASE_KEY) {
     process.exit(1);
 }
 
-console.log(`✅ Using Supabase key type: ${SUPABASE_SERVICE_ROLE_KEY ? 'Service Role' : 'Anon'}`);
+console.log(`✅ Using key type: ${SUPABASE_SERVICE_ROLE_KEY ? 'Service Role' : 'Anon'}`);
 console.log(`✅ Supabase URL: ${SUPABASE_URL}`);
 
 // ============================================================
@@ -72,7 +73,7 @@ console.log(`✅ Supabase URL: ${SUPABASE_URL}`);
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 // ============================================================
-//  5. CONSTANTS
+//  5. CONSTANTS & HELPERS (ALL FEATURES)
 // ============================================================
 const TIER_LIMITS = { free: 200, starter: 550, pro: 2500, enterprise: Infinity };
 const TIER_NAMES = {
@@ -83,9 +84,6 @@ const TIER_NAMES = {
 };
 const HOURLY_LIMIT_FREE = 5;
 
-// ============================================================
-//  6. HELPERS
-// ============================================================
 async function findUser(email) {
     const { data, error } = await supabase
         .from('users')
@@ -205,7 +203,7 @@ function generateSuggestions(lastMessage) {
 }
 
 // ============================================================
-//  7. AUTH MIDDLEWARE
+//  6. AUTH MIDDLEWARE
 // ============================================================
 const auth = async (req, res, next) => {
     const authHeader = req.headers.authorization;
@@ -223,22 +221,20 @@ const auth = async (req, res, next) => {
 };
 
 // ============================================================
-//  8. PUBLIC ENDPOINTS
+//  7. PUBLIC ENDPOINTS
 // ============================================================
 app.get('/', (req, res) => res.send('TechNovaphy AI Backend is running'));
 app.get('/api/health', (req, res) => res.json({ status: 'ok', message: 'Backend is live!' }));
 app.get('/api/ping', (req, res) => res.json({ status: 'ok', message: 'Backend is reachable!' }));
 
 // ============================================================
-//  9. DATABASE TEST ENDPOINT (NO AUTH)
+//  8. DATABASE TEST ENDPOINT (NO AUTH)
 // ============================================================
 app.get('/api/test-db', async (req, res) => {
     try {
-        // Try to read from users table (count rows)
         const { count, error } = await supabase
             .from('users')
             .select('*', { count: 'exact', head: true });
-
         if (error) {
             return res.status(500).json({
                 success: false,
@@ -246,7 +242,6 @@ app.get('/api/test-db', async (req, res) => {
                 hint: 'Check that table "users" exists in public schema and your key has permissions.'
             });
         }
-
         res.json({
             success: true,
             message: `✅ Connected to users table (${count} rows)`,
@@ -263,7 +258,7 @@ app.get('/api/test-db', async (req, res) => {
 });
 
 // ============================================================
-//  10. AUTH ROUTES
+//  9. AUTH ROUTES
 // ============================================================
 app.post('/api/auth/register', async (req, res) => {
     try {
@@ -364,7 +359,7 @@ app.post('/api/auth/update-memory', auth, async (req, res) => {
 });
 
 // ============================================================
-//  11. CHAT STREAM
+//  10. CHAT STREAM (all features)
 // ============================================================
 app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) => {
     try {
@@ -476,7 +471,7 @@ ${memoryPrompt}`;
                             fullContent += text;
                             res.write(`data: ${JSON.stringify({ type: 'chunk', text })}\n\n`);
                         }
-                    } catch (e) { /* ignore parse errors */ }
+                    } catch (e) { /* ignore */ }
                 }
             }
         }
@@ -507,7 +502,7 @@ ${memoryPrompt}`;
 });
 
 // ============================================================
-//  12. IMAGE GENERATION
+//  11. IMAGE GENERATION
 // ============================================================
 app.post('/api/generate-image', auth, async (req, res) => {
     try {
@@ -540,7 +535,7 @@ app.post('/api/generate-image', auth, async (req, res) => {
 });
 
 // ============================================================
-//  13. PAYMENT – Paystack Checkout
+//  12. PAYMENT – Paystack Checkout
 // ============================================================
 app.post('/api/create-checkout', auth, async (req, res) => {
     try {
@@ -612,7 +607,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
 });
 
 // ============================================================
-//  14. PAYSTACK WEBHOOK
+//  13. PAYSTACK WEBHOOK
 // ============================================================
 app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), async (req, res) => {
     try {
@@ -648,6 +643,6 @@ app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), as
 });
 
 // ============================================================
-//  15. START
+//  14. START
 // ============================================================
 app.listen(PORT, () => console.log(`🚀 TechNovaphy AI Backend running on port ${PORT}`));
