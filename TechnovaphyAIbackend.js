@@ -57,7 +57,8 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 const AGNES_API_KEY = process.env.AGNES_API_KEY;
-const AGNES_IMAGE_MODEL = process.env.AGNES_IMAGE_MODEL || 'Agnes-Image-2.1-Flash';
+// CHANGE: default model to 2.0-Flash
+const AGNES_IMAGE_MODEL = process.env.AGNES_IMAGE_MODEL || 'Agnes-Image-2.0-Flash';
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://your-frontend-url.netlify.app';
 const OWNER_EMAIL = process.env.OWNER_EMAIL || null;
 
@@ -616,7 +617,6 @@ app.post('/api/generate-image', auth, async (req, res) => {
 
         console.log(`🎨 Generating image with model: ${AGNES_IMAGE_MODEL}`);
 
-        // Agnes OpenAI‑compatible endpoint
         const response = await fetch('https://apihub.agnes-ai.com/v1/images/generations', {
             method: 'POST',
             headers: {
@@ -638,7 +638,6 @@ app.post('/api/generate-image', auth, async (req, res) => {
         }
 
         const data = await response.json();
-        // Expected format: { data: [ { url: '...' } ] } (OpenAI-compatible)
         const imageUrl = data?.data?.[0]?.url;
         if (!imageUrl) {
             console.error('❌ No image URL in Agnes response:', JSON.stringify(data));
@@ -667,7 +666,6 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             return res.status(400).json({ error: 'Invalid tier selected' });
         }
 
-        // Base price in KES
         const basePriceKES = TIER_PRICES_KES[tier];
         let finalCurrency = (currency || 'KES').toUpperCase();
 
@@ -675,7 +673,6 @@ app.post('/api/create-checkout', auth, async (req, res) => {
         if (finalCurrency === 'KES') {
             convertedAmount = basePriceKES;
         } else {
-            // Fetch live rates
             const rates = await fetchExchangeRates();
             const rate = rates[finalCurrency];
             if (!rate) {
@@ -684,7 +681,6 @@ app.post('/api/create-checkout', auth, async (req, res) => {
                 convertedAmount = basePriceKES;
             } else {
                 let amount = basePriceKES * rate;
-                // Convert to smallest unit for currencies with cents
                 const currenciesWithCents = ['USD','EUR','GBP','ZAR'];
                 if (currenciesWithCents.includes(finalCurrency)) {
                     convertedAmount = Math.round(amount * 100);
@@ -695,7 +691,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             }
         }
 
-        // ---- Check duplicate payment ----
+        // Check duplicate payment
         const { data: existing, error } = await supabase
             .from('payments')
             .select('*')
@@ -713,7 +709,6 @@ app.post('/api/create-checkout', auth, async (req, res) => {
 
         const paystackAmount = Math.round(convertedAmount);
 
-        // ---- Call Paystack ----
         const response = await fetch('https://api.paystack.co/transaction/initialize', {
             method: 'POST',
             headers: {
@@ -738,7 +733,6 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             return res.status(500).json({ error: data.message || 'Paystack initialization failed' });
         }
 
-        // ---- Record pending payment ----
         await supabase.from('payments').insert({
             user_id: user.id,
             transaction_id: idempotencyKey,
