@@ -413,7 +413,7 @@ app.get('/api/admin/users', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CHAT STREAM – WITH VISION SUPPORT (FIXED)
+//  CHAT STREAM – WITH VISION (UPDATED MODEL)
 // ============================================================
 app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) => {
     try {
@@ -531,7 +531,8 @@ ${memoryPrompt}`;
         groqMessages.push(userMessage);
 
         // ---- Determine which model to use ----
-        const model = hasImage ? 'llama-3.2-11b-vision-preview' : 'llama-3.3-70b-versatile';
+        // Fixed: using the recommended Llama 4 Scout for vision
+        const model = hasImage ? 'meta-llama/llama-4-scout-17b-16e-instruct' : 'llama-3.3-70b-versatile';
         console.log(`🧠 Using model: ${model} (hasImage: ${hasImage})`);
 
         // ---- Set up SSE headers ----
