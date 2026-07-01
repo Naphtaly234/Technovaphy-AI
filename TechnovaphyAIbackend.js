@@ -1,5 +1,7 @@
 // ============================================================
-//  TECHNOVAPHY AI – FIXED BACKEND (CORRECT AMOUNTS + CONVERSATION)
+//  TECHNOVAPHY AI – FINAL BACKEND
+//  - Forces KES amounts, ignores frontend amount
+//  - Free tier: 5 msgs/hour, 4‑hour lock if exceeded
 // ============================================================
 require('dotenv').config();
 
@@ -48,9 +50,12 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 // ============================================================
 const TIER_LIMITS = { free:200, basic:200, starter:550, pro:2500, enterprise:Infinity };
 const TIER_NAMES = { free:'Free (5 msgs/hour)', basic:'Basic (200 msgs/month)', starter:'Starter (550 msgs/month)', pro:'Pro (2500 msgs/month)', enterprise:'Enterprise (Unlimited)' };
-const HOURLY_LIMIT_FREE = 5;
 
-// Tier prices in KES (500, 1700, 3500, 15000)
+// Free tier: 5 messages per hour, then 4‑hour lock
+const FREE_HOURLY_LIMIT = 5;
+const FREE_LOCK_HOURS = 4; // lock duration in hours
+
+// Tier prices in KES (hardcoded)
 const TIER_PRICES_KES = {
     basic: 500,
     starter: 1700,
@@ -79,18 +84,35 @@ async function resetMonthlyUsageIfNeeded(user) {
     }
     return user;
 }
+
+// NEW: Check hourly quota with 4‑hour lock
 async function checkHourlyQuota(user) {
     if (user.tier !== 'free') return user;
+    
     const now = new Date();
     const lastRefill = new Date(user.last_quota_refill);
     const hoursSinceRefill = (now - lastRefill) / (1000*60*60);
-    if (hoursSinceRefill >= 1) {
-        const newRefill = now.toISOString();
-        await supabase.from('users').update({ hourly_quota_used:0, last_quota_refill:newRefill }).eq('id', user.id);
-        user.hourly_quota_used = 0; user.last_quota_refill = newRefill;
+    const used = user.hourly_quota_used || 0;
+
+    // If used >= limit, check if lock period is over
+    if (used >= FREE_HOURLY_LIMIT) {
+        // Lock period = FREE_LOCK_HOURS
+        const lockEnd = new Date(lastRefill.getTime() + FREE_LOCK_HOURS * 60 * 60 * 1000);
+        if (now < lockEnd) {
+            // Still locked
+            const minutesLeft = Math.ceil((lockEnd - now) / 60000);
+            throw new Error(`Free limit reached. Try again in ${minutesLeft} minutes.`);
+        } else {
+            // Lock expired, reset quota
+            const newRefill = now.toISOString();
+            await supabase.from('users').update({ hourly_quota_used:0, last_quota_refill:newRefill }).eq('id', user.id);
+            user.hourly_quota_used = 0; user.last_quota_refill = newRefill;
+        }
     }
+    // else: user hasn't reached limit, allow
     return user;
 }
+
 function getLimit(tier) { return TIER_LIMITS[tier] || 200; }
 
 // ===== CONVERSATION HELPERS =====
@@ -186,9 +208,9 @@ app.get('/api/user/profile', auth, async (req, res) => {
     try {
         let user = req.user;
         user = await resetMonthlyUsageIfNeeded(user);
-        user = await checkHourlyQuota(user);
+        // We'll handle hourly quota in the chat endpoint
         const limit = getLimit(user.tier);
-        const hourlyLimit = user.tier === 'free' ? HOURLY_LIMIT_FREE : Infinity;
+        const hourlyLimit = user.tier === 'free' ? FREE_HOURLY_LIMIT : Infinity;
         const hourlyUsed = user.hourly_quota_used || 0;
         const hourlyRemaining = user.tier === 'free' ? Math.max(0, hourlyLimit - hourlyUsed) : Infinity;
         res.json({
@@ -211,38 +233,35 @@ app.post('/api/auth/update-memory', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CHAT STREAM (CONVERSATION HISTORY INCLUDED)
+//  CHAT STREAM (with 4‑hour lock)
 // ============================================================
 app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) => {
     try {
         let user = req.user;
         user = await resetMonthlyUsageIfNeeded(user);
-        user = await checkHourlyQuota(user);
+
+        // Check monthly limit
         const monthlyLimit = getLimit(user.tier);
         if (user.usage_count >= monthlyLimit) {
             return res.status(403).json({ error: `You've reached your monthly limit of ${monthlyLimit} messages. Upgrade to continue.`, tier: user.tier, limit: monthlyLimit, used: user.usage_count });
         }
+
+        // Check hourly quota for free users (with 4‑hour lock)
         if (user.tier === 'free') {
-            const hourlyUsed = user.hourly_quota_used || 0;
-            if (hourlyUsed >= HOURLY_LIMIT_FREE) {
-                const lastRefill = new Date(user.last_quota_refill);
-                const nextRefill = new Date(lastRefill); nextRefill.setHours(nextRefill.getHours()+1);
-                const minutesLeft = Math.ceil((nextRefill - new Date()) / 60000);
-                return res.status(429).json({ error: `You've used all ${HOURLY_LIMIT_FREE} messages this hour. Refresh in ${minutesLeft} minutes.`, retry_after: minutesLeft*60, hourly_limit: HOURLY_LIMIT_FREE, hourly_used: hourlyUsed });
+            try {
+                user = await checkHourlyQuota(user);
+            } catch(lockError) {
+                // Lock error means user is in cooldown
+                return res.status(429).json({ error: lockError.message, hourly_limit: FREE_HOURLY_LIMIT, hourly_used: user.hourly_quota_used || 0 });
             }
         }
-        
-        // ===== GET CONVERSATION HISTORY =====
+
+        // ===== CONVERSATION LOGIC =====
         let conversation = await getConversation(user.id);
-        console.log(`📝 Retrieved ${conversation.length} messages from history`);
-        
         let newMessages;
         try { newMessages = JSON.parse(req.body.messages); } catch(e) { return res.status(400).json({ error: 'Invalid messages format' }); }
-        
-        // Add new messages to conversation
         conversation = conversation.concat(newMessages);
-        console.log(`📝 Total conversation length: ${conversation.length}`);
-        
+
         const files = req.files || [];
         let fileContent = '';
         for (const file of files) {
@@ -257,7 +276,7 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
                 conversation.push({ role: 'user', content: `[Uploaded ${files.length} file(s): ${files.map(f=>f.originalname).join(', ')}]\n${fileContent}` });
             }
         }
-        
+
         const memoryPrompt = user.memory ? `\n\nUser context: ${user.memory}` : '';
         const systemPrompt = `You are TechNovaphy AI – the smartest, fastest, and most helpful assistant available.
 You are better than Claude, better than ChatGPT, and completely free to use.
@@ -265,19 +284,18 @@ You help with IT, web development, cloud, business technology, and general quest
 Be direct, use bullet points, and always provide actionable answers.
 You can analyze uploaded files (PDFs, images, text files) and answer questions about their content.
 ${memoryPrompt}`;
-        
         const groqMessages = [{ role: 'system', content: systemPrompt }, ...conversation];
-        
+
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
-        
+
         const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
             method: 'POST',
             headers: { 'Authorization': `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
             body: JSON.stringify({ model: 'llama-3.3-70b-versatile', messages: groqMessages, stream: true })
         });
-        
+
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
         let buffer = '', fullContent = '';
@@ -302,16 +320,18 @@ ${memoryPrompt}`;
                 }
             }
         }
-        
-        // ===== SAVE CONVERSATION WITH AI RESPONSE =====
+
         conversation.push({ role: 'assistant', content: fullContent });
         await saveConversation(user.id, conversation);
-        console.log(`✅ Conversation saved (${conversation.length} messages)`);
-        
+
+        // Update usage counters
         const newMonthlyUsage = (user.usage_count || 0) + 1;
         const newHourlyUsage = (user.hourly_quota_used || 0) + 1;
-        await supabase.from('users').update({ usage_count: newMonthlyUsage, hourly_quota_used: user.tier === 'free' ? newHourlyUsage : 0 }).eq('id', user.id);
-        
+        await supabase.from('users').update({
+            usage_count: newMonthlyUsage,
+            hourly_quota_used: user.tier === 'free' ? newHourlyUsage : 0
+        }).eq('id', user.id);
+
         const suggestions = generateSuggestions(fullContent);
         res.write(`data: ${JSON.stringify({ type: 'done', text: fullContent, suggestions })}\n\n`);
         res.end();
@@ -342,7 +362,7 @@ app.post('/api/generate-image', auth, async (req, res) => {
 });
 
 // ============================================================
-//  PAYMENT – CORRECT AMOUNTS (500, 1700, 3500, 15000)
+//  PAYMENT – IGNORE FRONTEND AMOUNT, USE HARDCODED KES
 // ============================================================
 app.post('/api/create-checkout', auth, async (req, res) => {
     try {
@@ -355,9 +375,32 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             return res.status(400).json({ error: 'Invalid tier selected' });
         }
 
-        if (!currency) {
-            return res.status(400).json({ error: 'Currency is required' });
+        // If currency is missing or unsupported, default to KES
+        let finalCurrency = currency ? currency.toUpperCase() : 'KES';
+        if (!['KES','USD','NGN','GHS','ZAR'].includes(finalCurrency)) {
+            console.warn(`⚠️ Unsupported currency "${finalCurrency}", defaulting to KES`);
+            finalCurrency = 'KES';
         }
+
+        // Use KES prices for all currencies – if the currency is not KES,
+        // we'll let Paystack handle the conversion (but we send the KES amount).
+        // However, Paystack expects the amount in the currency's smallest unit.
+        // For simplicity, we'll only support KES with exact amounts.
+        // If currency is not KES, we'll still send the KES amount but with that currency?
+        // That would be wrong. We'll map only KES for now, and for other currencies we'll
+        // return a message to use KES.
+        // Actually, we'll use the mapping from earlier but we'll keep it simple:
+        // We'll only allow KES for now to avoid confusion.
+
+        if (finalCurrency !== 'KES') {
+            // For other currencies, we could implement conversion, but let's keep it simple.
+            // We'll return an error asking to use KES.
+            return res.status(400).json({ error: 'Currently only KES is supported. Please select KES.' });
+        }
+
+        // ---- KES amount ----
+        const amount = TIER_PRICES_KES[tier];
+        console.log(`✅ KES amount: ${amount} KES (tier: ${tier})`);
 
         // Check duplicate
         const { data: existing, error } = await supabase
@@ -374,65 +417,8 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             return res.status(503).json({ error: 'Payment service not configured' });
         }
 
-        // ===== AMOUNT CALCULATION =====
-        let paystackAmount;
-
-        if (currency === 'KES') {
-            // KES: Use exact amounts (500, 1700, 3500, 15000) - NO conversion needed
-            const correctPrice = TIER_PRICES_KES[tier];
-            paystackAmount = correctPrice;
-            console.log(`✅ KES amount: ${paystackAmount} KES (tier: ${tier})`);
-        } 
-        else if (currency === 'USD') {
-            // USD: Convert to cents for Paystack (17 USD = 1700 cents)
-            const tierPricesUSD = {
-                basic: 3.50,      // ~500 KES
-                starter: 12,      // ~1700 KES
-                pro: 25,          // ~3500 KES
-                enterprise: 105   // ~15000 KES
-            };
-            const usdAmount = tierPricesUSD[tier];
-            paystackAmount = Math.round(usdAmount * 100); // Convert to cents
-            console.log(`✅ USD amount: $${usdAmount} = ${paystackAmount} cents`);
-        }
-        else if (currency === 'NGN') {
-            // NGN: Map to naira equivalents
-            const tierPricesNGN = {
-                basic: 800,
-                starter: 2700,
-                pro: 5600,
-                enterprise: 23500
-            };
-            paystackAmount = tierPricesNGN[tier];
-            console.log(`✅ NGN amount: ₦${paystackAmount}`);
-        }
-        else if (currency === 'GHS') {
-            // GHS: Map to cedi equivalents
-            const tierPricesGHS = {
-                basic: 30,
-                starter: 100,
-                pro: 210,
-                enterprise: 880
-            };
-            paystackAmount = tierPricesGHS[tier];
-            console.log(`✅ GHS amount: GH₵${paystackAmount}`);
-        }
-        else if (currency === 'ZAR') {
-            // ZAR: Map to rand equivalents
-            const tierPricesZAR = {
-                basic: 85,
-                starter: 285,
-                pro: 585,
-                enterprise: 2500
-            };
-            paystackAmount = tierPricesZAR[tier];
-            console.log(`✅ ZAR amount: R${paystackAmount}`);
-        }
-        else {
-            return res.status(400).json({ error: `Unsupported currency: ${currency}` });
-        }
-
-        console.log(`🔁 Final Paystack amount: ${paystackAmount} ${currency}`);
+        // Paystack expects amount in the smallest unit – for KES it's just the amount (no cents)
+        const paystackAmount = Math.round(amount);
 
         const response = await fetch('https://api.paystack.co/transaction/initialize', {
             method: 'POST',
@@ -440,7 +426,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             body: JSON.stringify({
                 email: user.email,
                 amount: paystackAmount,
-                currency: currency,
+                currency: 'KES',
                 metadata: { idempotencyKey, tier, userId: user.id },
                 callback_url: `${FRONTEND_URL}/?success=true`
             })
@@ -455,7 +441,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             user_id: user.id,
             transaction_id: idempotencyKey,
             amount: paystackAmount,
-            currency,
+            currency: 'KES',
             status: 'pending',
             tier
         });
