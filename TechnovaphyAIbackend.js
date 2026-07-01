@@ -92,11 +92,14 @@ const BASE_PRICES_KES = {
   enterprise: 15000,
 };
 
-// Currencies where Paystack expects amount in subunits (cents/pence)
-const SUBUNIT_CURRENCIES = ['USD', 'EUR', 'GBP', 'ZAR'];
+// All currencies Paystack officially supports (add as needed)
+const SUPPORTED_CURRENCIES = ['KES', 'USD', 'EUR', 'GBP', 'NGN', 'GHS', 'ZAR'];
+
+// Currencies where Paystack expects amount in subunits (cents/pence/kobo)
+// For these, we multiply by 100 before sending to Paystack
+const SUBUNIT_CURRENCIES = ['USD', 'EUR', 'GBP', 'NGN', 'GHS', 'ZAR'];
 
 // Mutable object to hold live exchange rates (1 KES = X target)
-// Initial hardcoded fallback so the server can start even without API
 let liveExchangeRates = {
   KES: 1,
   USD: 0.0077,
@@ -148,7 +151,7 @@ function getPaystackAmount(displayAmount, currency) {
   if (SUBUNIT_CURRENCIES.includes(currency)) {
     return Math.round(displayAmount * 100); // e.g., 385 cents for 3.85 USD
   }
-  return Math.round(displayAmount); // KES, NGN, GHS already in base units
+  return Math.round(displayAmount); // KES already in base units
 }
 
 // ============================================================
@@ -643,9 +646,10 @@ app.post('/api/generate-image', auth, async (req, res) => {
 
 // ============================================================
 //  12. PAYMENT – Paystack Checkout (Universal Multi‑Currency)
+//     FIXED: subunit logic for all non‑KES currencies
 // ============================================================
 app.post('/api/create-checkout', auth, async (req, res) => {
-  const { idempotencyKey, tier, currency = 'KES' } = req.body; // currency now accepted
+  const { idempotencyKey, tier, currency = 'KES' } = req.body;
   const user = req.user;
 
   // Validate tier
@@ -678,6 +682,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
   const displayAmount = convertPrice(tier, currency);
   const paystackAmount = getPaystackAmount(displayAmount, currency);
 
+  // 🔥 LOG the amounts for debugging
   console.log(`💳 ${tier} tier → ${displayAmount} ${currency} (Paystack: ${paystackAmount} subunits)`);
 
   const response = await fetch('https://api.paystack.co/transaction/initialize', {
