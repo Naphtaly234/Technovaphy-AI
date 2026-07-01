@@ -1,5 +1,5 @@
 // ============================================================
-//  TECHNOVAPHY AI – UNBEATABLE BACKEND (4 TIERS, KES, CHAT FIX)
+//  TECHNOVAPHY AI – FINAL MVP BACKEND (4 TIERS, KES, SCALABLE)
 // ============================================================
 require('dotenv').config();
 
@@ -14,7 +14,6 @@ const { v4: uuidv4 } = require('uuid');
 const { createClient } = require('@supabase/supabase-js');
 const multer = require('multer');
 const pdfParse = require('pdf-parse');
-const mime = require('mime-types');
 
 const app = express();
 
@@ -37,6 +36,7 @@ app.use(morgan('combined'));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
+// Rate limiter for auth endpoints
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
@@ -53,13 +53,13 @@ const JWT_SECRET = process.env.JWT_SECRET || 'your_secret_key';
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
-const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
+const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY; // Live or Test secret
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 // ============================================================
-//  4. CONSTANTS – 4 TIERS + 2.5hr FREE WINDOW (Claude‑style)
+//  4. CONSTANTS – 4 TIERS + 2.5hr FREE WINDOW
 // ============================================================
 const TIER_LIMITS = {
   free: 200,
@@ -149,7 +149,7 @@ function getLimit(tier) {
 }
 
 // ============================================================
-//  6. FILE UPLOAD CONFIG
+//  6. FILE UPLOAD CONFIG (Stores in memory – fine for MVP)
 // ============================================================
 const storage = multer.memoryStorage();
 const fileFilter = (req, file, cb) => {
@@ -293,7 +293,7 @@ app.post('/api/auth/update-memory', auth, async (req, res) => {
 });
 
 // ============================================================
-//  10. CHAT WITH GROQ – UPGRADED TO BE ADDICTIVE & ROLE‑AWARE
+//  10. CHAT WITH GROQ – ROLE AWARE & SWEET (NO SUGGESTIONS)
 // ============================================================
 
 function detectRoleAndCustomize(userMessage) {
@@ -333,6 +333,7 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
     });
   }
 
+  // FREE TIER: 2.5-HOUR WINDOW CHECK
   if (user.tier === 'free') {
     const used = user.hourly_quota_used || 0;
     if (used >= FREE_WINDOW_LIMIT) {
@@ -363,6 +364,7 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
     return res.status(400).json({ error: 'Invalid messages format' });
   }
 
+  // --- File handling ---
   const files = req.files || [];
   let fileContent = '';
   for (const file of files) {
@@ -381,6 +383,7 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
     }
   }
 
+  // --- Auto-extract name into memory ---
   const lastUserMsg = messages.filter(m => m.role === 'user').pop();
   if (lastUserMsg) {
     const lower = lastUserMsg.content.toLowerCase();
@@ -396,9 +399,11 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
     }
   }
 
+  // --- Role Detection ---
   const lastUserContent = lastUserMsg ? lastUserMsg.content : '';
   const { detectedRole, extraInstructions } = detectRoleAndCustomize(lastUserContent);
 
+  // --- Build Memory Prompt ---
   let memoryPrompt = '';
   if (user.memory && user.memory.trim() !== '') {
     const staticSuggestions = [
@@ -414,12 +419,14 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
     }
   }
 
+  // --- Extract name ---
   let userName = 'there';
   if (user.memory && user.memory.includes('name:')) {
     const nameMatch = user.memory.match(/name:\s*([^\n,]+)/i);
     if (nameMatch) userName = nameMatch[1].trim();
   }
 
+  // --- SYSTEM PROMPT: SWEET, ROLE-AWARE, NO FOLLOW-UP, NO SUGGESTIONS ---
   const systemPrompt = `You are TechNovaphy AI, the warmest and most brilliant assistant on the planet.
 
 Current persona: You are acting as a **${detectedRole}**.
@@ -497,9 +504,10 @@ ${memoryPrompt}`;
       fullContent = "I'm sorry, I didn't get that. Could you please rephrase your question?";
     }
 
-    // No suggestions – send empty array
+    // 🔥 NO SUGGESTIONS – Empty array sent to frontend
     const suggestions = [];
 
+    // Update usage
     const newMonthlyUsage = (user.usage_count || 0) + 1;
     const newWindowUsage = (user.hourly_quota_used || 0) + 1;
     await supabase
@@ -553,7 +561,7 @@ app.post('/api/generate-image', auth, async (req, res) => {
 });
 
 // ============================================================
-//  12. PAYMENT – Paystack Checkout (4 tiers, KES)
+//  12. PAYMENT – Paystack Checkout (Supports Intl. Cards)
 // ============================================================
 app.post('/api/create-checkout', auth, async (req, res) => {
   const { idempotencyKey, tier } = req.body;
@@ -578,9 +586,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
     return res.status(503).json({ error: 'Payment service not configured' });
   }
 
-  // ============================================================
-  //  ✅ UPDATED PRICES – EXACTLY 500, 1700, 3500, 15000 KES
-  // ============================================================
+  // ✅ EXACT KES PRICES (Matches frontend)
   const tierPrices = {
     basic: 500,
     starter: 1700,
@@ -588,6 +594,8 @@ app.post('/api/create-checkout', auth, async (req, res) => {
     enterprise: 15000,
   };
 
+  // 🔥 Paystack supports international cards (Visa/Mastercard) automatically.
+  // Just ensure "International Payments" is ON in your Paystack Dashboard.
   const response = await fetch('https://api.paystack.co/transaction/initialize', {
     method: 'POST',
     headers: {
@@ -597,7 +605,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
     body: JSON.stringify({
       email: user.email,
       amount: tierPrices[tier],
-      currency: 'KES',
+      currency: 'KES', // Kenyan Shilling – Paystack converts international payments automatically
       metadata: {
         idempotencyKey: idempotencyKey,
         tier: tier,
@@ -631,6 +639,11 @@ app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), as
   const payload = req.body;
   const event = payload.event;
   const data = payload.data;
+
+  // 🔐 Optional: Verify signature here (uncomment in production)
+  // const crypto = require('crypto');
+  // const hash = crypto.createHmac('sha256', PAYSTACK_SECRET_KEY).update(JSON.stringify(payload)).digest('hex');
+  // if (hash !== signature) return res.status(401).send('Unauthorized');
 
   if (event === 'charge.success') {
     const metadata = data.metadata || {};
