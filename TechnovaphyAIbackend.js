@@ -12,18 +12,43 @@ const pdfParse = require('pdf-parse');
 
 const app = express();
 
-// CORS
-app.use(cors({ origin: '*', methods: ['GET','POST','PUT','DELETE','OPTIONS'], allowedHeaders: ['Content-Type','Authorization','Accept'], credentials: true, optionsSuccessStatus: 200 }));
+// ----- CORS -----
+app.use(cors({
+    origin: '*',
+    methods: ['GET','POST','PUT','DELETE','OPTIONS'],
+    allowedHeaders: ['Content-Type','Authorization','Accept'],
+    credentials: true,
+    optionsSuccessStatus: 200
+}));
+
+// ----- Middleware -----
 app.use(express.json({ limit: '20mb' }));
 app.use(express.urlencoded({ limit: '20mb', extended: true }));
 
-const authLimiter = rateLimit({ windowMs: 15*60*1000, max: 10, handler: (req,res) => res.status(429).json({ error: 'Too many login attempts.' }) });
+const authLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 10,
+    handler: (req, res) => {
+        res.status(429).json({ error: 'Too many login attempts.' });
+    }
+});
 app.use('/api/auth/login', authLimiter);
 app.use('/api/auth/register', authLimiter);
 
-const required = ['SUPABASE_URL','SUPABASE_SERVICE_ROLE_KEY','JWT_SECRET','GROQ_API_KEY','PAYSTACK_SECRET_KEY','OPENAI_API_KEY'];
-const missing = required.filter(k => !process.env[k]);
-if (missing.length) { console.error('❌ Missing:', missing.join(', ')); process.exit(1); }
+// ----- Environment Variables -----
+const required = [
+    'SUPABASE_URL',
+    'SUPABASE_SERVICE_ROLE_KEY',
+    'JWT_SECRET',
+    'GROQ_API_KEY',
+    'PAYSTACK_SECRET_KEY',
+    'OPENAI_API_KEY'
+];
+const missing = required.filter(key => !process.env[key]);
+if (missing.length) {
+    console.error('❌ Missing environment variables:', missing.join(', '));
+    process.exit(1);
+}
 
 const PORT = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET;
@@ -35,23 +60,29 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://your-netlify-url.netlify.app';
 const OWNER_EMAIL = process.env.OWNER_EMAIL || null;
 
+// ----- Supabase Client -----
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 (async function initDb() {
     const { error } = await supabase.from('users').select('id').limit(1);
-    if (error) { console.error('❌ DB error:', error.message); process.exit(1); }
+    if (error) {
+        console.error('❌ Database connection failed:', error.message);
+        process.exit(1);
+    }
     console.log('✅ Database connected.');
 })();
 
-// ============================================================
-//  CONSTANTS & HELPERS
-// ============================================================
+// ----- Constants -----
 const TIER_LIMITS = { free:200, basic:200, starter:550, pro:2500, enterprise:Infinity };
-const TIER_NAMES = { free:'Free (5 hrs unlimited)', basic:'Basic (200 msgs/month)', starter:'Starter (550 msgs/month)', pro:'Pro (2500 msgs/month)', enterprise:'Enterprise (Unlimited)' };
+const TIER_NAMES = {
+    free: 'Free (5 hrs unlimited)',
+    basic: 'Basic (200 msgs/month)',
+    starter: 'Starter (550 msgs/month)',
+    pro: 'Pro (2500 msgs/month)',
+    enterprise: 'Enterprise (Unlimited)'
+};
 const FREE_SESSION_HOURS = 5;
 const FREE_LOCK_HOURS = 4;
-
-// Base prices in KES (fixed)
 const TIER_PRICES_KES = {
     basic: 500,
     starter: 1700,
@@ -59,33 +90,20 @@ const TIER_PRICES_KES = {
     enterprise: 15000
 };
 
-// ---------- Exchange Rate Cache ----------
-let exchangeRates = {
-    KES: 1,
-    USD: 0.0077,
-    EUR: 0.0070,
-    GBP: 0.0061,
-    NGN: 12.5,
-    GHS: 0.098,
-    ZAR: 0.14
-};
+// ----- Exchange Rate Cache -----
+let exchangeRates = { KES: 1, USD: 0.0077, EUR: 0.0070, GBP: 0.0061, NGN: 12.5, GHS: 0.098, ZAR: 0.14 };
 let ratesLastFetched = 0;
 const RATES_CACHE_TTL = 60 * 60 * 1000; // 1 hour
 
 async function fetchExchangeRates() {
     const now = Date.now();
-    if (now - ratesLastFetched < RATES_CACHE_TTL) {
-        // Cache is fresh
-        return exchangeRates;
-    }
+    if (now - ratesLastFetched < RATES_CACHE_TTL) return exchangeRates;
     try {
         const response = await fetch('https://api.exchangerate-api.com/v4/latest/KES');
-        if (!response.ok) throw new Error('Exchange rate API returned ' + response.status);
+        if (!response.ok) throw new Error('Exchange rate API error');
         const data = await response.json();
         const rates = data.rates;
-        // Ensure KES is 1
         rates.KES = 1;
-        // Keep only the currencies we support
         const supported = ['KES','USD','EUR','GBP','NGN','GHS','ZAR'];
         const filtered = {};
         for (const key of supported) {
@@ -101,33 +119,40 @@ async function fetchExchangeRates() {
     }
 }
 
-// ---------- User Helpers ----------
+// ----- User Helpers -----
 async function findUser(email) {
     const { data, error } = await supabase.from('users').select('*').eq('email', email).maybeSingle();
-    if (error) throw new Error('Database error: ' + error.message);
+    if (error) throw new Error('DB: ' + error.message);
     return data;
 }
 async function findUserById(id) {
     const { data, error } = await supabase.from('users').select('*').eq('id', id).maybeSingle();
-    if (error) throw new Error('Database error: ' + error.message);
+    if (error) throw new Error('DB: ' + error.message);
     return data;
 }
 async function resetMonthlyUsageIfNeeded(user) {
     const now = new Date();
     const resetDate = new Date(user.monthly_reset_date);
     if (now >= resetDate) {
-        const nextMonth = new Date(now); nextMonth.setMonth(nextMonth.getMonth()+1);
-        await supabase.from('users').update({ usage_count:0, monthly_reset_date: nextMonth.toISOString().split('T')[0] }).eq('id', user.id);
-        user.usage_count = 0; user.monthly_reset_date = nextMonth.toISOString().split('T')[0];
+        const nextMonth = new Date(now);
+        nextMonth.setMonth(nextMonth.getMonth() + 1);
+        await supabase
+            .from('users')
+            .update({
+                usage_count: 0,
+                monthly_reset_date: nextMonth.toISOString().split('T')[0]
+            })
+            .eq('id', user.id);
+        user.usage_count = 0;
+        user.monthly_reset_date = nextMonth.toISOString().split('T')[0];
     }
     return user;
 }
-
 async function checkFreeSession(user) {
     if (user.tier !== 'free') return user;
     const now = new Date();
     const sessionStart = new Date(user.free_session_start || now);
-    const elapsedHours = (now - sessionStart) / (1000*60*60);
+    const elapsedHours = (now - sessionStart) / (1000 * 60 * 60);
     if (elapsedHours < FREE_SESSION_HOURS) {
         return user;
     } else {
@@ -139,7 +164,10 @@ async function checkFreeSession(user) {
             throw err;
         } else {
             const newSessionStart = now.toISOString();
-            await supabase.from('users').update({ free_session_start: newSessionStart }).eq('id', user.id);
+            await supabase
+                .from('users')
+                .update({ free_session_start: newSessionStart })
+                .eq('id', user.id);
             user.free_session_start = newSessionStart;
             return user;
         }
@@ -148,23 +176,46 @@ async function checkFreeSession(user) {
 function getLimit(tier) { return TIER_LIMITS[tier] || 200; }
 
 async function getConversation(userId) {
-    const { data, error } = await supabase.from('conversations').select('messages').eq('user_id', userId).maybeSingle();
+    const { data, error } = await supabase
+        .from('conversations')
+        .select('messages')
+        .eq('user_id', userId)
+        .maybeSingle();
     if (error && error.code !== 'PGRST116') throw error;
     return data ? data.messages : [];
 }
 async function saveConversation(userId, messages) {
-    const { error } = await supabase.from('conversations').upsert({ user_id: userId, messages, updated_at: new Date().toISOString() }, { onConflict: 'user_id' });
+    const { error } = await supabase
+        .from('conversations')
+        .upsert({
+            user_id: userId,
+            messages: messages,
+            updated_at: new Date().toISOString()
+        }, { onConflict: 'user_id' });
     if (error) throw new Error('Failed to save conversation: ' + error.message);
 }
 
-// ---- File Upload ----
+// ----- File Upload -----
 const storage = multer.memoryStorage();
 const fileFilter = (req, file, cb) => {
-    const allowedTypes = ['image/jpeg','image/png','image/webp','application/pdf','text/plain','text/csv','application/msword','application/vnd.openxmlformats-officedocument.wordprocessingml.document'];
-    if (allowedTypes.includes(file.mimetype)) cb(null, true);
-    else cb(new Error('Unsupported file type'), false);
+    const allowedTypes = [
+        'image/jpeg', 'image/png', 'image/webp',
+        'application/pdf',
+        'text/plain', 'text/csv',
+        'application/msword',
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+    ];
+    if (allowedTypes.includes(file.mimetype)) {
+        cb(null, true);
+    } else {
+        cb(new Error('Unsupported file type'), false);
+    }
 };
-const upload = multer({ storage, limits: { fileSize: 10*1024*1024 }, fileFilter });
+const upload = multer({
+    storage,
+    limits: { fileSize: 10 * 1024 * 1024 },
+    fileFilter
+});
 
 async function extractFileContent(file) {
     const mimeType = file.mimetype;
@@ -173,21 +224,29 @@ async function extractFileContent(file) {
         try {
             const data = await pdfParse(buffer);
             return data.text;
-        } catch(e) { return `[PDF could not be read: ${e.message}]`; }
+        } catch(e) {
+            return `[PDF could not be read: ${e.message}]`;
+        }
     } else if (mimeType === 'text/plain' || mimeType === 'text/csv') {
         return buffer.toString('utf-8');
     } else if (mimeType.startsWith('image/')) {
-        return `[Image: ${file.originalname}]`; // handled separately in vision
+        return `[Image: ${file.originalname}]`; // handled separately
     } else {
         try { return buffer.toString('utf-8'); } catch(e) { return `[File: ${file.originalname}]`; }
     }
 }
 
 function generateSuggestions(lastMessage) {
-    return ["Tell me more about that.", "Can you give me an example?", "How does this compare to other solutions?", "What are the key benefits?", "Is there anything else I should know?"];
+    return [
+        "Tell me more about that.",
+        "Can you give me an example?",
+        "How does this compare to other solutions?",
+        "What are the key benefits?",
+        "Is there anything else I should know?"
+    ];
 }
 
-// ---- Auth Middleware ----
+// ----- Auth Middleware -----
 const auth = async (req, res, next) => {
     const authHeader = req.headers.authorization;
     if (!authHeader) return res.status(401).json({ error: 'No token provided' });
@@ -198,7 +257,9 @@ const auth = async (req, res, next) => {
         if (!user) return res.status(401).json({ error: 'User not found' });
         req.user = user;
         next();
-    } catch(e) { res.status(401).json({ error: 'Invalid or expired token' }); }
+    } catch(e) {
+        res.status(401).json({ error: 'Invalid or expired token' });
+    }
 };
 
 // ============================================================
@@ -216,33 +277,59 @@ app.post('/api/auth/register', async (req, res) => {
         const { email, password, ageConfirmed } = req.body;
         if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
         if (!ageConfirmed) return res.status(400).json({ error: 'You must be 18 or older' });
+
         const existing = await findUser(email);
         if (existing) return res.status(400).json({ error: 'Email already exists' });
+
         const hashed = await bcrypt.hash(password, 10);
         const now = new Date();
-        const nextMonth = new Date(now); nextMonth.setMonth(nextMonth.getMonth()+1);
-        const { data, error } = await supabase.from('users').insert({
-            email, password_hash: hashed, tier: 'free', usage_count: 0,
-            monthly_reset_date: nextMonth.toISOString().split('T')[0], verified: true,
-            free_session_start: now.toISOString(), memory: '', role: 'user'
-        }).select().single();
+        const nextMonth = new Date(now);
+        nextMonth.setMonth(nextMonth.getMonth() + 1);
+
+        const { data, error } = await supabase
+            .from('users')
+            .insert({
+                email,
+                password_hash: hashed,
+                tier: 'free',
+                usage_count: 0,
+                monthly_reset_date: nextMonth.toISOString().split('T')[0],
+                verified: true,
+                free_session_start: now.toISOString(),
+                memory: '',
+                role: 'user'
+            })
+            .select()
+            .single();
+
         if (error) throw new Error('DB insert: ' + error.message);
-        await supabase.from('conversations').insert({ user_id: data.id, messages: [] });
+        await supabase
+            .from('conversations')
+            .insert({ user_id: data.id, messages: [] });
         res.status(201).json({ message: 'User created', userId: data.id });
-    } catch(err) { console.error('Registration error:', err); res.status(500).json({ error: err.message }); }
+    } catch(err) {
+        console.error('Registration error:', err);
+        res.status(500).json({ error: err.message });
+    }
 });
 
 app.post('/api/auth/login', async (req, res) => {
     try {
         const { email, password } = req.body;
         if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+
         const user = await findUser(email);
         if (!user) return res.status(401).json({ error: 'Invalid credentials' });
+
         const valid = await bcrypt.compare(password, user.password_hash);
         if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
+
         const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '7d' });
         res.json({ token, verified: true });
-    } catch(err) { console.error('Login error:', err); res.status(500).json({ error: err.message }); }
+    } catch(err) {
+        console.error('Login error:', err);
+        res.status(500).json({ error: err.message });
+    }
 });
 
 app.get('/api/user/profile', auth, async (req, res) => {
@@ -251,30 +338,45 @@ app.get('/api/user/profile', auth, async (req, res) => {
         user = await resetMonthlyUsageIfNeeded(user);
         const limit = getLimit(user.tier);
         const isOwner = (OWNER_EMAIL && user.email === OWNER_EMAIL) || user.role === 'owner';
+
         let sessionRemaining = null, lockRemaining = null;
         if (user.tier === 'free') {
             const now = new Date();
             const sessionStart = new Date(user.free_session_start || now);
-            const elapsedHours = (now - sessionStart) / (1000*60*60);
+            const elapsedHours = (now - sessionStart) / (1000 * 60 * 60);
             if (elapsedHours < FREE_SESSION_HOURS) {
-                const remainingMs = (sessionStart.getTime() + FREE_SESSION_HOURS*60*60*1000) - now.getTime();
-                sessionRemaining = Math.max(0, Math.ceil(remainingMs/60000));
+                const remainingMs = (sessionStart.getTime() + FREE_SESSION_HOURS * 60 * 60 * 1000) - now.getTime();
+                sessionRemaining = Math.max(0, Math.ceil(remainingMs / 60000));
             } else {
-                const lockEnd = new Date(sessionStart.getTime() + (FREE_SESSION_HOURS+FREE_LOCK_HOURS)*60*60*1000);
+                const lockEnd = new Date(sessionStart.getTime() + (FREE_SESSION_HOURS + FREE_LOCK_HOURS) * 60 * 60 * 1000);
                 if (now < lockEnd) {
                     const remainingMs = lockEnd - now;
-                    lockRemaining = Math.max(0, Math.ceil(remainingMs/60000));
-                } else { lockRemaining = 0; }
+                    lockRemaining = Math.max(0, Math.ceil(remainingMs / 60000));
+                } else {
+                    lockRemaining = 0;
+                }
             }
         }
+
         res.json({
-            email: user.email, tier: user.tier, tier_name: TIER_NAMES[user.tier] || 'Free',
-            usage_count: user.usage_count, limit, monthly_reset_date: user.monthly_reset_date,
-            verified: true, memory: user.memory || '', role: user.role || 'user',
-            is_owner: isOwner, free_session_start: user.free_session_start,
-            session_remaining_minutes: sessionRemaining, lock_remaining_minutes: lockRemaining
+            email: user.email,
+            tier: user.tier,
+            tier_name: TIER_NAMES[user.tier] || 'Free',
+            usage_count: user.usage_count,
+            limit: limit,
+            monthly_reset_date: user.monthly_reset_date,
+            verified: true,
+            memory: user.memory || '',
+            role: user.role || 'user',
+            is_owner: isOwner,
+            free_session_start: user.free_session_start,
+            session_remaining_minutes: sessionRemaining,
+            lock_remaining_minutes: lockRemaining
         });
-    } catch(err) { console.error('Profile error:', err); res.status(500).json({ error: err.message }); }
+    } catch(err) {
+        console.error('Profile error:', err);
+        res.status(500).json({ error: err.message });
+    }
 });
 
 app.post('/api/auth/update-memory', auth, async (req, res) => {
@@ -283,7 +385,10 @@ app.post('/api/auth/update-memory', auth, async (req, res) => {
         const user = req.user;
         await supabase.from('users').update({ memory }).eq('id', user.id);
         res.json({ message: 'Memory updated' });
-    } catch(err) { console.error('Update memory error:', err); res.status(500).json({ error: err.message }); }
+    } catch(err) {
+        console.error('Update memory error:', err);
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // ============================================================
@@ -294,57 +399,82 @@ app.get('/api/admin/users', auth, async (req, res) => {
         const user = req.user;
         const isOwner = (OWNER_EMAIL && user.email === OWNER_EMAIL) || user.role === 'owner';
         if (!isOwner) return res.status(403).json({ error: 'Admin access required.' });
-        const { data, error } = await supabase.from('users').select('id, email, tier, role, usage_count, created_at, free_session_start').order('created_at', { ascending: false });
+
+        const { data, error } = await supabase
+            .from('users')
+            .select('id, email, tier, role, usage_count, created_at, free_session_start')
+            .order('created_at', { ascending: false });
         if (error) throw error;
         res.json({ users: data });
-    } catch(err) { console.error('Admin users error:', err); res.status(500).json({ error: err.message }); }
+    } catch(err) {
+        console.error('Admin users error:', err);
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // ============================================================
-//  CHAT STREAM – WITH VISION SUPPORT
+//  CHAT STREAM – WITH VISION SUPPORT (FIXED)
 // ============================================================
 app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) => {
     try {
         let user = req.user;
         user = await resetMonthlyUsageIfNeeded(user);
 
+        // ---- OWNER BYPASS ----
         const isOwner = (OWNER_EMAIL && user.email === OWNER_EMAIL) || user.role === 'owner';
         if (!isOwner) {
+            // Free session check
             if (user.tier === 'free') {
-                try { user = await checkFreeSession(user); }
-                catch(lockError) {
-                    return res.status(429).json({ error: lockError.message, lock_remaining_minutes: lockError.minutesLeft || null });
+                try {
+                    user = await checkFreeSession(user);
+                } catch(lockError) {
+                    return res.status(429).json({
+                        error: lockError.message,
+                        lock_remaining_minutes: lockError.minutesLeft || null
+                    });
                 }
             }
+            // Monthly limit
             const monthlyLimit = getLimit(user.tier);
             if (user.usage_count >= monthlyLimit) {
                 return res.status(403).json({
                     error: `You've reached your monthly limit of ${monthlyLimit} messages. Upgrade to continue.`,
-                    tier: user.tier, limit: monthlyLimit, used: user.usage_count
+                    tier: user.tier,
+                    limit: monthlyLimit,
+                    used: user.usage_count
                 });
             }
         }
 
+        // ---- Get conversation history ----
         let conversation = await getConversation(user.id);
         let newMessages;
-        try { newMessages = JSON.parse(req.body.messages); } catch(e) { return res.status(400).json({ error: 'Invalid messages format' }); }
+        try {
+            newMessages = JSON.parse(req.body.messages);
+        } catch(e) {
+            return res.status(400).json({ error: 'Invalid messages format' });
+        }
         conversation = conversation.concat(newMessages);
 
+        // ---- Process uploaded files ----
         const files = req.files || [];
+        console.log(`📎 Received ${files.length} file(s):`, files.map(f => ({ name: f.originalname, type: f.mimetype })));
+
+        // Check if any image is present
         const hasImage = files.some(f => f.mimetype.startsWith('image/'));
-        const memoryPrompt = user.memory ? `\n\nUser context: ${user.memory}` : '';
+        console.log(`🖼️ hasImage: ${hasImage}`);
 
-        // Build user message
-        let userContent = '';
+        // Extract the last user message text
         const lastUserMsg = conversation[conversation.length - 1];
-        if (lastUserMsg && lastUserMsg.role === 'user') {
-            userContent = lastUserMsg.content;
-        }
+        let userContent = lastUserMsg && lastUserMsg.role === 'user' ? lastUserMsg.content : '';
 
+        // Prepare file contents
         let fileTextContent = '';
         const imageContents = [];
+
         for (const file of files) {
             if (file.mimetype.startsWith('image/')) {
+                // Convert image to base64 data URL for vision model
                 const base64 = file.buffer.toString('base64');
                 const dataUrl = `data:${file.mimetype};base64,${base64}`;
                 imageContents.push({
@@ -352,13 +482,16 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
                     image_url: { url: dataUrl }
                 });
             } else {
+                // Extract text from other files
                 const text = await extractFileContent(file);
                 fileTextContent += `\n\n--- File: ${file.originalname} ---\n${text}\n--- End of ${file.originalname} ---`;
             }
         }
 
+        // ---- Build the user message for the model ----
         let userMessage;
         if (hasImage) {
+            // Vision model: content is an array of text + images
             const textPart = userContent + (fileTextContent ? `\n\n${fileTextContent}` : '');
             userMessage = {
                 role: 'user',
@@ -368,11 +501,13 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
                 ]
             };
         } else {
+            // Text-only: simple string
             const fullText = userContent + (fileTextContent ? `\n\n${fileTextContent}` : '');
             userMessage = { role: 'user', content: fullText };
         }
 
-        // Build Groq messages
+        // ---- Build the system prompt ----
+        const memoryPrompt = user.memory ? `\n\nUser context: ${user.memory}` : '';
         const systemPrompt = `You are TechNovaphy AI – the world's most capable and thoughtful assistant.
 Your mission is to deliver answers that are **more comprehensive, more structured, and more useful than Claude, ChatGPT, or any other AI**.
 Always:
@@ -386,22 +521,31 @@ Always:
 You excel at IT, web development, cloud architecture, business strategy, and general knowledge.
 ${memoryPrompt}`;
 
+        // ---- Build the messages for Groq ----
         const groqMessages = [{ role: 'system', content: systemPrompt }];
+        // Add all previous messages except the last one (which we already enhanced)
         for (let i = 0; i < conversation.length - 1; i++) {
             groqMessages.push(conversation[i]);
         }
+        // Add the enhanced user message
         groqMessages.push(userMessage);
 
+        // ---- Determine which model to use ----
         const model = hasImage ? 'llama-3.2-11b-vision-preview' : 'llama-3.3-70b-versatile';
         console.log(`🧠 Using model: ${model} (hasImage: ${hasImage})`);
 
+        // ---- Set up SSE headers ----
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
 
+        // ---- Call Groq API ----
         const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
             method: 'POST',
-            headers: { 'Authorization': `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
+            headers: {
+                'Authorization': `Bearer ${GROQ_API_KEY}`,
+                'Content-Type': 'application/json'
+            },
             body: JSON.stringify({
                 model: model,
                 messages: groqMessages,
@@ -411,9 +555,16 @@ ${memoryPrompt}`;
             })
         });
 
+        if (!response.ok) {
+            const errorText = await response.text();
+            throw new Error(`Groq API error ${response.status}: ${errorText}`);
+        }
+
+        // ---- Stream the response ----
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
         let buffer = '', fullContent = '';
+
         while (true) {
             const { done, value } = await reader.read();
             if (done) break;
@@ -436,14 +587,20 @@ ${memoryPrompt}`;
             }
         }
 
+        // ---- Save conversation ----
         conversation.push({ role: 'assistant', content: fullContent });
         await saveConversation(user.id, conversation);
 
+        // ---- Update usage counters (only for non‑owners) ----
         if (!isOwner) {
             const newMonthlyUsage = (user.usage_count || 0) + 1;
-            await supabase.from('users').update({ usage_count: newMonthlyUsage }).eq('id', user.id);
+            await supabase
+                .from('users')
+                .update({ usage_count: newMonthlyUsage })
+                .eq('id', user.id);
         }
 
+        // ---- Send suggestions ----
         const suggestions = generateSuggestions(fullContent);
         res.write(`data: ${JSON.stringify({ type: 'done', text: fullContent, suggestions })}\n\n`);
         res.end();
@@ -465,20 +622,34 @@ app.post('/api/generate-image', auth, async (req, res) => {
     try {
         const { prompt } = req.body;
         if (!prompt) return res.status(400).json({ error: 'Prompt is required' });
-        if (!OPENAI_API_KEY) return res.status(503).json({ error: 'Image generation not configured' });
+        if (!OPENAI_API_KEY) {
+            return res.status(503).json({ error: 'Image generation not configured' });
+        }
+
         const response = await fetch('https://api.openai.com/v1/images/generations', {
             method: 'POST',
-            headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
-            body: JSON.stringify({ prompt, n: 1, size: '512x512', model: 'dall-e-2' })
+            headers: {
+                'Authorization': `Bearer ${OPENAI_API_KEY}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                prompt: prompt,
+                n: 1,
+                size: '512x512',
+                model: 'dall-e-2'
+            })
         });
         const data = await response.json();
         if (!response.ok) throw new Error(data.error?.message || 'Image generation failed');
         res.json({ url: data.data[0].url });
-    } catch(err) { console.error('Image gen error:', err); res.status(500).json({ error: err.message }); }
+    } catch(err) {
+        console.error('Image gen error:', err);
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // ============================================================
-//  PAYMENT – DYNAMIC EXCHANGE RATES
+//  PAYMENT – Dynamic exchange rates
 // ============================================================
 app.post('/api/create-checkout', auth, async (req, res) => {
     try {
@@ -494,27 +665,21 @@ app.post('/api/create-checkout', auth, async (req, res) => {
         // Get base price in KES
         const basePriceKES = TIER_PRICES_KES[tier];
         let finalCurrency = (currency || 'KES').toUpperCase();
-        // If currency is KES, no conversion needed
-        let convertedAmount;
 
+        let convertedAmount;
         if (finalCurrency === 'KES') {
             convertedAmount = basePriceKES;
         } else {
-            // Fetch current exchange rates
             const rates = await fetchExchangeRates();
             const rate = rates[finalCurrency];
             if (!rate) {
-                // Unsupported currency – default to KES
                 console.warn(`⚠️ Unsupported currency ${finalCurrency}, defaulting to KES`);
                 finalCurrency = 'KES';
                 convertedAmount = basePriceKES;
             } else {
-                // Convert to target currency
                 let amount = basePriceKES * rate;
-                // Determine if currency has cents
                 const currenciesWithCents = ['USD','EUR','GBP','ZAR'];
                 if (currenciesWithCents.includes(finalCurrency)) {
-                    // Convert to smallest unit (cents)
                     convertedAmount = Math.round(amount * 100);
                 } else {
                     convertedAmount = Math.round(amount);
@@ -575,7 +740,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
         });
 
         res.json({ url: data.data.authorization_url });
-    } catch (err) {
+    } catch(err) {
         console.error('Checkout error:', err);
         res.status(500).json({ error: err.message });
     }
@@ -589,14 +754,24 @@ app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), as
         const payload = req.body;
         const event = payload.event;
         const data = payload.data;
+
         if (event === 'charge.success') {
             const metadata = data.metadata || {};
             const userId = metadata.userId;
             const tier = metadata.tier || 'pro';
             const idempotencyKey = metadata.idempotencyKey;
+
             if (userId) {
-                await supabase.from('payments').update({ status: 'completed' }).eq('transaction_id', idempotencyKey);
-                await supabase.from('users').update({ tier, usage_count: 0 }).eq('id', userId);
+                await supabase
+                    .from('payments')
+                    .update({ status: 'completed' })
+                    .eq('transaction_id', idempotencyKey);
+
+                await supabase
+                    .from('users')
+                    .update({ tier: tier, usage_count: 0 })
+                    .eq('id', userId);
+
                 console.log(`✅ User ${userId} upgraded to ${tier}`);
             }
         }
