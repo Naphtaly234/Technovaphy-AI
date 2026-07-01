@@ -14,7 +14,7 @@ const app = express();
 
 // CORS
 app.use(cors({ origin: '*', methods: ['GET','POST','PUT','DELETE','OPTIONS'], allowedHeaders: ['Content-Type','Authorization','Accept'], credentials: true, optionsSuccessStatus: 200 }));
-app.use(express.json({ limit: '20mb' })); // larger for images
+app.use(express.json({ limit: '20mb' }));
 app.use(express.urlencoded({ limit: '20mb', extended: true }));
 
 const authLimiter = rateLimit({ windowMs: 15*60*1000, max: 10, handler: (req,res) => res.status(429).json({ error: 'Too many login attempts.' }) });
@@ -44,15 +44,64 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 })();
 
 // ============================================================
-//  CONSTANTS
+//  CONSTANTS & HELPERS
 // ============================================================
 const TIER_LIMITS = { free:200, basic:200, starter:550, pro:2500, enterprise:Infinity };
 const TIER_NAMES = { free:'Free (5 hrs unlimited)', basic:'Basic (200 msgs/month)', starter:'Starter (550 msgs/month)', pro:'Pro (2500 msgs/month)', enterprise:'Enterprise (Unlimited)' };
 const FREE_SESSION_HOURS = 5;
 const FREE_LOCK_HOURS = 4;
-const TIER_PRICES_KES = { basic:500, starter:1700, pro:3500, enterprise:15000 };
 
-// ---------- Helpers ----------
+// Base prices in KES (fixed)
+const TIER_PRICES_KES = {
+    basic: 500,
+    starter: 1700,
+    pro: 3500,
+    enterprise: 15000
+};
+
+// ---------- Exchange Rate Cache ----------
+let exchangeRates = {
+    KES: 1,
+    USD: 0.0077,
+    EUR: 0.0070,
+    GBP: 0.0061,
+    NGN: 12.5,
+    GHS: 0.098,
+    ZAR: 0.14
+};
+let ratesLastFetched = 0;
+const RATES_CACHE_TTL = 60 * 60 * 1000; // 1 hour
+
+async function fetchExchangeRates() {
+    const now = Date.now();
+    if (now - ratesLastFetched < RATES_CACHE_TTL) {
+        // Cache is fresh
+        return exchangeRates;
+    }
+    try {
+        const response = await fetch('https://api.exchangerate-api.com/v4/latest/KES');
+        if (!response.ok) throw new Error('Exchange rate API returned ' + response.status);
+        const data = await response.json();
+        const rates = data.rates;
+        // Ensure KES is 1
+        rates.KES = 1;
+        // Keep only the currencies we support
+        const supported = ['KES','USD','EUR','GBP','NGN','GHS','ZAR'];
+        const filtered = {};
+        for (const key of supported) {
+            filtered[key] = rates[key] || exchangeRates[key] || 1;
+        }
+        exchangeRates = filtered;
+        ratesLastFetched = now;
+        console.log('✅ Exchange rates updated:', exchangeRates);
+        return exchangeRates;
+    } catch (err) {
+        console.warn('⚠️ Failed to fetch exchange rates, using cached/fallback:', err.message);
+        return exchangeRates;
+    }
+}
+
+// ---------- User Helpers ----------
 async function findUser(email) {
     const { data, error } = await supabase.from('users').select('*').eq('email', email).maybeSingle();
     if (error) throw new Error('Database error: ' + error.message);
@@ -116,6 +165,23 @@ const fileFilter = (req, file, cb) => {
     else cb(new Error('Unsupported file type'), false);
 };
 const upload = multer({ storage, limits: { fileSize: 10*1024*1024 }, fileFilter });
+
+async function extractFileContent(file) {
+    const mimeType = file.mimetype;
+    const buffer = file.buffer;
+    if (mimeType === 'application/pdf') {
+        try {
+            const data = await pdfParse(buffer);
+            return data.text;
+        } catch(e) { return `[PDF could not be read: ${e.message}]`; }
+    } else if (mimeType === 'text/plain' || mimeType === 'text/csv') {
+        return buffer.toString('utf-8');
+    } else if (mimeType.startsWith('image/')) {
+        return `[Image: ${file.originalname}]`; // handled separately in vision
+    } else {
+        try { return buffer.toString('utf-8'); } catch(e) { return `[File: ${file.originalname}]`; }
+    }
+}
 
 function generateSuggestions(lastMessage) {
     return ["Tell me more about that.", "Can you give me an example?", "How does this compare to other solutions?", "What are the key benefits?", "Is there anything else I should know?"];
@@ -259,7 +325,6 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
             }
         }
 
-        // ---- Extract messages and files ----
         let conversation = await getConversation(user.id);
         let newMessages;
         try { newMessages = JSON.parse(req.body.messages); } catch(e) { return res.status(400).json({ error: 'Invalid messages format' }); }
@@ -269,20 +334,17 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
         const hasImage = files.some(f => f.mimetype.startsWith('image/'));
         const memoryPrompt = user.memory ? `\n\nUser context: ${user.memory}` : '';
 
-        // ---- Build user message with text and file content ----
+        // Build user message
         let userContent = '';
-        // Take the last user message (which contains the text) – we'll merge with file content
         const lastUserMsg = conversation[conversation.length - 1];
         if (lastUserMsg && lastUserMsg.role === 'user') {
             userContent = lastUserMsg.content;
         }
 
-        // ---- File content handling ----
         let fileTextContent = '';
         const imageContents = [];
         for (const file of files) {
             if (file.mimetype.startsWith('image/')) {
-                // Convert to base64 for vision
                 const base64 = file.buffer.toString('base64');
                 const dataUrl = `data:${file.mimetype};base64,${base64}`;
                 imageContents.push({
@@ -290,16 +352,13 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
                     image_url: { url: dataUrl }
                 });
             } else {
-                // Extract text from other files (PDF, txt, etc.)
                 const text = await extractFileContent(file);
                 fileTextContent += `\n\n--- File: ${file.originalname} ---\n${text}\n--- End of ${file.originalname} ---`;
             }
         }
 
-        // ---- Build the user message for the model ----
         let userMessage;
         if (hasImage) {
-            // Vision model: message is an array of text and images
             const textPart = userContent + (fileTextContent ? `\n\n${fileTextContent}` : '');
             userMessage = {
                 role: 'user',
@@ -309,17 +368,11 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
                 ]
             };
         } else {
-            // Text-only: simple string
             const fullText = userContent + (fileTextContent ? `\n\n${fileTextContent}` : '');
             userMessage = { role: 'user', content: fullText };
         }
 
-        // ---- Replace the last user message with the enhanced one ----
-        // We need to pop the last user message and push the new one
-        // Because we already added newMessages to conversation, we need to adjust:
-        // We'll reconstruct the groqMessages from the conversation history
-        // and replace the last user message with the enhanced one.
-        // Simplify: we'll build the groqMessages directly from conversation + enhanced user message.
+        // Build Groq messages
         const systemPrompt = `You are TechNovaphy AI – the world's most capable and thoughtful assistant.
 Your mission is to deliver answers that are **more comprehensive, more structured, and more useful than Claude, ChatGPT, or any other AI**.
 Always:
@@ -333,33 +386,22 @@ Always:
 You excel at IT, web development, cloud architecture, business strategy, and general knowledge.
 ${memoryPrompt}`;
 
-        // Build the messages for the API:
         const groqMessages = [{ role: 'system', content: systemPrompt }];
-        // Add all but the last user message from conversation
         for (let i = 0; i < conversation.length - 1; i++) {
-            const msg = conversation[i];
-            // If it's a user message and we have images, we need to keep the original structure,
-            // but for simplicity we keep as is (text only) because images only appear in the latest user message.
-            groqMessages.push(msg);
+            groqMessages.push(conversation[i]);
         }
-        // Now add the enhanced user message
         groqMessages.push(userMessage);
 
-        // ---- Determine model ----
         const model = hasImage ? 'llama-3.2-11b-vision-preview' : 'llama-3.3-70b-versatile';
         console.log(`🧠 Using model: ${model} (hasImage: ${hasImage})`);
 
-        // ---- Call Groq ----
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
 
         const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
             method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${GROQ_API_KEY}`,
-                'Content-Type': 'application/json'
-            },
+            headers: { 'Authorization': `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 model: model,
                 messages: groqMessages,
@@ -394,12 +436,9 @@ ${memoryPrompt}`;
             }
         }
 
-        // ---- Save conversation ----
-        // Add assistant response
         conversation.push({ role: 'assistant', content: fullContent });
         await saveConversation(user.id, conversation);
 
-        // ---- Update counters ----
         if (!isOwner) {
             const newMonthlyUsage = (user.usage_count || 0) + 1;
             await supabase.from('users').update({ usage_count: newMonthlyUsage }).eq('id', user.id);
@@ -419,26 +458,8 @@ ${memoryPrompt}`;
     }
 });
 
-// Helper to extract file content (for non-image files)
-async function extractFileContent(file) {
-    const mimeType = file.mimetype;
-    const buffer = file.buffer;
-    if (mimeType === 'application/pdf') {
-        try {
-            const data = await pdfParse(buffer);
-            return data.text;
-        } catch(e) { return `[PDF could not be read: ${e.message}]`; }
-    } else if (mimeType === 'text/plain' || mimeType === 'text/csv') {
-        return buffer.toString('utf-8');
-    } else if (mimeType.startsWith('image/')) {
-        return `[Image: ${file.originalname}]`; // handled separately
-    } else {
-        try { return buffer.toString('utf-8'); } catch(e) { return `[File: ${file.originalname}]`; }
-    }
-}
-
 // ============================================================
-//  IMAGE GENERATION (unchanged)
+//  IMAGE GENERATION
 // ============================================================
 app.post('/api/generate-image', auth, async (req, res) => {
     try {
@@ -457,33 +478,107 @@ app.post('/api/generate-image', auth, async (req, res) => {
 });
 
 // ============================================================
-//  PAYMENT (unchanged)
+//  PAYMENT – DYNAMIC EXCHANGE RATES
 // ============================================================
 app.post('/api/create-checkout', auth, async (req, res) => {
     try {
         const { idempotencyKey, tier, currency } = req.body;
         const user = req.user;
-        if (!tier || !['basic','starter','pro','enterprise'].includes(tier)) return res.status(400).json({ error: 'Invalid tier' });
-        const finalCurrency = 'KES';
-        const amount = TIER_PRICES_KES[tier];
-        const { data: existing, error } = await supabase.from('payments').select('*').eq('transaction_id', idempotencyKey).maybeSingle();
-        if (existing) { if (existing.status === 'completed') return res.json({ alreadyProcessed: true }); return res.status(409).json({ error: 'Payment being processed' }); }
-        if (!PAYSTACK_SECRET_KEY) return res.status(503).json({ error: 'Payment service not configured' });
-        const paystackAmount = Math.round(amount);
+
+        console.log(`📦 Checkout request: tier=${tier}, currency=${currency}`);
+
+        if (!tier || !['basic','starter','pro','enterprise'].includes(tier)) {
+            return res.status(400).json({ error: 'Invalid tier selected' });
+        }
+
+        // Get base price in KES
+        const basePriceKES = TIER_PRICES_KES[tier];
+        let finalCurrency = (currency || 'KES').toUpperCase();
+        // If currency is KES, no conversion needed
+        let convertedAmount;
+
+        if (finalCurrency === 'KES') {
+            convertedAmount = basePriceKES;
+        } else {
+            // Fetch current exchange rates
+            const rates = await fetchExchangeRates();
+            const rate = rates[finalCurrency];
+            if (!rate) {
+                // Unsupported currency – default to KES
+                console.warn(`⚠️ Unsupported currency ${finalCurrency}, defaulting to KES`);
+                finalCurrency = 'KES';
+                convertedAmount = basePriceKES;
+            } else {
+                // Convert to target currency
+                let amount = basePriceKES * rate;
+                // Determine if currency has cents
+                const currenciesWithCents = ['USD','EUR','GBP','ZAR'];
+                if (currenciesWithCents.includes(finalCurrency)) {
+                    // Convert to smallest unit (cents)
+                    convertedAmount = Math.round(amount * 100);
+                } else {
+                    convertedAmount = Math.round(amount);
+                }
+                console.log(`💱 Converted ${basePriceKES} KES → ${convertedAmount} ${finalCurrency}`);
+            }
+        }
+
+        // Check duplicate transaction
+        const { data: existing, error } = await supabase
+            .from('payments')
+            .select('*')
+            .eq('transaction_id', idempotencyKey)
+            .maybeSingle();
+
+        if (existing) {
+            if (existing.status === 'completed') return res.json({ alreadyProcessed: true });
+            return res.status(409).json({ error: 'Payment is being processed' });
+        }
+
+        if (!PAYSTACK_SECRET_KEY) {
+            return res.status(503).json({ error: 'Payment service not configured' });
+        }
+
+        const paystackAmount = Math.round(convertedAmount);
+
         const response = await fetch('https://api.paystack.co/transaction/initialize', {
             method: 'POST',
-            headers: { 'Authorization': `Bearer ${PAYSTACK_SECRET_KEY}`, 'Content-Type': 'application/json' },
+            headers: {
+                'Authorization': `Bearer ${PAYSTACK_SECRET_KEY}`,
+                'Content-Type': 'application/json'
+            },
             body: JSON.stringify({
-                email: user.email, amount: paystackAmount, currency: finalCurrency,
-                metadata: { idempotencyKey, tier, userId: user.id },
+                email: user.email,
+                amount: paystackAmount,
+                currency: finalCurrency,
+                metadata: {
+                    idempotencyKey,
+                    tier,
+                    userId: user.id
+                },
                 callback_url: `${FRONTEND_URL}/?success=true`
             })
         });
+
         const data = await response.json();
-        if (!data.status) return res.status(500).json({ error: data.message || 'Paystack init failed' });
-        await supabase.from('payments').insert({ user_id: user.id, transaction_id: idempotencyKey, amount: paystackAmount, currency: finalCurrency, status: 'pending', tier });
+        if (!data.status) {
+            return res.status(500).json({ error: data.message || 'Paystack initialization failed' });
+        }
+
+        await supabase.from('payments').insert({
+            user_id: user.id,
+            transaction_id: idempotencyKey,
+            amount: paystackAmount,
+            currency: finalCurrency,
+            status: 'pending',
+            tier
+        });
+
         res.json({ url: data.data.authorization_url });
-    } catch(err) { console.error('Checkout error:', err); res.status(500).json({ error: err.message }); }
+    } catch (err) {
+        console.error('Checkout error:', err);
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // ============================================================
@@ -506,7 +601,10 @@ app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), as
             }
         }
         res.sendStatus(200);
-    } catch(err) { console.error('Webhook error:', err); res.sendStatus(500); }
+    } catch(err) {
+        console.error('Webhook error:', err);
+        res.sendStatus(500);
+    }
 });
 
 // ============================================================
