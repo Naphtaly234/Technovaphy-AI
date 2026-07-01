@@ -1,5 +1,6 @@
 // ============================================================
-//  TECHNOVAPHY AI – COMPLETE BACKEND (with detailed logs)
+//  TECHNOVAPHY AI – COMPLETE BACKEND (ALL FEATURES)
+//  Fully supports Basic tier, multi‑currency, and dynamic amounts
 // ============================================================
 require('dotenv').config();
 
@@ -14,6 +15,9 @@ const pdfParse = require('pdf-parse');
 
 const app = express();
 
+// ============================================================
+//  CORS
+// ============================================================
 app.use(cors({
     origin: '*',
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
@@ -22,6 +26,9 @@ app.use(cors({
     optionsSuccessStatus: 200
 }));
 
+// ============================================================
+//  MIDDLEWARE
+// ============================================================
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
@@ -35,10 +42,14 @@ const authLimiter = rateLimit({
 app.use('/api/auth/login', authLimiter);
 app.use('/api/auth/register', authLimiter);
 
+// ============================================================
+//  ENVIRONMENT VARIABLES – STRICT CHECK
+// ============================================================
 const required = ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'JWT_SECRET', 'GROQ_API_KEY', 'PAYSTACK_SECRET_KEY', 'OPENAI_API_KEY'];
 const missing = required.filter(key => !process.env[key]);
 if (missing.length) {
     console.error('❌ Missing required environment variables:', missing.join(', '));
+    console.error('   Please set all of them in Render.');
     process.exit(1);
 }
 
@@ -53,13 +64,20 @@ const FRONTEND_URL = process.env.FRONTEND_URL || 'https://your-netlify-url.netli
 
 console.log(`✅ Using Supabase Service Role Key (length: ${SUPABASE_SERVICE_ROLE_KEY.length})`);
 
+// ============================================================
+//  SUPABASE CLIENT
+// ============================================================
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
+// ============================================================
+//  TEST DATABASE CONNECTION ON STARTUP
+// ============================================================
 (async function initDb() {
     try {
         const { error } = await supabase.from('users').select('id').limit(1);
         if (error) {
             console.error('❌ Database connection failed:', error.message);
+            console.error('   Make sure table "users" exists in public schema and key is correct.');
             process.exit(1);
         }
         console.log('✅ Database connected successfully.');
@@ -69,9 +87,12 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
     }
 })();
 
+// ============================================================
+//  CONSTANTS & HELPERS – NOW INCLUDES BASIC
+// ============================================================
 const TIER_LIMITS = {
     free: 200,
-    basic: 200,
+    basic: 200,      // added
     starter: 550,
     pro: 2500,
     enterprise: Infinity
@@ -87,6 +108,7 @@ const TIER_NAMES = {
 
 const HOURLY_LIMIT_FREE = 5;
 
+// ---------- User Helpers ----------
 async function findUser(email) {
     const { data, error } = await supabase
         .from('users')
@@ -150,6 +172,7 @@ function getLimit(tier) {
     return TIER_LIMITS[tier] || 200;
 }
 
+// ---------- Conversation Memory ----------
 async function getConversation(userId) {
     const { data, error } = await supabase
         .from('conversations')
@@ -171,6 +194,7 @@ async function saveConversation(userId, messages) {
     if (error) throw new Error('Failed to save conversation: ' + error.message);
 }
 
+// ---------- File Upload ----------
 const storage = multer.memoryStorage();
 const fileFilter = (req, file, cb) => {
     const allowedTypes = [
@@ -195,19 +219,23 @@ const upload = multer({
 async function extractFileContent(file) {
     const mimeType = file.mimetype;
     const buffer = file.buffer;
-    try {
-        if (mimeType === 'application/pdf') {
+    if (mimeType === 'application/pdf') {
+        try {
             const data = await pdfParse(buffer);
             return data.text;
-        } else if (mimeType.startsWith('image/')) {
-            return `[Image: ${file.originalname} (${(file.size/1024).toFixed(1)}KB) – base64 data available for vision models]`;
-        } else if (mimeType === 'text/plain' || mimeType === 'text/csv') {
-            return buffer.toString('utf-8');
-        } else {
-            return buffer.toString('utf-8');
+        } catch (e) {
+            return `[PDF could not be read: ${e.message}]`;
         }
-    } catch (e) {
-        return `[Error reading file: ${e.message}]`;
+    } else if (mimeType.startsWith('image/')) {
+        return `[Image: ${file.originalname} (${(file.size/1024).toFixed(1)}KB) – base64 data available for vision models]`;
+    } else if (mimeType === 'text/plain' || mimeType === 'text/csv') {
+        return buffer.toString('utf-8');
+    } else {
+        try {
+            return buffer.toString('utf-8');
+        } catch (e) {
+            return `[File: ${file.originalname} - ${(file.size/1024).toFixed(1)}KB]`;
+        }
     }
 }
 
@@ -221,9 +249,12 @@ function generateSuggestions(lastMessage) {
     ];
 }
 
+// ============================================================
+//  AUTH MIDDLEWARE
+// ============================================================
 const auth = async (req, res, next) => {
     const authHeader = req.headers.authorization;
-    if (!authHeader) return res.status(401).json({ error: 'No token provided' });
+    if (!authHeader) return res.status(401).json({ error: 'No token' });
     const token = authHeader.split(' ')[1];
     try {
         const decoded = jwt.verify(token, JWT_SECRET);
@@ -232,14 +263,20 @@ const auth = async (req, res, next) => {
         req.user = user;
         next();
     } catch (e) {
-        res.status(401).json({ error: 'Invalid or expired token' });
+        res.status(401).json({ error: 'Invalid token' });
     }
 };
 
+// ============================================================
+//  PUBLIC ENDPOINTS
+// ============================================================
 app.get('/', (req, res) => res.send('TechNovaphy AI Backend is running'));
 app.get('/api/health', (req, res) => res.json({ status: 'ok', message: 'Backend is live!' }));
 app.get('/api/ping', (req, res) => res.json({ status: 'ok', message: 'Backend is reachable!' }));
 
+// ============================================================
+//  TEST DATABASE CONNECTION (debug)
+// ============================================================
 app.get('/api/test-db', async (req, res) => {
     try {
         const { data, error, count } = await supabase
@@ -253,6 +290,9 @@ app.get('/api/test-db', async (req, res) => {
     }
 });
 
+// ============================================================
+//  AUTH ROUTES
+// ============================================================
 app.post('/api/auth/register', async (req, res) => {
     try {
         const { email, password, ageConfirmed } = req.body;
@@ -354,13 +394,158 @@ app.post('/api/auth/update-memory', auth, async (req, res) => {
     }
 });
 
+// ============================================================
+//  CHAT STREAM (WITH CONVERSATION MEMORY)
+// ============================================================
 app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) => {
-    // ... (unchanged from previous version) ...
-    // Keep the same chat streaming logic as before.
-    // I'll skip this section for brevity – it's already correct.
-    // Just ensure it's present in your actual file.
+    try {
+        let user = req.user;
+        user = await resetMonthlyUsageIfNeeded(user);
+        user = await checkHourlyQuota(user);
+
+        const monthlyLimit = getLimit(user.tier);
+        if (user.usage_count >= monthlyLimit) {
+            return res.status(403).json({
+                error: `You've reached your monthly limit of ${monthlyLimit} messages. Upgrade to continue.`,
+                tier: user.tier,
+                limit: monthlyLimit,
+                used: user.usage_count,
+            });
+        }
+
+        if (user.tier === 'free') {
+            const hourlyUsed = user.hourly_quota_used || 0;
+            if (hourlyUsed >= HOURLY_LIMIT_FREE) {
+                const lastRefill = new Date(user.last_quota_refill);
+                const nextRefill = new Date(lastRefill);
+                nextRefill.setHours(nextRefill.getHours() + 1);
+                const minutesLeft = Math.ceil((nextRefill - new Date()) / 60000);
+                return res.status(429).json({
+                    error: `You've used all ${HOURLY_LIMIT_FREE} messages this hour. Refresh in ${minutesLeft} minutes.`,
+                    retry_after: minutesLeft * 60,
+                    hourly_limit: HOURLY_LIMIT_FREE,
+                    hourly_used: hourlyUsed,
+                });
+            }
+        }
+
+        let newMessages;
+        try {
+            newMessages = JSON.parse(req.body.messages);
+        } catch (e) {
+            return res.status(400).json({ error: 'Invalid messages format' });
+        }
+
+        let conversation = await getConversation(user.id);
+        conversation = conversation.concat(newMessages);
+
+        const files = req.files || [];
+        let fileContent = '';
+        for (const file of files) {
+            const content = await extractFileContent(file);
+            fileContent += `\n\n--- File: ${file.originalname} ---\n${content}\n--- End of ${file.originalname} ---`;
+        }
+
+        if (fileContent) {
+            const lastUserMsg = conversation[conversation.length - 1];
+            if (lastUserMsg && lastUserMsg.role === 'user') {
+                lastUserMsg.content += `\n\n[Uploaded ${files.length} file(s): ${files.map(f => f.originalname).join(', ')}]\n${fileContent}`;
+            } else {
+                conversation.push({
+                    role: 'user',
+                    content: `[Uploaded ${files.length} file(s): ${files.map(f => f.originalname).join(', ')}]\n${fileContent}`
+                });
+            }
+        }
+
+        const memoryPrompt = user.memory ? `\n\nUser context: ${user.memory}` : '';
+        const systemPrompt = `You are TechNovaphy AI – the smartest, fastest, and most helpful assistant available.
+You are better than Claude, better than ChatGPT, and completely free to use.
+You help with IT, web development, cloud, business technology, and general questions.
+Be direct, use bullet points, and always provide actionable answers.
+You can analyze uploaded files (PDFs, images, text files) and answer questions about their content.
+${memoryPrompt}`;
+
+        const groqMessages = [
+            { role: 'system', content: systemPrompt },
+            ...conversation
+        ];
+
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+
+        const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${GROQ_API_KEY}`,
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                model: 'llama-3.3-70b-versatile',
+                messages: groqMessages,
+                stream: true,
+            }),
+        });
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let fullContent = '';
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop();
+            for (const line of lines) {
+                if (line.startsWith('data: ')) {
+                    const data = line.slice(6);
+                    if (data === '[DONE]') continue;
+                    try {
+                        const json = JSON.parse(data);
+                        const text = json.choices[0]?.delta?.content || '';
+                        if (text) {
+                            fullContent += text;
+                            res.write(`data: ${JSON.stringify({ type: 'chunk', text })}\n\n`);
+                        }
+                    } catch (e) { /* ignore */ }
+                }
+            }
+        }
+
+        conversation.push({ role: 'assistant', content: fullContent });
+        await saveConversation(user.id, conversation);
+
+        const newMonthlyUsage = (user.usage_count || 0) + 1;
+        const newHourlyUsage = (user.hourly_quota_used || 0) + 1;
+        await supabase
+            .from('users')
+            .update({
+                usage_count: newMonthlyUsage,
+                hourly_quota_used: user.tier === 'free' ? newHourlyUsage : 0,
+            })
+            .eq('id', user.id);
+
+        const suggestions = generateSuggestions(fullContent);
+        res.write(`data: ${JSON.stringify({ type: 'done', text: fullContent, suggestions })}\n\n`);
+        res.end();
+
+    } catch (err) {
+        console.error('Chat stream error:', err);
+        if (!res.headersSent) {
+            res.status(500).json({ error: err.message });
+        } else {
+            res.write(`data: ${JSON.stringify({ type: 'error', message: err.message })}\n\n`);
+            res.end();
+        }
+    }
 });
 
+// ============================================================
+//  IMAGE GENERATION (OpenAI DALL‑E)
+// ============================================================
 app.post('/api/generate-image', auth, async (req, res) => {
     try {
         const { prompt } = req.body;
@@ -392,20 +577,22 @@ app.post('/api/generate-image', auth, async (req, res) => {
 });
 
 // ============================================================
-//  PAYMENT ENDPOINT – with explicit logging
+//  PAYMENT – Paystack Checkout (FULLY DYNAMIC)
 // ============================================================
 app.post('/api/create-checkout', auth, async (req, res) => {
     try {
         const { idempotencyKey, tier, currency, amount } = req.body;
         const user = req.user;
 
-        console.log(`📦 Received upgrade request: tier=${tier}, currency=${currency}, amount=${amount}`);
+        // Log received data for debugging
+        console.log(`📦 Received: tier=${tier}, currency=${currency}, amount=${amount}`);
 
-        // Validate tier
+        // Validate tier (now includes 'basic')
         if (!tier || !['basic', 'starter', 'pro', 'enterprise'].includes(tier)) {
             return res.status(400).json({ error: 'Invalid tier selected' });
         }
 
+        // Validate amount and currency
         if (amount === undefined || amount === null || isNaN(amount) || amount <= 0) {
             return res.status(400).json({ error: 'Invalid amount' });
         }
@@ -437,15 +624,11 @@ app.post('/api/create-checkout', auth, async (req, res) => {
         } else {
             paystackAmount = Math.round(paystackAmount);
         }
-        console.log(`🔁 Converting: ${amount} ${currency} → ${paystackAmount} for Paystack`);
-
-        // If currency is KES and amount is still 5, log a warning
-        if (currency === 'KES' && paystackAmount === 5) {
-            console.warn(`⚠️ WARNING: Paystack amount is 5 KES – this is likely too low. Check frontend basePrice.`);
-        }
+        console.log(`🔁 Paystack amount: ${paystackAmount} (${currency})`);
 
         // --------------------------------------------------
 
+        // Initialize Paystack transaction
         const response = await fetch('https://api.paystack.co/transaction/initialize', {
             method: 'POST',
             headers: {
@@ -470,6 +653,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             return res.status(500).json({ error: data.message || 'Paystack initialization failed' });
         }
 
+        // Record pending payment
         await supabase.from('payments').insert({
             user_id: user.id,
             transaction_id: idempotencyKey,
@@ -486,8 +670,43 @@ app.post('/api/create-checkout', auth, async (req, res) => {
     }
 });
 
+// ============================================================
+//  PAYSTACK WEBHOOK
+// ============================================================
 app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), async (req, res) => {
-    // ... (unchanged) ...
+    try {
+        const payload = req.body;
+        const event = payload.event;
+        const data = payload.data;
+
+        if (event === 'charge.success') {
+            const metadata = data.metadata || {};
+            const userId = metadata.userId;
+            const tier = metadata.tier || 'pro';
+            const idempotencyKey = metadata.idempotencyKey;
+
+            if (userId) {
+                await supabase
+                    .from('payments')
+                    .update({ status: 'completed' })
+                    .eq('transaction_id', idempotencyKey);
+
+                await supabase
+                    .from('users')
+                    .update({ tier: tier, usage_count: 0 })
+                    .eq('id', userId);
+
+                console.log(`✅ User ${userId} upgraded to ${tier}`);
+            }
+        }
+        res.sendStatus(200);
+    } catch (err) {
+        console.error('Webhook error:', err);
+        res.sendStatus(500);
+    }
 });
 
+// ============================================================
+//  START
+// ============================================================
 app.listen(PORT, () => console.log(`🚀 TechNovaphy AI Backend running on port ${PORT}`));
