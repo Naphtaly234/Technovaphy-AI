@@ -1,5 +1,5 @@
 // ============================================================
-//  TECHNOVAPHY AI – UNBEATABLE BACKEND (CORS FIXED + CHAT FIX)
+//  TECHNOVAPHY AI – UNBEATABLE BACKEND (4 TIERS, KES, CHAT FIX)
 // ============================================================
 require('dotenv').config();
 
@@ -59,10 +59,11 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 // ============================================================
-//  4. CONSTANTS
+//  4. CONSTANTS – 4 TIERS
 // ============================================================
 const TIER_LIMITS = {
   free: 200,
+  basic: 200,
   starter: 550,
   pro: 2500,
   enterprise: Infinity,
@@ -70,9 +71,10 @@ const TIER_LIMITS = {
 
 const TIER_NAMES = {
   free: 'Free (5 msgs/hour)',
-  starter: 'Starter ($17/mo) – 550 msg',
-  pro: 'Pro ($34/mo) – 2,500 msg',
-  enterprise: 'Enterprise ($120/mo) – Unlimited',
+  basic: 'Basic (500 KES/mo) – 200 msg',
+  starter: 'Starter (1,700 KES/mo) – 550 msg',
+  pro: 'Pro (3,400 KES/mo) – 2,500 msg',
+  enterprise: 'Enterprise (12,000 KES/mo) – Unlimited',
 };
 
 const HOURLY_LIMIT_FREE = 5;
@@ -430,7 +432,6 @@ Important: Do NOT generate follow‑up questions unless the user specifically as
       fullContent = "I'm sorry, I didn't get that. Could you please rephrase your question?";
     }
 
-    // ---- Suggestions (can be dynamic later) ----
     const suggestions = [
       "Tell me more about that.",
       "Can you give me an example?",
@@ -492,13 +493,14 @@ app.post('/api/generate-image', auth, async (req, res) => {
 });
 
 // ============================================================
-//  11. PAYMENT – Paystack Checkout
+//  11. PAYMENT – Paystack Checkout (4 tiers, KES)
 // ============================================================
 app.post('/api/create-checkout', auth, async (req, res) => {
   const { idempotencyKey, tier } = req.body;
   const user = req.user;
 
-  if (!tier || !['starter', 'pro', 'enterprise'].includes(tier)) {
+  // Accept all 4 paid tiers
+  if (!tier || !['basic', 'starter', 'pro', 'enterprise'].includes(tier)) {
     return res.status(400).json({ error: 'Invalid tier selected' });
   }
 
@@ -517,7 +519,9 @@ app.post('/api/create-checkout', auth, async (req, res) => {
     return res.status(503).json({ error: 'Payment service not configured' });
   }
 
+  // 👇 Prices in KES
   const tierPrices = {
+    basic: 500,
     starter: 1700,
     pro: 3400,
     enterprise: 12000,
@@ -532,7 +536,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
     body: JSON.stringify({
       email: user.email,
       amount: tierPrices[tier],
-      currency: 'USD',
+      currency: 'KES',          // 👈 Kenyan Shillings
       metadata: {
         idempotencyKey: idempotencyKey,
         tier: tier,
@@ -551,7 +555,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
     user_id: user.id,
     transaction_id: idempotencyKey,
     amount: tierPrices[tier],
-    currency: 'USD',
+    currency: 'KES',
     status: 'pending',
   });
 
@@ -571,7 +575,7 @@ app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), as
   if (event === 'charge.success') {
     const metadata = data.metadata || {};
     const userId = metadata.userId;
-    const tier = metadata.tier || 'pro';
+    const tier = metadata.tier || 'pro';   // default to pro if missing
     const idempotencyKey = metadata.idempotencyKey;
 
     if (userId) {
