@@ -1,16 +1,13 @@
 // ============================================================
-//  TECHNOVAPHY AI – BACKEND (FIXED PAYMENT)
+//  TECHNOVAPHY AI – COMPLETE BACKEND (ALL FEATURES)
 // ============================================================
 require('dotenv').config();
 
 const express = require('express');
 const cors = require('cors');
-const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
-const morgan = require('morgan');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcrypt');
-const { v4: uuidv4 } = require('uuid');
 const { createClient } = require('@supabase/supabase-js');
 const multer = require('multer');
 const pdfParse = require('pdf-parse');
@@ -18,746 +15,674 @@ const pdfParse = require('pdf-parse');
 const app = express();
 
 // ============================================================
-//  1. CORS
+//  CORS
 // ============================================================
 app.use(cors({
-  origin: '*',
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-  credentials: true,
+    origin: '*',
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'Accept'],
+    credentials: true,
+    optionsSuccessStatus: 200
 }));
-app.options('*', cors());
 
 // ============================================================
-//  2. SECURITY & LOGGING
+//  MIDDLEWARE
 // ============================================================
-app.use(helmet());
-app.use(morgan('combined'));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
 const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 10,
-  message: 'Too many login attempts. Please try again later.',
+    windowMs: 15 * 60 * 1000,
+    max: 10,
+    handler: (req, res) => {
+        res.status(429).json({ error: 'Too many login attempts. Please try again later.' });
+    },
 });
 app.use('/api/auth/login', authLimiter);
 app.use('/api/auth/register', authLimiter);
 
 // ============================================================
-//  3. ENVIRONMENT VARIABLES
+//  ENVIRONMENT VARIABLES – STRICT CHECK
 // ============================================================
+const required = ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'JWT_SECRET', 'GROQ_API_KEY', 'PAYSTACK_SECRET_KEY', 'OPENAI_API_KEY'];
+const missing = required.filter(key => !process.env[key]);
+if (missing.length) {
+    console.error('❌ Missing required environment variables:', missing.join(', '));
+    console.error('   Please set all of them in Render.');
+    process.exit(1);
+}
+
 const PORT = process.env.PORT || 3001;
-const JWT_SECRET = process.env.JWT_SECRET || 'your_secret_key';
-const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const JWT_SECRET = process.env.JWT_SECRET;
 const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const FRONTEND_URL = process.env.FRONTEND_URL || 'https://your-netlify-url.netlify.app';
 
+console.log(`✅ Using Supabase Service Role Key (length: ${SUPABASE_SERVICE_ROLE_KEY.length})`);
+
+// ============================================================
+//  SUPABASE CLIENT
+// ============================================================
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 // ============================================================
-//  4. CONSTANTS
+//  TEST DATABASE CONNECTION ON STARTUP
 // ============================================================
-const TIER_LIMITS = {
-  free: 200,
-  basic: 200,
-  starter: 550,
-  pro: 2500,
-  enterprise: Infinity,
-};
+(async function initDb() {
+    try {
+        const { error } = await supabase.from('users').select('id').limit(1);
+        if (error) {
+            console.error('❌ Database connection failed:', error.message);
+            console.error('   Make sure table "users" exists in public schema and key is correct.');
+            process.exit(1);
+        }
+        console.log('✅ Database connected successfully.');
+    } catch (e) {
+        console.error('❌ Fatal database error:', e.message);
+        process.exit(1);
+    }
+})();
 
+// ============================================================
+//  CONSTANTS & HELPERS
+// ============================================================
+const TIER_LIMITS = { free: 200, starter: 550, pro: 2500, enterprise: Infinity };
 const TIER_NAMES = {
-  free: 'Free (20 msgs / 2.5h)',
-  basic: 'Basic (500 KES/mo) – 200 msg',
-  starter: 'Starter (1,700 KES/mo) – 550 msg',
-  pro: 'Pro (3,500 KES/mo) – 2,500 msg',
-  enterprise: 'Enterprise (15,000 KES/mo) – Unlimited',
+    free: 'Free (5 msgs/hour)',
+    starter: 'Starter ($17/mo) – 550 msg',
+    pro: 'Pro ($34/mo) – 2,500 msg',
+    enterprise: 'Enterprise ($120/mo) – Unlimited',
 };
+const HOURLY_LIMIT_FREE = 5;
 
-const FREE_WINDOW_LIMIT = 20;
-const FREE_WINDOW_HOURS = 2.5;
-
-// ============================================================
-//  4a. BASE PRICES & EXCHANGE RATES (HARDCODED - FIXED)
-// ============================================================
-
-const BASE_PRICES_KES = {
-  basic: 500,
-  starter: 1700,
-  pro: 3500,
-  enterprise: 15000,
-};
-
-// ✅ FIXED: These are the correct rates
-// 500 KES × 0.0077 = 3.85 USD ✅
-const EXCHANGE_RATES = {
-  KES: 1,
-  USD: 0.0077,
-  EUR: 0.0070,
-  GBP: 0.0061,
-  NGN: 12.5,
-  GHS: 0.098,
-  ZAR: 0.14,
-};
-
-// Currencies that need ×100 for Paystack
-const SUBUNIT_CURRENCIES = ['USD', 'EUR', 'GBP', 'NGN', 'GHS', 'ZAR'];
-
-// ============================================================
-//  5. HELPERS
-// ============================================================
+// ---------- User Helpers ----------
 async function findUser(email) {
-  const { data, error } = await supabase
-    .from('users')
-    .select('*')
-    .eq('email', email)
-    .single();
-  if (error && error.code !== 'PGRST116') throw error;
-  return data;
+    const { data, error } = await supabase
+        .from('users')
+        .select('*')
+        .eq('email', email)
+        .maybeSingle();
+    if (error) throw new Error('Database error: ' + error.message);
+    return data;
 }
 
 async function findUserById(id) {
-  const { data, error } = await supabase
-    .from('users')
-    .select('*')
-    .eq('id', id)
-    .single();
-  if (error && error.code !== 'PGRST116') throw error;
-  return data;
+    const { data, error } = await supabase
+        .from('users')
+        .select('*')
+        .eq('id', id)
+        .maybeSingle();
+    if (error) throw new Error('Database error: ' + error.message);
+    return data;
 }
 
 async function resetMonthlyUsageIfNeeded(user) {
-  const now = new Date();
-  const resetDate = new Date(user.monthly_reset_date);
-  if (now >= resetDate) {
-    const nextMonth = new Date(now);
-    nextMonth.setMonth(nextMonth.getMonth() + 1);
-    await supabase
-      .from('users')
-      .update({
-        usage_count: 0,
-        monthly_reset_date: nextMonth.toISOString().split('T')[0],
-      })
-      .eq('id', user.id);
-    user.usage_count = 0;
-    user.monthly_reset_date = nextMonth.toISOString().split('T')[0];
-  }
-  return user;
+    const now = new Date();
+    const resetDate = new Date(user.monthly_reset_date);
+    if (now >= resetDate) {
+        const nextMonth = new Date(now);
+        nextMonth.setMonth(nextMonth.getMonth() + 1);
+        await supabase
+            .from('users')
+            .update({
+                usage_count: 0,
+                monthly_reset_date: nextMonth.toISOString().split('T')[0],
+            })
+            .eq('id', user.id);
+        user.usage_count = 0;
+        user.monthly_reset_date = nextMonth.toISOString().split('T')[0];
+    }
+    return user;
 }
 
-async function checkFreeWindowQuota(user) {
-  if (user.tier !== 'free') return user;
-
-  const now = new Date();
-  const lastRefill = new Date(user.last_quota_refill);
-  const hoursSinceRefill = (now - lastRefill) / (1000 * 60 * 60);
-
-  if (hoursSinceRefill >= FREE_WINDOW_HOURS) {
-    const newRefill = now.toISOString();
-    await supabase
-      .from('users')
-      .update({
-        hourly_quota_used: 0,
-        last_quota_refill: newRefill,
-      })
-      .eq('id', user.id);
-    user.hourly_quota_used = 0;
-    user.last_quota_refill = newRefill;
-  }
-  return user;
+async function checkHourlyQuota(user) {
+    if (user.tier !== 'free') return user;
+    const now = new Date();
+    const lastRefill = new Date(user.last_quota_refill);
+    const hoursSinceRefill = (now - lastRefill) / (1000 * 60 * 60);
+    if (hoursSinceRefill >= 1) {
+        const newRefill = now.toISOString();
+        await supabase
+            .from('users')
+            .update({
+                hourly_quota_used: 0,
+                last_quota_refill: newRefill,
+            })
+            .eq('id', user.id);
+        user.hourly_quota_used = 0;
+        user.last_quota_refill = newRefill;
+    }
+    return user;
 }
 
 function getLimit(tier) {
-  return TIER_LIMITS[tier] || 200;
+    return TIER_LIMITS[tier] || 200;
 }
 
-// ============================================================
-//  6. FILE UPLOAD
-// ============================================================
+// ---------- Conversation Memory ----------
+async function getConversation(userId) {
+    const { data, error } = await supabase
+        .from('conversations')
+        .select('messages')
+        .eq('user_id', userId)
+        .maybeSingle();
+    if (error && error.code !== 'PGRST116') throw error;
+    return data ? data.messages : [];
+}
+
+async function saveConversation(userId, messages) {
+    // Upsert: insert or update
+    const { error } = await supabase
+        .from('conversations')
+        .upsert({
+            user_id: userId,
+            messages: messages,
+            updated_at: new Date().toISOString()
+        }, { onConflict: 'user_id' });
+    if (error) throw new Error('Failed to save conversation: ' + error.message);
+}
+
+// ---------- File Upload ----------
 const storage = multer.memoryStorage();
 const fileFilter = (req, file, cb) => {
-  const allowedTypes = [
-    'image/jpeg', 'image/png', 'image/webp',
-    'application/pdf',
-    'text/plain', 'text/csv',
-    'text/html',
-    'application/msword',
-    'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-  ];
-  if (file.mimetype.startsWith('text/') || allowedTypes.includes(file.mimetype)) {
-    cb(null, true);
-  } else {
-    cb(new Error('Unsupported file type'), false);
-  }
+    const allowedTypes = [
+        'image/jpeg', 'image/png', 'image/webp',
+        'application/pdf',
+        'text/plain', 'text/csv',
+        'application/msword',
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+    ];
+    if (allowedTypes.includes(file.mimetype)) {
+        cb(null, true);
+    } else {
+        cb(new Error('Unsupported file type'), false);
+    }
 };
 const upload = multer({
-  storage: storage,
-  limits: { fileSize: 10 * 1024 * 1024 },
-  fileFilter: fileFilter,
+    storage: storage,
+    limits: { fileSize: 10 * 1024 * 1024 },
+    fileFilter: fileFilter,
 });
 
 async function extractFileContent(file) {
-  const mimeType = file.mimetype;
-  const buffer = file.buffer;
-  if (mimeType === 'application/pdf') {
-    try {
-      const data = await pdfParse(buffer);
-      return data.text;
-    } catch (e) {
-      return `[PDF could not be read: ${e.message}]`;
+    const mimeType = file.mimetype;
+    const buffer = file.buffer;
+    if (mimeType === 'application/pdf') {
+        try {
+            const data = await pdfParse(buffer);
+            return data.text;
+        } catch (e) {
+            return `[PDF could not be read: ${e.message}]`;
+        }
+    } else if (mimeType.startsWith('image/')) {
+        return `[Image: ${file.originalname} (${(file.size/1024).toFixed(1)}KB) – base64 data available for vision models]`;
+    } else if (mimeType === 'text/plain' || mimeType === 'text/csv') {
+        return buffer.toString('utf-8');
+    } else {
+        try {
+            return buffer.toString('utf-8');
+        } catch (e) {
+            return `[File: ${file.originalname} - ${(file.size/1024).toFixed(1)}KB]`;
+        }
     }
-  } else if (mimeType.startsWith('image/')) {
-    return `[Image: ${file.originalname} (${(file.size/1024).toFixed(1)}KB)]`;
-  } else if (mimeType.startsWith('text/') || mimeType === 'application/json' || mimeType === 'text/html') {
-    return buffer.toString('utf-8');
-  } else {
-    try {
-      return buffer.toString('utf-8');
-    } catch (e) {
-      return `[File: ${file.originalname} - ${(file.size/1024).toFixed(1)}KB]`;
-    }
-  }
+}
+
+function generateSuggestions(lastMessage) {
+    return [
+        "Tell me more about that.",
+        "Can you give me an example?",
+        "How does this compare to other solutions?",
+        "What are the key benefits?",
+        "Is there anything else I should know?"
+    ];
 }
 
 // ============================================================
-//  7. AUTH MIDDLEWARE
+//  AUTH MIDDLEWARE
 // ============================================================
 const auth = async (req, res, next) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader) return res.status(401).json({ error: 'No token' });
-  const token = authHeader.split(' ')[1];
-  try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    const user = await findUserById(decoded.userId);
-    if (!user) return res.status(401).json({ error: 'User not found' });
-    req.user = user;
-    next();
-  } catch (e) {
-    res.status(401).json({ error: 'Invalid token' });
-  }
+    const authHeader = req.headers.authorization;
+    if (!authHeader) return res.status(401).json({ error: 'No token' });
+    const token = authHeader.split(' ')[1];
+    try {
+        const decoded = jwt.verify(token, JWT_SECRET);
+        const user = await findUserById(decoded.userId);
+        if (!user) return res.status(401).json({ error: 'User not found' });
+        req.user = user;
+        next();
+    } catch (e) {
+        res.status(401).json({ error: 'Invalid token' });
+    }
 };
 
 // ============================================================
-//  8. HEALTH CHECK
+//  PUBLIC ENDPOINTS
 // ============================================================
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', message: 'TechNovaphy AI backend is live!' });
-});
+app.get('/', (req, res) => res.send('TechNovaphy AI Backend is running'));
+app.get('/api/health', (req, res) => res.json({ status: 'ok', message: 'Backend is live!' }));
+app.get('/api/ping', (req, res) => res.json({ status: 'ok', message: 'Backend is reachable!' }));
 
 // ============================================================
-//  9. DEBUG ENDPOINT – Check Rates
+//  TEST DATABASE CONNECTION (debug)
 // ============================================================
-app.get('/api/debug/rates', (req, res) => {
-  res.json({
-    exchange_rates: EXCHANGE_RATES,
-    base_prices: BASE_PRICES_KES,
-    subunit_currencies: SUBUNIT_CURRENCIES,
-    sample_calculation: {
-      tier: 'basic',
-      currency: 'USD',
-      base_kes: 500,
-      rate: EXCHANGE_RATES.USD,
-      display_amount: Math.round(500 * EXCHANGE_RATES.USD * 100) / 100,
-      paystack_amount: Math.round(Math.round(500 * EXCHANGE_RATES.USD * 100) / 100 * 100),
+app.get('/api/test-db', async (req, res) => {
+    try {
+        const { data, error, count } = await supabase
+            .from('users')
+            .select('*', { count: 'exact', head: true });
+        if (error) throw error;
+        res.json({ success: true, count });
+    } catch (err) {
+        console.error('Test DB error:', err);
+        res.status(500).json({ success: false, error: err.message });
     }
-  });
 });
 
 // ============================================================
-//  10. AUTH ROUTES
+//  AUTH ROUTES
 // ============================================================
 app.post('/api/auth/register', async (req, res) => {
-  const { email, password, ageConfirmed } = req.body;
-  if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
-  if (!ageConfirmed) return res.status(400).json({ error: 'You must be 18 or older' });
-  const existing = await findUser(email);
-  if (existing) return res.status(400).json({ error: 'Email already exists' });
+    try {
+        const { email, password, ageConfirmed } = req.body;
+        if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+        if (!ageConfirmed) return res.status(400).json({ error: 'You must be 18 or older' });
 
-  const hashed = await bcrypt.hash(password, 10);
-  const now = new Date();
-  const nextMonth = new Date(now);
-  nextMonth.setMonth(nextMonth.getMonth() + 1);
-  const { data, error } = await supabase.from('users').insert({
-    email,
-    password_hash: hashed,
-    tier: 'free',
-    usage_count: 0,
-    monthly_reset_date: nextMonth.toISOString().split('T')[0],
-    verified: true,
-    hourly_quota_used: 0,
-    last_quota_refill: now.toISOString(),
-    memory: '',
-  }).select().single();
-  if (error) return res.status(500).json({ error: error.message });
-  res.status(201).json({ message: 'User created', userId: data.id });
+        const existing = await findUser(email);
+        if (existing) return res.status(400).json({ error: 'Email already exists' });
+
+        const hashed = await bcrypt.hash(password, 10);
+        const now = new Date();
+        const nextMonth = new Date(now);
+        nextMonth.setMonth(nextMonth.getMonth() + 1);
+
+        const { data, error } = await supabase
+            .from('users')
+            .insert({
+                email,
+                password_hash: hashed,
+                tier: 'free',
+                usage_count: 0,
+                monthly_reset_date: nextMonth.toISOString().split('T')[0],
+                verified: true,
+                hourly_quota_used: 0,
+                last_quota_refill: now.toISOString(),
+                memory: '',
+            })
+            .select()
+            .single();
+
+        if (error) throw new Error('Database insert: ' + error.message);
+        // Create empty conversation entry for this user
+        await supabase
+            .from('conversations')
+            .insert({ user_id: data.id, messages: [] });
+        res.status(201).json({ message: 'User created', userId: data.id });
+    } catch (err) {
+        console.error('Registration error:', err);
+        res.status(500).json({ error: err.message });
+    }
 });
 
 app.post('/api/auth/login', async (req, res) => {
-  const { email, password } = req.body;
-  const user = await findUser(email);
-  if (!user) return res.status(401).json({ error: 'Invalid credentials' });
-  const valid = await bcrypt.compare(password, user.password_hash);
-  if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
-  const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '7d' });
-  res.json({ token, verified: true });
+    try {
+        const { email, password } = req.body;
+        if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+
+        const user = await findUser(email);
+        if (!user) return res.status(401).json({ error: 'Invalid credentials' });
+
+        const valid = await bcrypt.compare(password, user.password_hash);
+        if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
+
+        const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '7d' });
+        res.json({ token, verified: true });
+    } catch (err) {
+        console.error('Login error:', err);
+        res.status(500).json({ error: err.message });
+    }
 });
 
 app.get('/api/user/profile', auth, async (req, res) => {
-  let user = req.user;
-  user = await resetMonthlyUsageIfNeeded(user);
-  user = await checkFreeWindowQuota(user);
-
-  const limit = getLimit(user.tier);
-  const windowLimit = user.tier === 'free' ? FREE_WINDOW_LIMIT : Infinity;
-  const used = user.hourly_quota_used || 0;
-  const remaining = user.tier === 'free' ? Math.max(0, windowLimit - used) : Infinity;
-
-  res.json({
-    email: user.email,
-    tier: user.tier,
-    tier_name: TIER_NAMES[user.tier] || 'Free',
-    usage_count: user.usage_count,
-    limit: limit,
-    monthly_reset_date: user.monthly_reset_date,
-    verified: true,
-    hourly_quota_used: used,
-    hourly_quota_limit: windowLimit,
-    hourly_remaining: remaining,
-    last_quota_refill: user.last_quota_refill,
-    memory: user.memory || '',
-  });
+    try {
+        let user = req.user;
+        user = await resetMonthlyUsageIfNeeded(user);
+        user = await checkHourlyQuota(user);
+        const limit = getLimit(user.tier);
+        const hourlyLimit = user.tier === 'free' ? HOURLY_LIMIT_FREE : Infinity;
+        const hourlyUsed = user.hourly_quota_used || 0;
+        const hourlyRemaining = user.tier === 'free' ? Math.max(0, hourlyLimit - hourlyUsed) : Infinity;
+        res.json({
+            email: user.email,
+            tier: user.tier,
+            tier_name: TIER_NAMES[user.tier] || 'Free',
+            usage_count: user.usage_count,
+            limit: limit,
+            monthly_reset_date: user.monthly_reset_date,
+            verified: true,
+            hourly_quota_used: hourlyUsed,
+            hourly_quota_limit: hourlyLimit,
+            hourly_remaining: hourlyRemaining,
+            last_quota_refill: user.last_quota_refill,
+            memory: user.memory || '',
+        });
+    } catch (err) {
+        console.error('Profile error:', err);
+        res.status(500).json({ error: err.message });
+    }
 });
 
 app.post('/api/auth/update-memory', auth, async (req, res) => {
-  const { memory } = req.body;
-  const user = req.user;
-  await supabase.from('users').update({ memory }).eq('id', user.id);
-  res.json({ message: 'Memory updated' });
+    try {
+        const { memory } = req.body;
+        const user = req.user;
+        await supabase.from('users').update({ memory }).eq('id', user.id);
+        res.json({ message: 'Memory updated' });
+    } catch (err) {
+        console.error('Update memory error:', err);
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // ============================================================
-//  11. CHAT WITH GROQ
+//  CHAT STREAM (WITH CONVERSATION MEMORY)
 // ============================================================
-
-function detectRoleAndCustomize(userMessage) {
-  const msg = userMessage.toLowerCase();
-  const roleMap = [
-    { keywords: ['react', 'node', 'python', 'java', 'javascript', 'typescript', 'git', 'api', 'backend', 'frontend', 'debug', 'code', 'programming', 'software', 'developer', 'devops', 'docker', 'kubernetes'], role: 'Senior Software Engineer', extra: 'Write clean, production-ready code with edge cases handled. Explain trade-offs. Provide actual code blocks.' },
-    { keywords: ['ui', 'ux', 'figma', 'adobe', 'photoshop', 'illustrator', 'typography', 'color palette', 'wireframe', 'prototype', 'user experience', 'user interface', 'design system'], role: 'Principal UX/UI Designer', extra: 'Think about human psychology, accessibility (WCAG), and visual hierarchy. Suggest modern design patterns and tools.' },
-    { keywords: ['math', 'statistics', 'calculus', 'algebra', 'probability', 'linear regression', 'hypothesis', 'dataset', 'machine learning', 'neural network', 'algorithm', 'data science'], role: 'Mathematician & Data Scientist', extra: 'Show your reasoning step-by-step. Use mathematical notation (if text-based) and explain the "why" behind formulas.' },
-    { keywords: ['cyber', 'security', 'firewall', 'encryption', 'certificate', 'vulnerability', 'penetration', 'owasp', 'zero-trust', 'hack'], role: 'Cybersecurity Architect', extra: 'Prioritize risk assessment, defense-in-depth, and OWASP/ISO standards. Be paranoid but practical.' },
-    { keywords: ['cloud', 'aws', 'azure', 'gcp', 'serverless', 's3', 'ec2', 'lambda', 'cloudfront', 'terraform'], role: 'Cloud Solutions Architect', extra: 'Focus on scalability, cost-efficiency, and resilience. Give cloud-agnostic advice when possible.' },
-    { keywords: ['strategy', 'marketing', 'sales', 'copywriting', 'business model', 'roi', 'market fit', 'competitor', 'pitch'], role: 'Business & Growth Strategist', extra: 'Be data-driven. Focus on monetization, user acquisition, and clear, persuasive language.' }
-  ];
-  let detectedRole = 'General Tech Genius';
-  let extraInstructions = 'Give clear, structured, and helpful answers. Use bullet points and real-world analogies.';
-  for (const item of roleMap) {
-    if (item.keywords.some(kw => msg.includes(kw))) {
-      detectedRole = item.role;
-      extraInstructions = item.extra;
-      break;
-    }
-  }
-  return { detectedRole, extraInstructions };
-}
-
 app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) => {
-  let user = req.user;
-  user = await resetMonthlyUsageIfNeeded(user);
-  user = await checkFreeWindowQuota(user);
+    try {
+        let user = req.user;
+        user = await resetMonthlyUsageIfNeeded(user);
+        user = await checkHourlyQuota(user);
 
-  const monthlyLimit = getLimit(user.tier);
-  if (user.usage_count >= monthlyLimit) {
-    return res.status(403).json({
-      error: `You've reached your monthly limit of ${monthlyLimit} messages. Upgrade to continue.`,
-      tier: user.tier,
-      limit: monthlyLimit,
-      used: user.usage_count,
-    });
-  }
+        const monthlyLimit = getLimit(user.tier);
+        if (user.usage_count >= monthlyLimit) {
+            return res.status(403).json({
+                error: `You've reached your monthly limit of ${monthlyLimit} messages. Upgrade to continue.`,
+                tier: user.tier,
+                limit: monthlyLimit,
+                used: user.usage_count,
+            });
+        }
 
-  if (user.tier === 'free') {
-    const used = user.hourly_quota_used || 0;
-    if (used >= FREE_WINDOW_LIMIT) {
-      const lastRefill = new Date(user.last_quota_refill);
-      const resetTime = new Date(lastRefill.getTime() + (FREE_WINDOW_HOURS * 60 * 60 * 1000));
-      const minutesLeft = Math.ceil((resetTime - new Date()) / 60000);
-      const hoursLeft = Math.floor(minutesLeft / 60);
-      const minsLeft = minutesLeft % 60;
-      let timeString = '';
-      if (hoursLeft > 0) timeString += `${hoursLeft}h `;
-      timeString += `${minsLeft}m`;
+        if (user.tier === 'free') {
+            const hourlyUsed = user.hourly_quota_used || 0;
+            if (hourlyUsed >= HOURLY_LIMIT_FREE) {
+                const lastRefill = new Date(user.last_quota_refill);
+                const nextRefill = new Date(lastRefill);
+                nextRefill.setHours(nextRefill.getHours() + 1);
+                const minutesLeft = Math.ceil((nextRefill - new Date()) / 60000);
+                return res.status(429).json({
+                    error: `You've used all ${HOURLY_LIMIT_FREE} messages this hour. Refresh in ${minutesLeft} minutes.`,
+                    retry_after: minutesLeft * 60,
+                    hourly_limit: HOURLY_LIMIT_FREE,
+                    hourly_used: hourlyUsed,
+                });
+            }
+        }
 
-      return res.status(429).json({
-        error: `✨ You've used all ${FREE_WINDOW_LIMIT} messages in this 2.5‑hour window. Your next window unlocks in ${timeString}.`,
-        retry_after: minutesLeft * 60,
-        window_limit: FREE_WINDOW_LIMIT,
-        window_hours: FREE_WINDOW_HOURS,
-        used: used,
-        unlocks_in_minutes: minutesLeft,
-      });
-    }
-  }
+        let newMessages;
+        try {
+            newMessages = JSON.parse(req.body.messages); // array of {role, content}
+        } catch (e) {
+            return res.status(400).json({ error: 'Invalid messages format' });
+        }
 
-  let messages;
-  try {
-    messages = JSON.parse(req.body.messages);
-  } catch (e) {
-    return res.status(400).json({ error: 'Invalid messages format' });
-  }
+        // Load existing conversation history
+        let conversation = await getConversation(user.id);
+        // Append new messages
+        conversation = conversation.concat(newMessages);
 
-  const files = req.files || [];
-  let fileContent = '';
-  let fileNames = [];
-  for (const file of files) {
-    fileNames.push(file.originalname);
-    const content = await extractFileContent(file);
-    fileContent += `\n\n--- File: ${file.originalname} ---\n${content}\n--- End of ${file.originalname} ---`;
-  }
-  if (fileContent) {
-    const lastUserMsg = messages[messages.length - 1];
-    if (lastUserMsg && lastUserMsg.role === 'user') {
-      lastUserMsg.content += `\n\n[Uploaded ${files.length} file(s): ${fileNames.join(', ')}]\n${fileContent}`;
-    } else {
-      messages.push({
-        role: 'user',
-        content: `[Uploaded ${files.length} file(s): ${fileNames.join(', ')}]\n${fileContent}`
-      });
-    }
-  }
+        const files = req.files || [];
+        let fileContent = '';
+        for (const file of files) {
+            const content = await extractFileContent(file);
+            fileContent += `\n\n--- File: ${file.originalname} ---\n${content}\n--- End of ${file.originalname} ---`;
+        }
 
-  const lastUserMsg = messages.filter(m => m.role === 'user').pop();
-  if (lastUserMsg) {
-    const lower = lastUserMsg.content.toLowerCase();
-    const nameMatch = lower.match(/my name is ([^\n.,!?]+)/i) || lower.match(/call me ([^\n.,!?]+)/i);
-    if (nameMatch) {
-      const name = nameMatch[1].trim();
-      let memory = user.memory || '';
-      if (!memory.includes('name:')) {
-        memory = memory ? `${memory}\nname: ${name}` : `name: ${name}`;
-        await supabase.from('users').update({ memory }).eq('id', user.id);
-        user.memory = memory;
-      }
-    }
-  }
+        if (fileContent) {
+            const lastUserMsg = conversation[conversation.length - 1];
+            if (lastUserMsg && lastUserMsg.role === 'user') {
+                lastUserMsg.content += `\n\n[Uploaded ${files.length} file(s): ${files.map(f => f.originalname).join(', ')}]\n${fileContent}`;
+            } else {
+                conversation.push({
+                    role: 'user',
+                    content: `[Uploaded ${files.length} file(s): ${files.map(f => f.originalname).join(', ')}]\n${fileContent}`
+                });
+            }
+        }
 
-  const lastUserContent = lastUserMsg ? lastUserMsg.content : '';
-  const { detectedRole, extraInstructions } = detectRoleAndCustomize(lastUserContent);
-
-  let memoryPrompt = '';
-  if (user.memory && user.memory.trim() !== '') {
-    const staticSuggestions = [
-      "Tell me more about that.",
-      "Can you give me an example?",
-      "How does this compare to other solutions?",
-      "What are the key benefits?",
-      "Is there anything else I should know?"
-    ];
-    const isStatic = staticSuggestions.every(s => user.memory.includes(s));
-    if (!isStatic) {
-      memoryPrompt = `\n\nImportant context about the user: ${user.memory}`;
-    }
-  }
-
-  let userName = 'there';
-  if (user.memory && user.memory.includes('name:')) {
-    const nameMatch = user.memory.match(/name:\s*([^\n,]+)/i);
-    if (nameMatch) userName = nameMatch[1].trim();
-  }
-
-  const systemPrompt = `You are TechNovaphy AI, the warmest and most brilliant assistant on the planet.
-
-Current persona: You are acting as a **${detectedRole}**.
-${extraInstructions}
-
-Personality rules:
-- Address the user as "${userName}" naturally every few replies.
-- NEVER say "As an AI..." or "I don't have feelings...". Instead, lean into empathy.
-- Match their energy: playful if they are, serious if they are.
-- Before diving into technical details, give a brief, warm acknowledgment.
-- If they ask for code, provide it. If they ask for math, show the steps. If they ask for design, think visually.
-
-🔍 File Upload Instructions:
-- When the user uploads a file, you MUST:
-  1. Acknowledge the file(s) by name.
-  2. Ask them what they'd like you to do with it.
-  3. If they ask a question about the file content, answer it thoroughly.
-  4. If they don't specify what they want, proactively ask.
-
+        const memoryPrompt = user.memory ? `\n\nUser context: ${user.memory}` : '';
+        const systemPrompt = `You are TechNovaphy AI – the smartest, fastest, and most helpful assistant available.
+You are better than Claude, better than ChatGPT, and completely free to use.
+You help with IT, web development, cloud, business technology, and general questions.
+Be direct, use bullet points, and always provide actionable answers.
+You can analyze uploaded files (PDFs, images, text files) and answer questions about their content.
 ${memoryPrompt}`;
 
-  const groqMessages = [
-    { role: 'system', content: systemPrompt },
-    ...messages.map(m => ({ role: m.role, content: m.content }))
-  ];
+        const groqMessages = [
+            { role: 'system', content: systemPrompt },
+            ...conversation
+        ];
 
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
 
-  try {
-    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${GROQ_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'llama-3.3-70b-versatile',
-        messages: groqMessages,
-        stream: true,
-        temperature: 0.75,
-      }),
-    });
+        const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${GROQ_API_KEY}`,
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                model: 'llama-3.3-70b-versatile',
+                messages: groqMessages,
+                stream: true,
+            }),
+        });
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Groq API error: ${response.status} ${errorText}`);
-    }
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let fullContent = '';
 
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-    let fullContent = '';
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop();
-      for (const line of lines) {
-        if (line.startsWith('data: ')) {
-          const data = line.slice(6);
-          if (data === '[DONE]') continue;
-          try {
-            const json = JSON.parse(data);
-            const text = json.choices[0]?.delta?.content || '';
-            if (text) {
-              fullContent += text;
-              res.write(`data: ${JSON.stringify({ type: 'chunk', text })}\n\n`);
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop();
+            for (const line of lines) {
+                if (line.startsWith('data: ')) {
+                    const data = line.slice(6);
+                    if (data === '[DONE]') continue;
+                    try {
+                        const json = JSON.parse(data);
+                        const text = json.choices[0]?.delta?.content || '';
+                        if (text) {
+                            fullContent += text;
+                            res.write(`data: ${JSON.stringify({ type: 'chunk', text })}\n\n`);
+                        }
+                    } catch (e) { /* ignore */ }
+                }
             }
-          } catch (e) {
-            console.warn('SSE parse error:', e);
-          }
         }
-      }
+
+        // Append assistant reply to conversation
+        conversation.push({ role: 'assistant', content: fullContent });
+
+        // Save updated conversation to database
+        await saveConversation(user.id, conversation);
+
+        // Update usage counters
+        const newMonthlyUsage = (user.usage_count || 0) + 1;
+        const newHourlyUsage = (user.hourly_quota_used || 0) + 1;
+        await supabase
+            .from('users')
+            .update({
+                usage_count: newMonthlyUsage,
+                hourly_quota_used: user.tier === 'free' ? newHourlyUsage : 0,
+            })
+            .eq('id', user.id);
+
+        const suggestions = generateSuggestions(fullContent);
+        res.write(`data: ${JSON.stringify({ type: 'done', text: fullContent, suggestions })}\n\n`);
+        res.end();
+
+    } catch (err) {
+        console.error('Chat stream error:', err);
+        if (!res.headersSent) {
+            res.status(500).json({ error: err.message });
+        } else {
+            res.write(`data: ${JSON.stringify({ type: 'error', message: err.message })}\n\n`);
+            res.end();
+        }
     }
-
-    if (!fullContent || fullContent.trim() === '') {
-      fullContent = "I'm sorry, I didn't get that. Could you please rephrase your question?";
-    }
-
-    const suggestions = [];
-
-    const newMonthlyUsage = (user.usage_count || 0) + 1;
-    const newWindowUsage = (user.hourly_quota_used || 0) + 1;
-    await supabase
-      .from('users')
-      .update({
-        usage_count: newMonthlyUsage,
-        hourly_quota_used: user.tier === 'free' ? newWindowUsage : 0,
-      })
-      .eq('id', user.id);
-
-    res.write(`data: ${JSON.stringify({ type: 'done', text: fullContent, suggestions })}\n\n`);
-    res.end();
-
-  } catch (error) {
-    console.error('Groq error:', error);
-    const errorMsg = error.message || 'Internal server error';
-    res.write(`data: ${JSON.stringify({ type: 'error', message: errorMsg })}\n\n`);
-    res.end();
-  }
 });
 
 // ============================================================
-//  12. IMAGE GENERATION
+//  IMAGE GENERATION (OpenAI DALL‑E) – REQUIRED
 // ============================================================
 app.post('/api/generate-image', auth, async (req, res) => {
-  const { prompt } = req.body;
-  if (!prompt) return res.status(400).json({ error: 'Prompt is required' });
-  if (!OPENAI_API_KEY) return res.status(503).json({ error: 'Image generation not configured' });
+    try {
+        const { prompt } = req.body;
+        if (!prompt) return res.status(400).json({ error: 'Prompt is required' });
+        if (!OPENAI_API_KEY) {
+            return res.status(503).json({ error: 'Image generation not configured' });
+        }
 
-  try {
-    const response = await fetch('https://api.openai.com/v1/images/generations', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${OPENAI_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        prompt: prompt,
-        n: 1,
-        size: '512x512',
-        model: 'dall-e-2',
-      }),
-    });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error?.message || 'Image generation failed');
-    res.json({ url: data.data[0].url });
-  } catch (error) {
-    console.error('Image gen error:', error);
-    res.status(500).json({ error: error.message });
-  }
+        const response = await fetch('https://api.openai.com/v1/images/generations', {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${OPENAI_API_KEY}`,
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                prompt: prompt,
+                n: 1,
+                size: '512x512',
+                model: 'dall-e-2',
+            }),
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error?.message || 'Image generation failed');
+        res.json({ url: data.data[0].url });
+    } catch (err) {
+        console.error('Image gen error:', err);
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // ============================================================
-//  13. PAYMENT – FIXED WITH FORCE RATES
+//  PAYMENT – Paystack Checkout (REQUIRED)
 // ============================================================
 app.post('/api/create-checkout', auth, async (req, res) => {
-  const { idempotencyKey, tier, currency = 'KES' } = req.body;
-  const user = req.user;
+    try {
+        const { idempotencyKey, tier } = req.body;
+        const user = req.user;
 
-  console.log('📥 ===== PAYMENT REQUEST =====');
-  console.log(`   Tier: ${tier}`);
-  console.log(`   Currency: ${currency}`);
-  console.log(`   User: ${user.email}`);
+        if (!tier || !['starter', 'pro', 'enterprise'].includes(tier)) {
+            return res.status(400).json({ error: 'Invalid tier selected' });
+        }
 
-  // Validate tier
-  if (!tier || !['basic', 'starter', 'pro', 'enterprise'].includes(tier)) {
-    return res.status(400).json({ error: 'Invalid tier selected' });
-  }
+        const { data: existing, error } = await supabase
+            .from('payments')
+            .select('*')
+            .eq('transaction_id', idempotencyKey)
+            .maybeSingle();
 
-  // Validate currency
-  if (!EXCHANGE_RATES[currency]) {
-    return res.status(400).json({ error: `Unsupported currency: ${currency}` });
-  }
+        if (existing) {
+            if (existing.status === 'completed') return res.json({ alreadyProcessed: true });
+            return res.status(409).json({ error: 'Payment is being processed' });
+        }
 
-  // Check for duplicate idempotency key
-  const { data: existing, error } = await supabase
-    .from('payments')
-    .select('*')
-    .eq('transaction_id', idempotencyKey)
-    .maybeSingle();
+        if (!PAYSTACK_SECRET_KEY) {
+            return res.status(503).json({ error: 'Payment service not configured' });
+        }
 
-  if (existing) {
-    if (existing.status === 'completed') return res.json({ alreadyProcessed: true });
-    return res.status(409).json({ error: 'Payment is being processed' });
-  }
+        const tierPrices = {
+            starter: 1700,
+            pro: 3400,
+            enterprise: 12000,
+        };
 
-  if (!PAYSTACK_SECRET_KEY) {
-    return res.status(503).json({ error: 'Payment service not configured' });
-  }
+        const response = await fetch('https://api.paystack.co/transaction/initialize', {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${PAYSTACK_SECRET_KEY}`,
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                email: user.email,
+                amount: tierPrices[tier],
+                currency: 'USD',
+                metadata: {
+                    idempotencyKey: idempotencyKey,
+                    tier: tier,
+                    userId: user.id,
+                },
+                callback_url: `${FRONTEND_URL}/?success=true`,
+            }),
+        });
 
-  // ----- ✅ FIXED CALCULATION -----
-  const basePriceKES = BASE_PRICES_KES[tier];
-  const rate = EXCHANGE_RATES[currency];
-  
-  // Display amount (e.g., 500 × 0.0077 = 3.85)
-  const displayAmount = Math.round(basePriceKES * rate * 100) / 100;
-  
-  // Paystack amount (subunits for non-KES)
-  let paystackAmount;
-  if (currency === 'KES') {
-    paystackAmount = Math.round(displayAmount);
-  } else {
-    paystackAmount = Math.round(displayAmount * 100);
-  }
+        const data = await response.json();
+        if (!data.status) {
+            return res.status(500).json({ error: data.message || 'Paystack initialization failed' });
+        }
 
-  // ----- 📊 LOGGING -----
-  console.log('💳 ===== PAYMENT CALCULATION =====');
-  console.log(`   Base KES price: ${basePriceKES} KES`);
-  console.log(`   Exchange rate (1 KES → ${currency}): ${rate}`);
-  console.log(`   Display amount: ${displayAmount} ${currency}`);
-  console.log(`   Paystack amount (subunits): ${paystackAmount}`);
-  console.log(`   Currency: ${currency}`);
-  console.log('====================================');
+        await supabase.from('payments').insert({
+            user_id: user.id,
+            transaction_id: idempotencyKey,
+            amount: tierPrices[tier],
+            currency: 'USD',
+            status: 'pending',
+        });
 
-  // Reject if amount is too small
-  if (paystackAmount < 1) {
-    return res.status(400).json({ 
-      error: `Amount too small: ${displayAmount} ${currency}. Please use KES or contact support.` 
-    });
-  }
-
-  // Make Paystack request
-  const response = await fetch('https://api.paystack.co/transaction/initialize', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${PAYSTACK_SECRET_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      email: user.email,
-      amount: paystackAmount,
-      currency: currency,
-      metadata: {
-        idempotencyKey: idempotencyKey,
-        tier: tier,
-        userId: user.id,
-      },
-      callback_url: process.env.FRONTEND_URL
-        ? `${process.env.FRONTEND_URL}/dashboard?success=true`
-        : 'https://technovaphysai.netlify.app/?success=true',
-    }),
-  });
-
-  const data = await response.json();
-  console.log('📤 Paystack response:', data.status ? '✅ SUCCESS' : '❌ FAILED');
-  console.log('   Message:', data.message);
-
-  if (!data.status) {
-    if (data.message && data.message.includes('currency')) {
-      return res.status(400).json({ 
-        error: `Currency "${currency}" is not supported by your Paystack account. Please use KES.` 
-      });
+        res.json({ url: data.data.authorization_url });
+    } catch (err) {
+        console.error('Checkout error:', err);
+        res.status(500).json({ error: err.message });
     }
-    return res.status(500).json({ error: data.message || 'Paystack initialization failed' });
-  }
-
-  // Store payment record
-  await supabase.from('payments').insert({
-    user_id: user.id,
-    transaction_id: idempotencyKey,
-    amount: displayAmount,
-    currency: currency,
-    status: 'pending',
-  });
-
-  res.json({ url: data.data.authorization_url });
 });
 
 // ============================================================
-//  14. PAYSTACK WEBHOOK
+//  PAYSTACK WEBHOOK
 // ============================================================
 app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), async (req, res) => {
-  const signature = req.headers['x-paystack-signature'];
-  const payload = req.body;
-  const event = payload.event;
-  const data = payload.data;
+    try {
+        const payload = req.body;
+        const event = payload.event;
+        const data = payload.data;
 
-  if (event === 'charge.success') {
-    const metadata = data.metadata || {};
-    const userId = metadata.userId;
-    const tier = metadata.tier || 'pro';
-    const idempotencyKey = metadata.idempotencyKey;
+        if (event === 'charge.success') {
+            const metadata = data.metadata || {};
+            const userId = metadata.userId;
+            const tier = metadata.tier || 'pro';
+            const idempotencyKey = metadata.idempotencyKey;
 
-    if (userId) {
-      await supabase
-        .from('payments')
-        .update({ status: 'completed' })
-        .eq('transaction_id', idempotencyKey);
+            if (userId) {
+                await supabase
+                    .from('payments')
+                    .update({ status: 'completed' })
+                    .eq('transaction_id', idempotencyKey);
 
-      await supabase
-        .from('users')
-        .update({ tier: tier, usage_count: 0 })
-        .eq('id', userId);
+                await supabase
+                    .from('users')
+                    .update({ tier: tier, usage_count: 0 })
+                    .eq('id', userId);
 
-      console.log(`✅ User ${userId} upgraded to ${tier}`);
+                console.log(`✅ User ${userId} upgraded to ${tier}`);
+            }
+        }
+        res.sendStatus(200);
+    } catch (err) {
+        console.error('Webhook error:', err);
+        res.sendStatus(500);
     }
-  }
-
-  res.sendStatus(200);
 });
 
 // ============================================================
-//  15. START SERVER
+//  START
 // ============================================================
-app.listen(PORT, () => {
-  console.log(`🚀 TechNovaphy AI backend running on port ${PORT}`);
-  console.log('📊 Exchange rates loaded:', EXCHANGE_RATES);
-  console.log('💳 Sample: 500 KES → ', Math.round(500 * EXCHANGE_RATES.USD * 100) / 100, 'USD');
-});
+app.listen(PORT, () => console.log(`🚀 TechNovaphy AI Backend running on port ${PORT}`));
