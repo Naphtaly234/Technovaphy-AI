@@ -35,14 +35,14 @@ const authLimiter = rateLimit({
 app.use('/api/auth/login', authLimiter);
 app.use('/api/auth/register', authLimiter);
 
-// ----- Environment Variables (must be set in Render) -----
+// ----- Environment Variables -----
 const required = [
     'SUPABASE_URL',
     'SUPABASE_SERVICE_ROLE_KEY',
     'JWT_SECRET',
     'GROQ_API_KEY',
     'PAYSTACK_SECRET_KEY',
-    'AGNES_API_KEY'   // <-- Agnes key added here
+    'AGNES_API_KEY'
 ];
 const missing = required.filter(key => !process.env[key]);
 if (missing.length) {
@@ -57,6 +57,7 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 const AGNES_API_KEY = process.env.AGNES_API_KEY;
+const AGNES_IMAGE_MODEL = process.env.AGNES_IMAGE_MODEL || 'Agnes-Image-2.1-Flash';
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://your-frontend-url.netlify.app';
 const OWNER_EMAIL = process.env.OWNER_EMAIL || null;
 
@@ -270,7 +271,7 @@ app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 app.get('/api/ping', (req, res) => res.json({ status: 'ok', message: 'Backend is reachable!' }));
 
 // ============================================================
-//  AUTH ROUTES (register, login, profile, update-memory)
+//  AUTH ROUTES
 // ============================================================
 app.post('/api/auth/register', async (req, res) => {
     try {
@@ -613,6 +614,8 @@ app.post('/api/generate-image', auth, async (req, res) => {
             return res.status(503).json({ error: 'Image generation not configured (missing AGNES_API_KEY)' });
         }
 
+        console.log(`🎨 Generating image with model: ${AGNES_IMAGE_MODEL}`);
+
         // Agnes OpenAI‑compatible endpoint
         const response = await fetch('https://apihub.agnes-ai.com/v1/images/generations', {
             method: 'POST',
@@ -621,7 +624,7 @@ app.post('/api/generate-image', auth, async (req, res) => {
                 'Content-Type': 'application/json'
             },
             body: JSON.stringify({
-                model: 'Agnes-Image-2.0-Flash',   // you can change to 'Agnes-Image-2.1-Flash' if available
+                model: AGNES_IMAGE_MODEL,
                 prompt: prompt,
                 n: 1,
                 size: '1024x1024'
