@@ -1,7 +1,4 @@
-// ============================================================
-//  TECHNOVAPHY AI – COMPLETE BACKEND (ALL FEATURES)
-//  Fully supports Basic tier, multi‑currency, and dynamic amounts
-// ============================================================
+
 require('dotenv').config();
 
 const express = require('express');
@@ -266,6 +263,47 @@ const auth = async (req, res, next) => {
         res.status(401).json({ error: 'Invalid token' });
     }
 };
+async function handleUpgrade(tier, currency) {
+    try {
+        const tierData = TIERS[tier];
+        if (!tierData) throw new Error('Invalid tier');
+
+        let amount;
+        if (currency === 'KES') {
+            amount = tierData.basePrice; // 500, 1700, etc.
+        } else {
+            amount = convertPrice(tierData.basePrice, currency);
+        }
+
+        console.log(`🔍 Upgrade: ${tier}, currency=${currency}, amount=${amount}`);
+
+        if (isNaN(amount) || amount <= 0) throw new Error('Invalid amount');
+
+        // Extra safety: if KES and amount != basePrice, force it
+        if (currency === 'KES' && amount !== tierData.basePrice) {
+            console.warn('⚠️ Forcing KES amount to basePrice');
+            amount = tierData.basePrice;
+        }
+
+        const idempotencyKey = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+        const data = await apiCall('/create-checkout', {
+            method: 'POST',
+            body: JSON.stringify({ idempotencyKey, tier, currency, amount }),
+        });
+
+        if (data.alreadyProcessed) {
+            alert('Payment already processing.');
+            return;
+        }
+        if (data.url) {
+            window.location.href = data.url;
+        } else {
+            throw new Error('No checkout URL received');
+        }
+    } catch (err) {
+        alert('Upgrade error: ' + err.message);
+    }
+}
 
 // ============================================================
 //  PUBLIC ENDPOINTS
