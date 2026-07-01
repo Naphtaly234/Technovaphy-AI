@@ -1,10 +1,4 @@
-// ============================================================
-//  TECHNOVAPHY AI – COMPLETE BACKEND
-//  - Owner bypass (unlimited)
-//  - Free tier: 5 msgs/hour → 4‑hour lock
-//  - Payments: hardcoded KES
-//  - Best‑in‑class AI prompt
-// ============================================================
+
 require('dotenv').config();
 
 const express = require('express');
@@ -103,7 +97,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 //  CONSTANTS & HELPERS
 // ============================================================
 const TIER_LIMITS = {
-    free: 200,
+    free: 200,      // monthly limit for free (but we override with session logic)
     basic: 200,
     starter: 550,
     pro: 2500,
@@ -111,15 +105,15 @@ const TIER_LIMITS = {
 };
 
 const TIER_NAMES = {
-    free: 'Free (5 msgs/hour)',
+    free: 'Free (5 hrs unlimited)',
     basic: 'Basic (200 msgs/month)',
     starter: 'Starter (550 msgs/month)',
     pro: 'Pro (2500 msgs/month)',
     enterprise: 'Enterprise (Unlimited)'
 };
 
-// Free tier: 5 messages per hour → 4‑hour lock
-const FREE_HOURLY_LIMIT = 5;
+// Free tier: 5 hours unlimited, then 4 hours lock
+const FREE_SESSION_HOURS = 5;
 const FREE_LOCK_HOURS = 4;
 
 // Hardcoded KES prices (ignores frontend amount)
@@ -170,33 +164,37 @@ async function resetMonthlyUsageIfNeeded(user) {
     return user;
 }
 
-async function checkHourlyQuota(user) {
+// ----- FREE SESSION LOGIC -----
+async function checkFreeSession(user) {
     if (user.tier !== 'free') return user;
     const now = new Date();
-    const lastRefill = new Date(user.last_quota_refill);
-    const hoursSinceRefill = (now - lastRefill) / (1000 * 60 * 60);
-    const used = user.hourly_quota_used || 0;
+    const sessionStart = new Date(user.free_session_start || now);
 
-    if (used >= FREE_HOURLY_LIMIT) {
-        const lockEnd = new Date(lastRefill.getTime() + FREE_LOCK_HOURS * 60 * 60 * 1000);
+    // Calculate elapsed hours since session start
+    const elapsedHours = (now - sessionStart) / (1000 * 60 * 60);
+
+    if (elapsedHours < FREE_SESSION_HOURS) {
+        // Still within the 5-hour window – unlimited access
+        return user;
+    } else {
+        // Session ended, check if lock period is over
+        const lockEnd = new Date(sessionStart.getTime() + (FREE_SESSION_HOURS + FREE_LOCK_HOURS) * 60 * 60 * 1000);
         if (now < lockEnd) {
+            // Still locked
             const minutesLeft = Math.ceil((lockEnd - now) / 60000);
-            throw new Error(`Free limit reached. Try again in ${minutesLeft} minutes.`);
+            throw new Error(`Free session ended. Try again in ${minutesLeft} minutes.`);
         } else {
-            // Lock expired, reset quota
-            const newRefill = now.toISOString();
+            // Lock expired – start a new session
+            const newSessionStart = now.toISOString();
             await supabase
                 .from('users')
-                .update({
-                    hourly_quota_used: 0,
-                    last_quota_refill: newRefill
-                })
+                .update({ free_session_start: newSessionStart })
                 .eq('id', user.id);
-            user.hourly_quota_used = 0;
-            user.last_quota_refill = newRefill;
+            user.free_session_start = newSessionStart;
+            // Also reset monthly usage (optional, but keep it as is)
+            return user;
         }
     }
-    return user;
 }
 
 function getLimit(tier) {
@@ -347,10 +345,10 @@ app.post('/api/auth/register', async (req, res) => {
                 usage_count: 0,
                 monthly_reset_date: nextMonth.toISOString().split('T')[0],
                 verified: true,
-                hourly_quota_used: 0,
-                last_quota_refill: now.toISOString(),
+                // free session starts now
+                free_session_start: now.toISOString(),
                 memory: '',
-                role: 'user' // default role
+                role: 'user'
             })
             .select()
             .single();
@@ -389,14 +387,31 @@ app.get('/api/user/profile', auth, async (req, res) => {
     try {
         let user = req.user;
         user = await resetMonthlyUsageIfNeeded(user);
-        // We'll check hourly quota in chat, but we return current usage
+        // We'll not run free session check here, just report current state
         const limit = getLimit(user.tier);
-        const hourlyLimit = user.tier === 'free' ? FREE_HOURLY_LIMIT : Infinity;
-        const hourlyUsed = user.hourly_quota_used || 0;
-        const hourlyRemaining = user.tier === 'free' ? Math.max(0, hourlyLimit - hourlyUsed) : Infinity;
-
-        // Check if this user is the owner (by email or role)
         const isOwner = (OWNER_EMAIL && user.email === OWNER_EMAIL) || user.role === 'owner';
+
+        // For free tier, compute remaining session time
+        let sessionRemaining = null;
+        let lockRemaining = null;
+        if (user.tier === 'free') {
+            const now = new Date();
+            const sessionStart = new Date(user.free_session_start || now);
+            const elapsedHours = (now - sessionStart) / (1000 * 60 * 60);
+            if (elapsedHours < FREE_SESSION_HOURS) {
+                const remainingMs = (sessionStart.getTime() + FREE_SESSION_HOURS * 60 * 60 * 1000) - now.getTime();
+                sessionRemaining = Math.max(0, Math.ceil(remainingMs / 60000)); // minutes
+            } else {
+                const lockEnd = new Date(sessionStart.getTime() + (FREE_SESSION_HOURS + FREE_LOCK_HOURS) * 60 * 60 * 1000);
+                if (now < lockEnd) {
+                    const remainingMs = lockEnd - now;
+                    lockRemaining = Math.max(0, Math.ceil(remainingMs / 60000));
+                } else {
+                    // Session ready to reset – we can show 0 lock remaining (or reset)
+                    lockRemaining = 0;
+                }
+            }
+        }
 
         res.json({
             email: user.email,
@@ -406,13 +421,12 @@ app.get('/api/user/profile', auth, async (req, res) => {
             limit: limit,
             monthly_reset_date: user.monthly_reset_date,
             verified: true,
-            hourly_quota_used: hourlyUsed,
-            hourly_quota_limit: hourlyLimit,
-            hourly_remaining: hourlyRemaining,
-            last_quota_refill: user.last_quota_refill,
             memory: user.memory || '',
             role: user.role || 'user',
-            is_owner: isOwner
+            is_owner: isOwner,
+            free_session_start: user.free_session_start,
+            session_remaining_minutes: sessionRemaining,
+            lock_remaining_minutes: lockRemaining
         });
     } catch (err) {
         console.error('Profile error:', err);
@@ -433,7 +447,7 @@ app.post('/api/auth/update-memory', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CHAT STREAM – with owner bypass and enhanced prompt
+//  CHAT STREAM – with 5‑hour free session + owner bypass
 // ============================================================
 app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) => {
     try {
@@ -444,9 +458,20 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
         const isOwner = (OWNER_EMAIL && user.email === OWNER_EMAIL) || user.role === 'owner';
         if (isOwner) {
             console.log(`👑 Owner ${user.email} – unlimited access granted.`);
-            // Skip all quota checks – proceed to chat logic directly
         } else {
-            // ---- Normal user checks ----
+            // ---- FREE SESSION CHECK (only for free tier) ----
+            if (user.tier === 'free') {
+                try {
+                    user = await checkFreeSession(user);
+                } catch (lockError) {
+                    return res.status(429).json({
+                        error: lockError.message,
+                        lock_remaining_minutes: lockError.minutesLeft // optional
+                    });
+                }
+            }
+
+            // ---- MONTHLY LIMIT CHECK (for all non‑owner users) ----
             const monthlyLimit = getLimit(user.tier);
             if (user.usage_count >= monthlyLimit) {
                 return res.status(403).json({
@@ -455,17 +480,6 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
                     limit: monthlyLimit,
                     used: user.usage_count
                 });
-            }
-            if (user.tier === 'free') {
-                try {
-                    user = await checkHourlyQuota(user);
-                } catch (lockError) {
-                    return res.status(429).json({
-                        error: lockError.message,
-                        hourly_limit: FREE_HOURLY_LIMIT,
-                        hourly_used: user.hourly_quota_used || 0
-                    });
-                }
             }
         }
 
@@ -565,16 +579,13 @@ ${memoryPrompt}`;
         // ---- Update usage counters (only for non‑owners) ----
         if (!isOwner) {
             const newMonthlyUsage = (user.usage_count || 0) + 1;
-            const newHourlyUsage = (user.hourly_quota_used || 0) + 1;
             await supabase
                 .from('users')
                 .update({
-                    usage_count: newMonthlyUsage,
-                    hourly_quota_used: user.tier === 'free' ? newHourlyUsage : 0
+                    usage_count: newMonthlyUsage
                 })
                 .eq('id', user.id);
         } else {
-            // Owner: we don't increment counters (or we could, but it's not needed)
             console.log(`👑 Owner message processed without counter increment.`);
         }
 
