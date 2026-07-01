@@ -81,6 +81,77 @@ const FREE_WINDOW_LIMIT = 20;
 const FREE_WINDOW_HOURS = 2.5;
 
 // ============================================================
+//  4a. MULTI‑CURRENCY WITH LIVE EXCHANGE RATES
+// ============================================================
+
+// Base prices in KES (your source of truth)
+const BASE_PRICES_KES = {
+  basic: 500,
+  starter: 1700,
+  pro: 3500,
+  enterprise: 15000,
+};
+
+// Currencies where Paystack expects amount in subunits (cents/pence)
+const SUBUNIT_CURRENCIES = ['USD', 'EUR', 'GBP', 'ZAR'];
+
+// Mutable object to hold live exchange rates (1 KES = X target)
+// Initial hardcoded fallback so the server can start even without API
+let liveExchangeRates = {
+  KES: 1,
+  USD: 0.0077,
+  EUR: 0.0070,
+  GBP: 0.0061,
+  NGN: 12.5,
+  GHS: 0.098,
+  ZAR: 0.14,
+};
+
+/**
+ * Fetch fresh exchange rates from a free API (no key required)
+ * Falls back to existing rates on failure.
+ */
+async function updateExchangeRates() {
+  try {
+    const response = await fetch('https://api.exchangerate-api.com/v4/latest/KES');
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    if (data && data.rates) {
+      liveExchangeRates = data.rates; // e.g., { USD: 0.0077, EUR: 0.0070, ... }
+      console.log('✅ Exchange rates updated from live API');
+    }
+  } catch (error) {
+    console.error('⚠️ Failed to update exchange rates, using last known rates:', error.message);
+  }
+}
+
+// Initial fetch, then refresh every 60 minutes
+updateExchangeRates();
+setInterval(updateExchangeRates, 60 * 60 * 1000);
+
+/**
+ * Convert KES base price to target currency display amount.
+ * Example: basic tier → 500 KES → 3.85 USD
+ */
+function convertPrice(tier, targetCurrency) {
+  const baseKES = BASE_PRICES_KES[tier];
+  if (!baseKES) throw new Error('Invalid tier');
+  const rate = liveExchangeRates[targetCurrency];
+  if (rate === undefined) throw new Error(`Unsupported currency: ${targetCurrency}`);
+  return Math.round(baseKES * rate * 100) / 100;
+}
+
+/**
+ * Return the amount Paystack expects (subunits for some currencies).
+ */
+function getPaystackAmount(displayAmount, currency) {
+  if (SUBUNIT_CURRENCIES.includes(currency)) {
+    return Math.round(displayAmount * 100); // e.g., 385 cents for 3.85 USD
+  }
+  return Math.round(displayAmount); // KES, NGN, GHS already in base units
+}
+
+// ============================================================
 //  5. HELPERS
 // ============================================================
 async function findUser(email) {
@@ -153,16 +224,14 @@ function getLimit(tier) {
 // ============================================================
 const storage = multer.memoryStorage();
 const fileFilter = (req, file, cb) => {
-  // 👇 Add 'text/html' here – also allow any text/* to be safe
   const allowedTypes = [
     'image/jpeg', 'image/png', 'image/webp',
     'application/pdf',
     'text/plain', 'text/csv',
-    'text/html',                    // ✅ HTML files now allowed
+    'text/html',
     'application/msword',
     'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
   ];
-  // Also allow any text/* mime type
   if (file.mimetype.startsWith('text/') || allowedTypes.includes(file.mimetype)) {
     cb(null, true);
   } else {
@@ -188,7 +257,6 @@ async function extractFileContent(file) {
   } else if (mimeType.startsWith('image/')) {
     return `[Image: ${file.originalname} (${(file.size/1024).toFixed(1)}KB) – base64 data available for vision models]`;
   } else if (mimeType.startsWith('text/') || mimeType === 'application/json' || mimeType === 'text/html') {
-    // For all text-based files, decode as UTF-8
     return buffer.toString('utf-8');
   } else {
     try {
@@ -380,7 +448,6 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
   if (fileContent) {
     const lastUserMsg = messages[messages.length - 1];
     if (lastUserMsg && lastUserMsg.role === 'user') {
-      // Append file content to the last user message
       lastUserMsg.content += `\n\n[Uploaded ${files.length} file(s): ${fileNames.join(', ')}]\n${fileContent}`;
     } else {
       messages.push({
@@ -575,16 +642,23 @@ app.post('/api/generate-image', auth, async (req, res) => {
 });
 
 // ============================================================
-//  12. PAYMENT – Paystack Checkout (Supports Intl. Cards)
+//  12. PAYMENT – Paystack Checkout (Universal Multi‑Currency)
 // ============================================================
 app.post('/api/create-checkout', auth, async (req, res) => {
-  const { idempotencyKey, tier } = req.body;
+  const { idempotencyKey, tier, currency = 'KES' } = req.body; // currency now accepted
   const user = req.user;
 
+  // Validate tier
   if (!tier || !['basic', 'starter', 'pro', 'enterprise'].includes(tier)) {
     return res.status(400).json({ error: 'Invalid tier selected' });
   }
 
+  // Validate currency against live rates
+  if (!liveExchangeRates[currency]) {
+    return res.status(400).json({ error: `Unsupported currency: ${currency}` });
+  }
+
+  // Check for duplicate idempotency key
   const { data: existing, error } = await supabase
     .from('payments')
     .select('*')
@@ -600,17 +674,11 @@ app.post('/api/create-checkout', auth, async (req, res) => {
     return res.status(503).json({ error: 'Payment service not configured' });
   }
 
-  // ✅ EXACT KES PRICES (Matches frontend)
-  const tierPrices = {
-    basic: 500,
-    starter: 1700,
-    pro: 3500,
-    enterprise: 15000,
-  };
+  // Convert base KES price to target currency using live rates
+  const displayAmount = convertPrice(tier, currency);
+  const paystackAmount = getPaystackAmount(displayAmount, currency);
 
-  // 🔧 FIXED: Paystack expects amount in CENTS (subunit). Multiply by 100.
-  const amountInCents = tierPrices[tier] * 100;
-  console.log(`💳 Initializing Paystack payment: ${tier} tier → ${tierPrices[tier]} KES (${amountInCents} cents)`);
+  console.log(`💳 ${tier} tier → ${displayAmount} ${currency} (Paystack: ${paystackAmount} subunits)`);
 
   const response = await fetch('https://api.paystack.co/transaction/initialize', {
     method: 'POST',
@@ -620,14 +688,16 @@ app.post('/api/create-checkout', auth, async (req, res) => {
     },
     body: JSON.stringify({
       email: user.email,
-      amount: amountInCents,   // ✅ Now correctly 50000, 170000, 350000, 1500000
-      currency: 'KES',
+      amount: paystackAmount,
+      currency: currency,
       metadata: {
         idempotencyKey: idempotencyKey,
         tier: tier,
         userId: user.id,
       },
-      callback_url: process.env.FRONTEND_URL ? `${process.env.FRONTEND_URL}/dashboard?success=true` : 'https://your-frontend.com/dashboard?success=true',
+      callback_url: process.env.FRONTEND_URL
+        ? `${process.env.FRONTEND_URL}/dashboard?success=true`
+        : 'https://your-frontend.com/dashboard?success=true',
     }),
   });
 
@@ -636,12 +706,12 @@ app.post('/api/create-checkout', auth, async (req, res) => {
     return res.status(500).json({ error: data.message || 'Paystack initialization failed' });
   }
 
-  // Store the actual KES amount in your database (not cents)
+  // Store display amount (not subunits) in your database
   await supabase.from('payments').insert({
     user_id: user.id,
     transaction_id: idempotencyKey,
-    amount: tierPrices[tier],   // e.g., 500 for Basic
-    currency: 'KES',
+    amount: displayAmount,
+    currency: currency,
     status: 'pending',
   });
 
