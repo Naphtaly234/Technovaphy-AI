@@ -1,9 +1,4 @@
-// ============================================================
-//  TECHNOVAPHY AI – FINAL BACKEND
-//  - Best‑in‑class AI prompt
-//  - Free tier: 5 msgs/hour → 4‑hour lock
-//  - Payments: hardcoded KES (500, 1700, 3500, 15000)
-// ============================================================
+
 require('dotenv').config();
 
 const express = require('express');
