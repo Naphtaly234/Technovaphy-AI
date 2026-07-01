@@ -1,5 +1,6 @@
 // ============================================================
-//  TECHNOVAPHY AI – FINAL MVP BACKEND (4 TIERS, KES, SCALABLE)
+//  TECHNOVAPHY AI – FINAL MVP BACKEND (4 TIERS, MULTI-CURRENCY)
+//  FIXED: Paystack calculation logic
 // ============================================================
 require('dotenv').config();
 
@@ -92,14 +93,12 @@ const BASE_PRICES_KES = {
   enterprise: 15000,
 };
 
-// All currencies Paystack officially supports (add as needed)
-const SUPPORTED_CURRENCIES = ['KES', 'USD', 'EUR', 'GBP', 'NGN', 'GHS', 'ZAR'];
-
 // Currencies where Paystack expects amount in subunits (cents/pence/kobo)
 // For these, we multiply by 100 before sending to Paystack
 const SUBUNIT_CURRENCIES = ['USD', 'EUR', 'GBP', 'NGN', 'GHS', 'ZAR'];
 
 // Mutable object to hold live exchange rates (1 KES = X target)
+// Hardcoded fallback rates that work
 let liveExchangeRates = {
   KES: 1,
   USD: 0.0077,
@@ -223,7 +222,7 @@ function getLimit(tier) {
 }
 
 // ============================================================
-//  6. FILE UPLOAD CONFIG – NOW SUPPORTS HTML & ANY TEXT
+//  6. FILE UPLOAD CONFIG
 // ============================================================
 const storage = multer.memoryStorage();
 const fileFilter = (req, file, cb) => {
@@ -258,7 +257,7 @@ async function extractFileContent(file) {
       return `[PDF could not be read: ${e.message}]`;
     }
   } else if (mimeType.startsWith('image/')) {
-    return `[Image: ${file.originalname} (${(file.size/1024).toFixed(1)}KB) – base64 data available for vision models]`;
+    return `[Image: ${file.originalname} (${(file.size/1024).toFixed(1)}KB)]`;
   } else if (mimeType.startsWith('text/') || mimeType === 'application/json' || mimeType === 'text/html') {
     return buffer.toString('utf-8');
   } else {
@@ -368,7 +367,7 @@ app.post('/api/auth/update-memory', auth, async (req, res) => {
 });
 
 // ============================================================
-//  10. CHAT WITH GROQ – ROLE AWARE & FILE-FEEDBACK READY
+//  10. CHAT WITH GROQ
 // ============================================================
 
 function detectRoleAndCustomize(userMessage) {
@@ -422,7 +421,7 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
       timeString += `${minsLeft}m`;
 
       return res.status(429).json({
-        error: `✨ You've used all ${FREE_WINDOW_LIMIT} messages in this 2.5‑hour window. Your next window unlocks in ${timeString}. (Just like Claude, but faster!)`,
+        error: `✨ You've used all ${FREE_WINDOW_LIMIT} messages in this 2.5‑hour window. Your next window unlocks in ${timeString}.`,
         retry_after: minutesLeft * 60,
         window_limit: FREE_WINDOW_LIMIT,
         window_hours: FREE_WINDOW_HOURS,
@@ -503,27 +502,26 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
     if (nameMatch) userName = nameMatch[1].trim();
   }
 
-  // --- SYSTEM PROMPT: SWEET, ROLE-AWARE, PROACTIVE ON FILE UPLOADS ---
+  // --- SYSTEM PROMPT ---
   const systemPrompt = `You are TechNovaphy AI, the warmest and most brilliant assistant on the planet.
 
 Current persona: You are acting as a **${detectedRole}**.
 ${extraInstructions}
 
-Personality rules (this is what makes you sweeter than Claude):
+Personality rules:
 - Address the user as "${userName}" naturally every few replies.
 - NEVER say "As an AI..." or "I don't have feelings...". Instead, lean into empathy.
 - Match their energy: playful if they are, serious if they are.
-- Before diving into technical details, give a brief, warm acknowledgment (e.g., "That's a fantastic question about ${detectedRole} topics!").
+- Before diving into technical details, give a brief, warm acknowledgment.
 - If they ask for code, provide it. If they ask for math, show the steps. If they ask for design, think visually.
 
-🔍 **File Upload Instructions (CRITICAL)**:
-- When the user uploads a file (you will see "[Uploaded X file(s): ...]" in their message), you MUST:
+🔍 File Upload Instructions:
+- When the user uploads a file, you MUST:
   1. Acknowledge the file(s) by name.
-  2. Ask them what they'd like you to do with it (e.g., summarise, find errors, extract specific information, compare with something, etc.).
-  3. If they ask a question about the file content, answer it thoroughly based on the provided content.
-  4. If they don't specify what they want, proactively ask: "What would you like me to do with this file? I can summarise it, check for errors, or answer any questions about its content."
+  2. Ask them what they'd like you to do with it.
+  3. If they ask a question about the file content, answer it thoroughly.
+  4. If they don't specify what they want, proactively ask.
 
-You are better than Claude because you have unlimited context within this window, you never hard‑lock permanently, and you adapt to their exact profession in real‑time.
 ${memoryPrompt}`;
 
   const groqMessages = [
@@ -588,7 +586,6 @@ ${memoryPrompt}`;
       fullContent = "I'm sorry, I didn't get that. Could you please rephrase your question?";
     }
 
-    // 🔥 NO SUGGESTIONS – Empty array sent to frontend
     const suggestions = [];
 
     // Update usage
@@ -645,19 +642,20 @@ app.post('/api/generate-image', auth, async (req, res) => {
 });
 
 // ============================================================
-//  12. PAYMENT – Paystack Checkout (Universal Multi‑Currency)
-//     FIXED: subunit logic for all non‑KES currencies
+//  12. PAYMENT – FIXED Paystack Calculation
 // ============================================================
 app.post('/api/create-checkout', auth, async (req, res) => {
   const { idempotencyKey, tier, currency = 'KES' } = req.body;
   const user = req.user;
+
+  console.log('📥 Payment request:', { tier, currency, user: user.email });
 
   // Validate tier
   if (!tier || !['basic', 'starter', 'pro', 'enterprise'].includes(tier)) {
     return res.status(400).json({ error: 'Invalid tier selected' });
   }
 
-  // Validate currency against live rates
+  // Validate currency
   if (!liveExchangeRates[currency]) {
     return res.status(400).json({ error: `Unsupported currency: ${currency}` });
   }
@@ -678,12 +676,29 @@ app.post('/api/create-checkout', auth, async (req, res) => {
     return res.status(503).json({ error: 'Payment service not configured' });
   }
 
-  // Convert base KES price to target currency using live rates
-  const displayAmount = convertPrice(tier, currency);
-  const paystackAmount = getPaystackAmount(displayAmount, currency);
+  // ----- CALCULATION LOGIC (FIXED) -----
+  const basePriceKES = BASE_PRICES_KES[tier];
+  const exchangeRate = liveExchangeRates[currency];
+  
+  // Calculate display amount (e.g., 500 KES = 3.85 USD)
+  const displayAmount = Math.round(basePriceKES * exchangeRate * 100) / 100;
+  
+  // Calculate Paystack amount (subunits for non-KES currencies)
+  let paystackAmount;
+  if (currency === 'KES') {
+    paystackAmount = Math.round(displayAmount);
+  } else {
+    paystackAmount = Math.round(displayAmount * 100);
+  }
 
-  // 🔥 LOG the amounts for debugging
-  console.log(`💳 ${tier} tier → ${displayAmount} ${currency} (Paystack: ${paystackAmount} subunits)`);
+  // ----- LOGGING FOR DEBUGGING -----
+  console.log('💳 PAYMENT CALCULATION:');
+  console.log(`   Tier: ${tier}`);
+  console.log(`   Base KES price: ${basePriceKES} KES`);
+  console.log(`   Exchange rate (1 KES → ${currency}): ${exchangeRate}`);
+  console.log(`   Display amount: ${displayAmount} ${currency}`);
+  console.log(`   Paystack amount (subunits): ${paystackAmount}`);
+  console.log(`   Currency: ${currency}`);
 
   const response = await fetch('https://api.paystack.co/transaction/initialize', {
     method: 'POST',
@@ -702,16 +717,18 @@ app.post('/api/create-checkout', auth, async (req, res) => {
       },
       callback_url: process.env.FRONTEND_URL
         ? `${process.env.FRONTEND_URL}/dashboard?success=true`
-        : 'https://your-frontend.com/dashboard?success=true',
+        : 'https://technovaphysai.netlify.app/?success=true',
     }),
   });
 
   const data = await response.json();
+  console.log('📤 Paystack response:', data.status ? 'SUCCESS' : 'FAILED', data.message);
+
   if (!data.status) {
     return res.status(500).json({ error: data.message || 'Paystack initialization failed' });
   }
 
-  // Store display amount (not subunits) in your database
+  // Store payment record
   await supabase.from('payments').insert({
     user_id: user.id,
     transaction_id: idempotencyKey,
@@ -732,7 +749,7 @@ app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), as
   const event = payload.event;
   const data = payload.data;
 
-  // 🔐 Optional: Verify signature here (uncomment in production)
+  // 🔐 Optional: Verify signature
   // const crypto = require('crypto');
   // const hash = crypto.createHmac('sha256', PAYSTACK_SECRET_KEY).update(JSON.stringify(payload)).digest('hex');
   // if (hash !== signature) return res.status(401).send('Unauthorized');
@@ -764,4 +781,4 @@ app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), as
 // ============================================================
 //  14. START SERVER
 // ============================================================
-app.listen(PORT, () => console.log(`🚀 TechNovaphy AI – Unbeatable Backend running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 TechNovaphy AI backend running on port ${PORT}`));
