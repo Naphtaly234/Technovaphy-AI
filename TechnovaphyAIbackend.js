@@ -1,7 +1,8 @@
 // ============================================================
 //  TECHNOVAPHY AI – FINAL BACKEND
-//  - Forces KES amounts, ignores frontend amount
-//  - Free tier: 5 msgs/hour, 4‑hour lock if exceeded
+//  - Best‑in‑class AI prompt
+//  - Free tier: 5 msgs/hour → 4‑hour lock
+//  - Payments: hardcoded KES (500, 1700, 3500, 15000)
 // ============================================================
 require('dotenv').config();
 
@@ -51,11 +52,11 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 const TIER_LIMITS = { free:200, basic:200, starter:550, pro:2500, enterprise:Infinity };
 const TIER_NAMES = { free:'Free (5 msgs/hour)', basic:'Basic (200 msgs/month)', starter:'Starter (550 msgs/month)', pro:'Pro (2500 msgs/month)', enterprise:'Enterprise (Unlimited)' };
 
-// Free tier: 5 messages per hour, then 4‑hour lock
+// Free tier: 5 messages per hour → 4‑hour lock
 const FREE_HOURLY_LIMIT = 5;
-const FREE_LOCK_HOURS = 4; // lock duration in hours
+const FREE_LOCK_HOURS = 4;
 
-// Tier prices in KES (hardcoded)
+// Hardcoded KES prices
 const TIER_PRICES_KES = {
     basic: 500,
     starter: 1700,
@@ -85,21 +86,16 @@ async function resetMonthlyUsageIfNeeded(user) {
     return user;
 }
 
-// NEW: Check hourly quota with 4‑hour lock
 async function checkHourlyQuota(user) {
     if (user.tier !== 'free') return user;
-    
     const now = new Date();
     const lastRefill = new Date(user.last_quota_refill);
     const hoursSinceRefill = (now - lastRefill) / (1000*60*60);
     const used = user.hourly_quota_used || 0;
 
-    // If used >= limit, check if lock period is over
     if (used >= FREE_HOURLY_LIMIT) {
-        // Lock period = FREE_LOCK_HOURS
         const lockEnd = new Date(lastRefill.getTime() + FREE_LOCK_HOURS * 60 * 60 * 1000);
         if (now < lockEnd) {
-            // Still locked
             const minutesLeft = Math.ceil((lockEnd - now) / 60000);
             throw new Error(`Free limit reached. Try again in ${minutesLeft} minutes.`);
         } else {
@@ -109,7 +105,6 @@ async function checkHourlyQuota(user) {
             user.hourly_quota_used = 0; user.last_quota_refill = newRefill;
         }
     }
-    // else: user hasn't reached limit, allow
     return user;
 }
 
@@ -208,7 +203,6 @@ app.get('/api/user/profile', auth, async (req, res) => {
     try {
         let user = req.user;
         user = await resetMonthlyUsageIfNeeded(user);
-        // We'll handle hourly quota in the chat endpoint
         const limit = getLimit(user.tier);
         const hourlyLimit = user.tier === 'free' ? FREE_HOURLY_LIMIT : Infinity;
         const hourlyUsed = user.hourly_quota_used || 0;
@@ -233,30 +227,26 @@ app.post('/api/auth/update-memory', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CHAT STREAM (with 4‑hour lock)
+//  CHAT STREAM – with improved system prompt
 // ============================================================
 app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) => {
     try {
         let user = req.user;
         user = await resetMonthlyUsageIfNeeded(user);
 
-        // Check monthly limit
         const monthlyLimit = getLimit(user.tier);
         if (user.usage_count >= monthlyLimit) {
             return res.status(403).json({ error: `You've reached your monthly limit of ${monthlyLimit} messages. Upgrade to continue.`, tier: user.tier, limit: monthlyLimit, used: user.usage_count });
         }
 
-        // Check hourly quota for free users (with 4‑hour lock)
         if (user.tier === 'free') {
             try {
                 user = await checkHourlyQuota(user);
             } catch(lockError) {
-                // Lock error means user is in cooldown
                 return res.status(429).json({ error: lockError.message, hourly_limit: FREE_HOURLY_LIMIT, hourly_used: user.hourly_quota_used || 0 });
             }
         }
 
-        // ===== CONVERSATION LOGIC =====
         let conversation = await getConversation(user.id);
         let newMessages;
         try { newMessages = JSON.parse(req.body.messages); } catch(e) { return res.status(400).json({ error: 'Invalid messages format' }); }
@@ -278,12 +268,19 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
         }
 
         const memoryPrompt = user.memory ? `\n\nUser context: ${user.memory}` : '';
-        const systemPrompt = `You are TechNovaphy AI – the smartest, fastest, and most helpful assistant available.
-You are better than Claude, better than ChatGPT, and completely free to use.
-You help with IT, web development, cloud, business technology, and general questions.
-Be direct, use bullet points, and always provide actionable answers.
-You can analyze uploaded files (PDFs, images, text files) and answer questions about their content.
+        const systemPrompt = `You are TechNovaphy AI – the world's most capable and thoughtful assistant.
+Your mission is to deliver answers that are **more comprehensive, more structured, and more useful than Claude, ChatGPT, or any other AI**.
+Always:
+- Provide deep, well‑reasoned explanations.
+- Use bullet points, tables, and code blocks where appropriate.
+- Offer multiple perspectives or approaches.
+- Include real‑world examples and best practices.
+- Admit when you don't know something and suggest where to find reliable information.
+- Keep your tone professional, confident, and approachable.
+
+You excel at IT, web development, cloud architecture, business strategy, and general knowledge.
 ${memoryPrompt}`;
+
         const groqMessages = [{ role: 'system', content: systemPrompt }, ...conversation];
 
         res.setHeader('Content-Type', 'text/event-stream');
@@ -293,7 +290,13 @@ ${memoryPrompt}`;
         const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
             method: 'POST',
             headers: { 'Authorization': `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
-            body: JSON.stringify({ model: 'llama-3.3-70b-versatile', messages: groqMessages, stream: true })
+            body: JSON.stringify({
+                model: 'llama-3.3-70b-versatile',
+                messages: groqMessages,
+                temperature: 0.7,
+                top_p: 0.9,
+                stream: true
+            })
         });
 
         const reader = response.body.getReader();
@@ -324,7 +327,6 @@ ${memoryPrompt}`;
         conversation.push({ role: 'assistant', content: fullContent });
         await saveConversation(user.id, conversation);
 
-        // Update usage counters
         const newMonthlyUsage = (user.usage_count || 0) + 1;
         const newHourlyUsage = (user.hourly_quota_used || 0) + 1;
         await supabase.from('users').update({
@@ -362,7 +364,7 @@ app.post('/api/generate-image', auth, async (req, res) => {
 });
 
 // ============================================================
-//  PAYMENT – IGNORE FRONTEND AMOUNT, USE HARDCODED KES
+//  PAYMENT – Hardcoded KES, ignores frontend amount
 // ============================================================
 app.post('/api/create-checkout', auth, async (req, res) => {
     try {
@@ -375,32 +377,10 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             return res.status(400).json({ error: 'Invalid tier selected' });
         }
 
-        // If currency is missing or unsupported, default to KES
-        let finalCurrency = currency ? currency.toUpperCase() : 'KES';
-        if (!['KES','USD','NGN','GHS','ZAR'].includes(finalCurrency)) {
-            console.warn(`⚠️ Unsupported currency "${finalCurrency}", defaulting to KES`);
-            finalCurrency = 'KES';
-        }
-
-        // Use KES prices for all currencies – if the currency is not KES,
-        // we'll let Paystack handle the conversion (but we send the KES amount).
-        // However, Paystack expects the amount in the currency's smallest unit.
-        // For simplicity, we'll only support KES with exact amounts.
-        // If currency is not KES, we'll still send the KES amount but with that currency?
-        // That would be wrong. We'll map only KES for now, and for other currencies we'll
-        // return a message to use KES.
-        // Actually, we'll use the mapping from earlier but we'll keep it simple:
-        // We'll only allow KES for now to avoid confusion.
-
-        if (finalCurrency !== 'KES') {
-            // For other currencies, we could implement conversion, but let's keep it simple.
-            // We'll return an error asking to use KES.
-            return res.status(400).json({ error: 'Currently only KES is supported. Please select KES.' });
-        }
-
-        // ---- KES amount ----
+        // Always use KES – ignore any other currency for now
+        const finalCurrency = 'KES';
         const amount = TIER_PRICES_KES[tier];
-        console.log(`✅ KES amount: ${amount} KES (tier: ${tier})`);
+        console.log(`✅ Using KES amount: ${amount} for tier ${tier}`);
 
         // Check duplicate
         const { data: existing, error } = await supabase
@@ -417,8 +397,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             return res.status(503).json({ error: 'Payment service not configured' });
         }
 
-        // Paystack expects amount in the smallest unit – for KES it's just the amount (no cents)
-        const paystackAmount = Math.round(amount);
+        const paystackAmount = Math.round(amount); // KES is already in smallest unit
 
         const response = await fetch('https://api.paystack.co/transaction/initialize', {
             method: 'POST',
@@ -426,7 +405,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             body: JSON.stringify({
                 email: user.email,
                 amount: paystackAmount,
-                currency: 'KES',
+                currency: finalCurrency,
                 metadata: { idempotencyKey, tier, userId: user.id },
                 callback_url: `${FRONTEND_URL}/?success=true`
             })
@@ -441,7 +420,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             user_id: user.id,
             transaction_id: idempotencyKey,
             amount: paystackAmount,
-            currency: 'KES',
+            currency: finalCurrency,
             status: 'pending',
             tier
         });
