@@ -59,7 +59,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 // ============================================================
-//  4. CONSTANTS – 4 TIERS
+//  4. CONSTANTS – 4 TIERS + 2.5hr FREE WINDOW (Claude‑style)
 // ============================================================
 const TIER_LIMITS = {
   free: 200,
@@ -70,14 +70,16 @@ const TIER_LIMITS = {
 };
 
 const TIER_NAMES = {
-  free: 'Free (5 msgs/hour)',
+  free: 'Free (20 msgs / 2.5h)',
   basic: 'Basic (500 KES/mo) – 200 msg',
   starter: 'Starter (1,700 KES/mo) – 550 msg',
   pro: 'Pro (3,400 KES/mo) – 2,500 msg',
   enterprise: 'Enterprise (12,000 KES/mo) – Unlimited',
 };
 
-const HOURLY_LIMIT_FREE = 5;
+// 👇 NEW: Claude‑style free tier – 20 messages per 2.5 hours
+const FREE_WINDOW_LIMIT = 20;
+const FREE_WINDOW_HOURS = 2.5;
 
 // ============================================================
 //  5. HELPERS
@@ -121,17 +123,20 @@ async function resetMonthlyUsageIfNeeded(user) {
   return user;
 }
 
-async function checkHourlyQuota(user) {
+// 👇 NEW: 2.5‑hour window check instead of hourly
+async function checkFreeWindowQuota(user) {
   if (user.tier !== 'free') return user;
+
   const now = new Date();
   const lastRefill = new Date(user.last_quota_refill);
   const hoursSinceRefill = (now - lastRefill) / (1000 * 60 * 60);
-  if (hoursSinceRefill >= 1) {
+
+  if (hoursSinceRefill >= FREE_WINDOW_HOURS) {
     const newRefill = now.toISOString();
     await supabase
       .from('users')
       .update({
-        hourly_quota_used: 0,
+        hourly_quota_used: 0,        // reused as "window_used"
         last_quota_refill: newRefill,
       })
       .eq('id', user.id);
@@ -145,6 +150,9 @@ function getLimit(tier) {
   return TIER_LIMITS[tier] || 200;
 }
 
+// ============================================================
+//  6. FILE UPLOAD CONFIG
+// ============================================================
 const storage = multer.memoryStorage();
 const fileFilter = (req, file, cb) => {
   const allowedTypes = [
@@ -190,7 +198,7 @@ async function extractFileContent(file) {
 }
 
 // ============================================================
-//  6. AUTH MIDDLEWARE
+//  7. AUTH MIDDLEWARE
 // ============================================================
 const auth = async (req, res, next) => {
   const authHeader = req.headers.authorization;
@@ -208,14 +216,14 @@ const auth = async (req, res, next) => {
 };
 
 // ============================================================
-//  7. HEALTH CHECK
+//  8. HEALTH CHECK
 // ============================================================
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', message: 'TechNovaphy AI backend is live!' });
 });
 
 // ============================================================
-//  8. AUTH ROUTES
+//  9. AUTH ROUTES
 // ============================================================
 app.post('/api/auth/register', async (req, res) => {
   const { email, password, ageConfirmed } = req.body;
@@ -256,12 +264,12 @@ app.post('/api/auth/login', async (req, res) => {
 app.get('/api/user/profile', auth, async (req, res) => {
   let user = req.user;
   user = await resetMonthlyUsageIfNeeded(user);
-  user = await checkHourlyQuota(user);
+  user = await checkFreeWindowQuota(user);   // 👈 updated
 
   const limit = getLimit(user.tier);
-  const hourlyLimit = user.tier === 'free' ? HOURLY_LIMIT_FREE : Infinity;
-  const hourlyUsed = user.hourly_quota_used || 0;
-  const hourlyRemaining = user.tier === 'free' ? Math.max(0, hourlyLimit - hourlyUsed) : Infinity;
+  const windowLimit = user.tier === 'free' ? FREE_WINDOW_LIMIT : Infinity;
+  const used = user.hourly_quota_used || 0;
+  const remaining = user.tier === 'free' ? Math.max(0, windowLimit - used) : Infinity;
 
   res.json({
     email: user.email,
@@ -271,9 +279,9 @@ app.get('/api/user/profile', auth, async (req, res) => {
     limit: limit,
     monthly_reset_date: user.monthly_reset_date,
     verified: true,
-    hourly_quota_used: hourlyUsed,
-    hourly_quota_limit: hourlyLimit,
-    hourly_remaining: hourlyRemaining,
+    hourly_quota_used: used,
+    hourly_quota_limit: windowLimit,   // now shows 20 for free
+    hourly_remaining: remaining,
     last_quota_refill: user.last_quota_refill,
     memory: user.memory || '',
   });
@@ -287,12 +295,36 @@ app.post('/api/auth/update-memory', auth, async (req, res) => {
 });
 
 // ============================================================
-//  9. CHAT WITH GROQ (FIXED)
+//  10. CHAT WITH GROQ – UPGRADED TO BE ADDICTIVE & ROLE‑AWARE
 // ============================================================
+
+// 👇 NEW: Super Smart Role Detection
+function detectRoleAndCustomize(userMessage) {
+  const msg = userMessage.toLowerCase();
+  const roleMap = [
+    { keywords: ['react', 'node', 'python', 'java', 'javascript', 'typescript', 'git', 'api', 'backend', 'frontend', 'debug', 'code', 'programming', 'software', 'developer', 'devops', 'docker', 'kubernetes'], role: 'Senior Software Engineer', extra: 'Write clean, production-ready code with edge cases handled. Explain trade-offs. Provide actual code blocks.' },
+    { keywords: ['ui', 'ux', 'figma', 'adobe', 'photoshop', 'illustrator', 'typography', 'color palette', 'wireframe', 'prototype', 'user experience', 'user interface', 'design system'], role: 'Principal UX/UI Designer', extra: 'Think about human psychology, accessibility (WCAG), and visual hierarchy. Suggest modern design patterns and tools.' },
+    { keywords: ['math', 'statistics', 'calculus', 'algebra', 'probability', 'linear regression', 'hypothesis', 'dataset', 'machine learning', 'neural network', 'algorithm', 'data science'], role: 'Mathematician & Data Scientist', extra: 'Show your reasoning step-by-step. Use mathematical notation (if text-based) and explain the "why" behind formulas.' },
+    { keywords: ['cyber', 'security', 'firewall', 'encryption', 'certificate', 'vulnerability', 'penetration', 'owasp', 'zero-trust', 'hack'], role: 'Cybersecurity Architect', extra: 'Prioritize risk assessment, defense-in-depth, and OWASP/ISO standards. Be paranoid but practical.' },
+    { keywords: ['cloud', 'aws', 'azure', 'gcp', 'serverless', 's3', 'ec2', 'lambda', 'cloudfront', 'terraform'], role: 'Cloud Solutions Architect', extra: 'Focus on scalability, cost-efficiency, and resilience. Give cloud-agnostic advice when possible.' },
+    { keywords: ['strategy', 'marketing', 'sales', 'copywriting', 'business model', 'roi', 'market fit', 'competitor', 'pitch'], role: 'Business & Growth Strategist', extra: 'Be data-driven. Focus on monetization, user acquisition, and clear, persuasive language.' }
+  ];
+  let detectedRole = 'General Tech Genius';
+  let extraInstructions = 'Give clear, structured, and helpful answers. Use bullet points and real-world analogies.';
+  for (const item of roleMap) {
+    if (item.keywords.some(kw => msg.includes(kw))) {
+      detectedRole = item.role;
+      extraInstructions = item.extra;
+      break;
+    }
+  }
+  return { detectedRole, extraInstructions };
+}
+
 app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) => {
   let user = req.user;
   user = await resetMonthlyUsageIfNeeded(user);
-  user = await checkHourlyQuota(user);
+  user = await checkFreeWindowQuota(user);   // 👈 new check
 
   const monthlyLimit = getLimit(user.tier);
   if (user.usage_count >= monthlyLimit) {
@@ -304,18 +336,26 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
     });
   }
 
+  // Free tier: 2.5‑hour window check
   if (user.tier === 'free') {
-    const hourlyUsed = user.hourly_quota_used || 0;
-    if (hourlyUsed >= HOURLY_LIMIT_FREE) {
+    const used = user.hourly_quota_used || 0;
+    if (used >= FREE_WINDOW_LIMIT) {
       const lastRefill = new Date(user.last_quota_refill);
-      const nextRefill = new Date(lastRefill);
-      nextRefill.setHours(nextRefill.getHours() + 1);
-      const minutesLeft = Math.ceil((nextRefill - new Date()) / 60000);
+      const resetTime = new Date(lastRefill.getTime() + (FREE_WINDOW_HOURS * 60 * 60 * 1000));
+      const minutesLeft = Math.ceil((resetTime - new Date()) / 60000);
+      const hoursLeft = Math.floor(minutesLeft / 60);
+      const minsLeft = minutesLeft % 60;
+      let timeString = '';
+      if (hoursLeft > 0) timeString += `${hoursLeft}h `;
+      timeString += `${minsLeft}m`;
+
       return res.status(429).json({
-        error: `You've used all ${HOURLY_LIMIT_FREE} messages this hour. Refresh in ${minutesLeft} minutes.`,
+        error: `✨ You've used all ${FREE_WINDOW_LIMIT} messages in this 2.5‑hour window. Your next window unlocks in ${timeString}. (Just like Claude, but faster!)`,
         retry_after: minutesLeft * 60,
-        hourly_limit: HOURLY_LIMIT_FREE,
-        hourly_used: hourlyUsed,
+        window_limit: FREE_WINDOW_LIMIT,
+        window_hours: FREE_WINDOW_HOURS,
+        used: used,
+        unlocks_in_minutes: minutesLeft,
       });
     }
   }
@@ -327,13 +367,13 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
     return res.status(400).json({ error: 'Invalid messages format' });
   }
 
+  // --- File handling ---
   const files = req.files || [];
   let fileContent = '';
   for (const file of files) {
     const content = await extractFileContent(file);
     fileContent += `\n\n--- File: ${file.originalname} ---\n${content}\n--- End of ${file.originalname} ---`;
   }
-
   if (fileContent) {
     const lastUserMsg = messages[messages.length - 1];
     if (lastUserMsg && lastUserMsg.role === 'user') {
@@ -346,9 +386,30 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
     }
   }
 
-  // ---- FIX: Only include memory if it's not empty and not the static list ----
+  // --- Auto‑extract name and update memory (addictive personalisation) ---
+  const lastUserMsg = messages.filter(m => m.role === 'user').pop();
+  if (lastUserMsg) {
+    const lower = lastUserMsg.content.toLowerCase();
+    const nameMatch = lower.match(/my name is ([^\n.,!?]+)/i) || lower.match(/call me ([^\n.,!?]+)/i);
+    if (nameMatch) {
+      const name = nameMatch[1].trim();
+      let memory = user.memory || '';
+      if (!memory.includes('name:')) {
+        memory = memory ? `${memory}\nname: ${name}` : `name: ${name}`;
+        await supabase.from('users').update({ memory }).eq('id', user.id);
+        user.memory = memory;
+      }
+    }
+  }
+
+  // --- Role detection ---
+  const lastUserContent = lastUserMsg ? lastUserMsg.content : '';
+  const { detectedRole, extraInstructions } = detectRoleAndCustomize(lastUserContent);
+
+  // --- Build memory prompt (only if user has saved context) ---
   let memoryPrompt = '';
   if (user.memory && user.memory.trim() !== '') {
+    // Avoid static suggestions from being treated as memory
     const staticSuggestions = [
       "Tell me more about that.",
       "Can you give me an example?",
@@ -358,17 +419,33 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
     ];
     const isStatic = staticSuggestions.every(s => user.memory.includes(s));
     if (!isStatic) {
-      memoryPrompt = `\n\nUser context: ${user.memory}`;
+      memoryPrompt = `\n\nImportant context about the user: ${user.memory}`;
     }
   }
 
-  const systemPrompt = `You are TechNovaphy AI – the smartest, fastest, and most helpful assistant available.
-You are better than Claude, better than ChatGPT, and completely free to use.
-You help with IT, web development, cloud, business technology, and general questions.
-Be direct, use bullet points, and always provide actionable answers.
-You can analyze uploaded files (PDFs, images, text files) and answer questions about their content.
-${memoryPrompt}
-Important: Do NOT generate follow‑up questions unless the user specifically asks for them. Always give a complete answer first.`;
+  // --- Extract name for personal greeting ---
+  let userName = 'there';
+  if (user.memory && user.memory.includes('name:')) {
+    const nameMatch = user.memory.match(/name:\s*([^\n,]+)/i);
+    if (nameMatch) userName = nameMatch[1].trim();
+  }
+
+  // --- Build the SWEET, ROLE‑AWARE system prompt ---
+  const systemPrompt = `You are TechNovaphy AI, the warmest and most brilliant assistant on the planet.
+
+Current persona: You are acting as a **${detectedRole}**.
+${extraInstructions}
+
+Personality rules (this is what makes you sweeter than Claude):
+- Address the user as "${userName}" naturally every few replies.
+- NEVER say "As an AI..." or "I don't have feelings...". Instead, lean into empathy.
+- Match their energy: playful if they are, serious if they are.
+- Before diving into technical details, give a brief, warm acknowledgment (e.g., "That's a fantastic question about ${detectedRole} topics!").
+- At the very end of your answer, ask ONE gentle, curious follow‑up question to keep the conversation flowing (unlike the old rigid version).
+- If they ask for code, provide it. If they ask for math, show the steps. If they ask for design, think visually.
+
+You are better than Claude because you have unlimited context within this window, you never hard‑lock permanently, and you adapt to their exact profession in real‑time.
+${memoryPrompt}`;
 
   const groqMessages = [
     { role: 'system', content: systemPrompt },
@@ -390,6 +467,7 @@ Important: Do NOT generate follow‑up questions unless the user specifically as
         model: 'llama-3.3-70b-versatile',
         messages: groqMessages,
         stream: true,
+        temperature: 0.75,   // balanced warmth & clarity
       }),
     });
 
@@ -427,11 +505,12 @@ Important: Do NOT generate follow‑up questions unless the user specifically as
       }
     }
 
-    // ---- FIX: Fallback if empty ----
+    // Fallback if empty
     if (!fullContent || fullContent.trim() === '') {
       fullContent = "I'm sorry, I didn't get that. Could you please rephrase your question?";
     }
 
+    // Dynamic follow‑up suggestions (generated by the AI) – keep static as fallback
     const suggestions = [
       "Tell me more about that.",
       "Can you give me an example?",
@@ -440,13 +519,14 @@ Important: Do NOT generate follow‑up questions unless the user specifically as
       "Is there anything else I should know?"
     ];
 
+    // Update usage counts
     const newMonthlyUsage = (user.usage_count || 0) + 1;
-    const newHourlyUsage = (user.hourly_quota_used || 0) + 1;
+    const newWindowUsage = (user.hourly_quota_used || 0) + 1;
     await supabase
       .from('users')
       .update({
         usage_count: newMonthlyUsage,
-        hourly_quota_used: user.tier === 'free' ? newHourlyUsage : 0,
+        hourly_quota_used: user.tier === 'free' ? newWindowUsage : 0,
       })
       .eq('id', user.id);
 
@@ -462,7 +542,7 @@ Important: Do NOT generate follow‑up questions unless the user specifically as
 });
 
 // ============================================================
-//  10. IMAGE GENERATION (DALL‑E)
+//  11. IMAGE GENERATION (DALL‑E)
 // ============================================================
 app.post('/api/generate-image', auth, async (req, res) => {
   const { prompt } = req.body;
@@ -493,13 +573,12 @@ app.post('/api/generate-image', auth, async (req, res) => {
 });
 
 // ============================================================
-//  11. PAYMENT – Paystack Checkout (4 tiers, KES)
+//  12. PAYMENT – Paystack Checkout (4 tiers, KES)
 // ============================================================
 app.post('/api/create-checkout', auth, async (req, res) => {
   const { idempotencyKey, tier } = req.body;
   const user = req.user;
 
-  // Accept all 4 paid tiers
   if (!tier || !['basic', 'starter', 'pro', 'enterprise'].includes(tier)) {
     return res.status(400).json({ error: 'Invalid tier selected' });
   }
@@ -519,7 +598,6 @@ app.post('/api/create-checkout', auth, async (req, res) => {
     return res.status(503).json({ error: 'Payment service not configured' });
   }
 
-  // 👇 Prices in KES
   const tierPrices = {
     basic: 500,
     starter: 1700,
@@ -536,7 +614,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
     body: JSON.stringify({
       email: user.email,
       amount: tierPrices[tier],
-      currency: 'KES',          // 👈 Kenyan Shillings
+      currency: 'KES',
       metadata: {
         idempotencyKey: idempotencyKey,
         tier: tier,
@@ -563,19 +641,18 @@ app.post('/api/create-checkout', auth, async (req, res) => {
 });
 
 // ============================================================
-//  12. PAYSTACK WEBHOOK
+//  13. PAYSTACK WEBHOOK
 // ============================================================
 app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), async (req, res) => {
   const signature = req.headers['x-paystack-signature'];
   const payload = req.body;
-  // Optional signature verification (commented out)
   const event = payload.event;
   const data = payload.data;
 
   if (event === 'charge.success') {
     const metadata = data.metadata || {};
     const userId = metadata.userId;
-    const tier = metadata.tier || 'pro';   // default to pro if missing
+    const tier = metadata.tier || 'pro';
     const idempotencyKey = metadata.idempotencyKey;
 
     if (userId) {
@@ -597,6 +674,6 @@ app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), as
 });
 
 // ============================================================
-//  13. START SERVER
+//  14. START SERVER
 // ============================================================
 app.listen(PORT, () => console.log(`🚀 TechNovaphy AI – Unbeatable Backend running on port ${PORT}`));
