@@ -608,6 +608,10 @@ app.post('/api/create-checkout', auth, async (req, res) => {
     enterprise: 15000,
   };
 
+  // 🔧 FIXED: Paystack expects amount in CENTS (subunit). Multiply by 100.
+  const amountInCents = tierPrices[tier] * 100;
+  console.log(`💳 Initializing Paystack payment: ${tier} tier → ${tierPrices[tier]} KES (${amountInCents} cents)`);
+
   const response = await fetch('https://api.paystack.co/transaction/initialize', {
     method: 'POST',
     headers: {
@@ -616,7 +620,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
     },
     body: JSON.stringify({
       email: user.email,
-      amount: tierPrices[tier],
+      amount: amountInCents,   // ✅ Now correctly 50000, 170000, 350000, 1500000
       currency: 'KES',
       metadata: {
         idempotencyKey: idempotencyKey,
@@ -632,10 +636,11 @@ app.post('/api/create-checkout', auth, async (req, res) => {
     return res.status(500).json({ error: data.message || 'Paystack initialization failed' });
   }
 
+  // Store the actual KES amount in your database (not cents)
   await supabase.from('payments').insert({
     user_id: user.id,
     transaction_id: idempotencyKey,
-    amount: tierPrices[tier]*100,
+    amount: tierPrices[tier],   // e.g., 500 for Basic
     currency: 'KES',
     status: 'pending',
   });
