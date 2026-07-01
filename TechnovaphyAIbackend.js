@@ -73,8 +73,8 @@ const TIER_NAMES = {
   free: 'Free (20 msgs / 2.5h)',
   basic: 'Basic (500 KES/mo) – 200 msg',
   starter: 'Starter (1,700 KES/mo) – 550 msg',
-  pro: 'Pro (3,400 KES/mo) – 2,500 msg',
-  enterprise: 'Enterprise (12,000 KES/mo) – Unlimited',
+  pro: 'Pro (3,500 KES/mo) – 2,500 msg',
+  enterprise: 'Enterprise (15,000 KES/mo) – Unlimited',
 };
 
 const FREE_WINDOW_LIMIT = 20;
@@ -333,7 +333,6 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
     });
   }
 
-  // Free tier: 2.5‑hour window check
   if (user.tier === 'free') {
     const used = user.hourly_quota_used || 0;
     if (used >= FREE_WINDOW_LIMIT) {
@@ -364,7 +363,6 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
     return res.status(400).json({ error: 'Invalid messages format' });
   }
 
-  // --- File handling ---
   const files = req.files || [];
   let fileContent = '';
   for (const file of files) {
@@ -383,7 +381,6 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
     }
   }
 
-  // --- Auto‑extract name and update memory (addictive personalisation) ---
   const lastUserMsg = messages.filter(m => m.role === 'user').pop();
   if (lastUserMsg) {
     const lower = lastUserMsg.content.toLowerCase();
@@ -399,11 +396,9 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
     }
   }
 
-  // --- Role detection ---
   const lastUserContent = lastUserMsg ? lastUserMsg.content : '';
   const { detectedRole, extraInstructions } = detectRoleAndCustomize(lastUserContent);
 
-  // --- Build memory prompt (only if user has saved context) ---
   let memoryPrompt = '';
   if (user.memory && user.memory.trim() !== '') {
     const staticSuggestions = [
@@ -419,14 +414,12 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
     }
   }
 
-  // --- Extract name for personal greeting ---
   let userName = 'there';
   if (user.memory && user.memory.includes('name:')) {
     const nameMatch = user.memory.match(/name:\s*([^\n,]+)/i);
     if (nameMatch) userName = nameMatch[1].trim();
   }
 
-  // --- Build the SWEET, ROLE‑AWARE system prompt (FOLLOW‑UP LINE REMOVED) ---
   const systemPrompt = `You are TechNovaphy AI, the warmest and most brilliant assistant on the planet.
 
 Current persona: You are acting as a **${detectedRole}**.
@@ -500,15 +493,13 @@ ${memoryPrompt}`;
       }
     }
 
-    // Fallback if empty
     if (!fullContent || fullContent.trim() === '') {
       fullContent = "I'm sorry, I didn't get that. Could you please rephrase your question?";
     }
 
-    // --- REMOVED the static suggestions – send empty array ---
-    const suggestions = [];   // no more "Tell me more" buttons
+    // No suggestions – send empty array
+    const suggestions = [];
 
-    // Update usage counts
     const newMonthlyUsage = (user.usage_count || 0) + 1;
     const newWindowUsage = (user.hourly_quota_used || 0) + 1;
     await supabase
@@ -587,11 +578,14 @@ app.post('/api/create-checkout', auth, async (req, res) => {
     return res.status(503).json({ error: 'Payment service not configured' });
   }
 
+  // ============================================================
+  //  ✅ UPDATED PRICES – EXACTLY 500, 1700, 3500, 15000 KES
+  // ============================================================
   const tierPrices = {
     basic: 500,
     starter: 1700,
-    pro: 3400,
-    enterprise: 12000,
+    pro: 3500,
+    enterprise: 15000,
   };
 
   const response = await fetch('https://api.paystack.co/transaction/initialize', {
