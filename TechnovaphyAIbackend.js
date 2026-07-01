@@ -1,5 +1,5 @@
 // ============================================================
-//  TECHNOVAPHY AI – BACKEND (FIXED PAYMENT LOGIC)
+//  TECHNOVAPHY AI – BACKEND (FIXED PAYMENT)
 // ============================================================
 require('dotenv').config();
 
@@ -18,7 +18,7 @@ const pdfParse = require('pdf-parse');
 const app = express();
 
 // ============================================================
-//  1. CORS – PERMISSIVE
+//  1. CORS
 // ============================================================
 app.use(cors({
   origin: '*',
@@ -36,7 +36,6 @@ app.use(morgan('combined'));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
-// Rate limiter for auth endpoints
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
@@ -59,7 +58,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 // ============================================================
-//  4. CONSTANTS – 4 TIERS + 2.5hr FREE WINDOW
+//  4. CONSTANTS
 // ============================================================
 const TIER_LIMITS = {
   free: 200,
@@ -81,10 +80,9 @@ const FREE_WINDOW_LIMIT = 20;
 const FREE_WINDOW_HOURS = 2.5;
 
 // ============================================================
-//  4a. BASE PRICES & EXCHANGE RATES (HARDCODED – FIXED)
+//  4a. BASE PRICES & EXCHANGE RATES (HARDCODED - FIXED)
 // ============================================================
 
-// Base prices in KES
 const BASE_PRICES_KES = {
   basic: 500,
   starter: 1700,
@@ -92,41 +90,20 @@ const BASE_PRICES_KES = {
   enterprise: 15000,
 };
 
-// Currencies that need subunit conversion (×100)
-const SUBUNIT_CURRENCIES = ['USD', 'EUR', 'GBP', 'NGN', 'GHS', 'ZAR'];
-
-// ✅ HARDCODED RATES – CORRECT AND WORKING
-// (These are manually verified and will be used unless overridden)
+// ✅ FIXED: These are the correct rates
+// 500 KES × 0.0077 = 3.85 USD ✅
 const EXCHANGE_RATES = {
   KES: 1,
-  USD: 0.0077,   // 1 KES = 0.0077 USD → 500 KES = $3.85
-  EUR: 0.0070,   // 1 KES = 0.0070 EUR
-  GBP: 0.0061,   // 1 KES = 0.0061 GBP
-  NGN: 12.5,     // 1 KES = 12.5 NGN
-  GHS: 0.098,    // 1 KES = 0.098 GHS
-  ZAR: 0.14,     // 1 KES = 0.14 ZAR
+  USD: 0.0077,
+  EUR: 0.0070,
+  GBP: 0.0061,
+  NGN: 12.5,
+  GHS: 0.098,
+  ZAR: 0.14,
 };
 
-/**
- * Convert KES amount to display amount in target currency
- */
-function convertToDisplay(tier, currency) {
-  const baseKES = BASE_PRICES_KES[tier];
-  if (!baseKES) throw new Error('Invalid tier');
-  const rate = EXCHANGE_RATES[currency];
-  if (rate === undefined) throw new Error(`Unsupported currency: ${currency}`);
-  return Math.round(baseKES * rate * 100) / 100;
-}
-
-/**
- * Get Paystack amount (subunits for non-KES)
- */
-function getPaystackAmount(displayAmount, currency) {
-  if (SUBUNIT_CURRENCIES.includes(currency)) {
-    return Math.round(displayAmount * 100);
-  }
-  return Math.round(displayAmount);
-}
+// Currencies that need ×100 for Paystack
+const SUBUNIT_CURRENCIES = ['USD', 'EUR', 'GBP', 'NGN', 'GHS', 'ZAR'];
 
 // ============================================================
 //  5. HELPERS
@@ -197,7 +174,7 @@ function getLimit(tier) {
 }
 
 // ============================================================
-//  6. FILE UPLOAD CONFIG
+//  6. FILE UPLOAD
 // ============================================================
 const storage = multer.memoryStorage();
 const fileFilter = (req, file, cb) => {
@@ -270,7 +247,26 @@ app.get('/api/health', (req, res) => {
 });
 
 // ============================================================
-//  9. AUTH ROUTES
+//  9. DEBUG ENDPOINT – Check Rates
+// ============================================================
+app.get('/api/debug/rates', (req, res) => {
+  res.json({
+    exchange_rates: EXCHANGE_RATES,
+    base_prices: BASE_PRICES_KES,
+    subunit_currencies: SUBUNIT_CURRENCIES,
+    sample_calculation: {
+      tier: 'basic',
+      currency: 'USD',
+      base_kes: 500,
+      rate: EXCHANGE_RATES.USD,
+      display_amount: Math.round(500 * EXCHANGE_RATES.USD * 100) / 100,
+      paystack_amount: Math.round(Math.round(500 * EXCHANGE_RATES.USD * 100) / 100 * 100),
+    }
+  });
+});
+
+// ============================================================
+//  10. AUTH ROUTES
 // ============================================================
 app.post('/api/auth/register', async (req, res) => {
   const { email, password, ageConfirmed } = req.body;
@@ -342,7 +338,7 @@ app.post('/api/auth/update-memory', auth, async (req, res) => {
 });
 
 // ============================================================
-//  10. CHAT WITH GROQ
+//  11. CHAT WITH GROQ
 // ============================================================
 
 function detectRoleAndCustomize(userMessage) {
@@ -382,7 +378,6 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
     });
   }
 
-  // FREE TIER: 2.5-HOUR WINDOW CHECK
   if (user.tier === 'free') {
     const used = user.hourly_quota_used || 0;
     if (used >= FREE_WINDOW_LIMIT) {
@@ -413,7 +408,6 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
     return res.status(400).json({ error: 'Invalid messages format' });
   }
 
-  // --- File handling ---
   const files = req.files || [];
   let fileContent = '';
   let fileNames = [];
@@ -434,7 +428,6 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
     }
   }
 
-  // --- Auto-extract name into memory ---
   const lastUserMsg = messages.filter(m => m.role === 'user').pop();
   if (lastUserMsg) {
     const lower = lastUserMsg.content.toLowerCase();
@@ -450,11 +443,9 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
     }
   }
 
-  // --- Role Detection ---
   const lastUserContent = lastUserMsg ? lastUserMsg.content : '';
   const { detectedRole, extraInstructions } = detectRoleAndCustomize(lastUserContent);
 
-  // --- Build Memory Prompt ---
   let memoryPrompt = '';
   if (user.memory && user.memory.trim() !== '') {
     const staticSuggestions = [
@@ -470,14 +461,12 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
     }
   }
 
-  // --- Extract name ---
   let userName = 'there';
   if (user.memory && user.memory.includes('name:')) {
     const nameMatch = user.memory.match(/name:\s*([^\n,]+)/i);
     if (nameMatch) userName = nameMatch[1].trim();
   }
 
-  // --- SYSTEM PROMPT ---
   const systemPrompt = `You are TechNovaphy AI, the warmest and most brilliant assistant on the planet.
 
 Current persona: You are acting as a **${detectedRole}**.
@@ -563,7 +552,6 @@ ${memoryPrompt}`;
 
     const suggestions = [];
 
-    // Update usage
     const newMonthlyUsage = (user.usage_count || 0) + 1;
     const newWindowUsage = (user.hourly_quota_used || 0) + 1;
     await supabase
@@ -586,7 +574,7 @@ ${memoryPrompt}`;
 });
 
 // ============================================================
-//  11. IMAGE GENERATION (DALL‑E)
+//  12. IMAGE GENERATION
 // ============================================================
 app.post('/api/generate-image', auth, async (req, res) => {
   const { prompt } = req.body;
@@ -617,13 +605,16 @@ app.post('/api/generate-image', auth, async (req, res) => {
 });
 
 // ============================================================
-//  12. PAYMENT – FIXED WITH HARDCODED RATES
+//  13. PAYMENT – FIXED WITH FORCE RATES
 // ============================================================
 app.post('/api/create-checkout', auth, async (req, res) => {
   const { idempotencyKey, tier, currency = 'KES' } = req.body;
   const user = req.user;
 
-  console.log('📥 Payment request:', { tier, currency, user: user.email });
+  console.log('📥 ===== PAYMENT REQUEST =====');
+  console.log(`   Tier: ${tier}`);
+  console.log(`   Currency: ${currency}`);
+  console.log(`   User: ${user.email}`);
 
   // Validate tier
   if (!tier || !['basic', 'starter', 'pro', 'enterprise'].includes(tier)) {
@@ -651,11 +642,11 @@ app.post('/api/create-checkout', auth, async (req, res) => {
     return res.status(503).json({ error: 'Payment service not configured' });
   }
 
-  // ----- CALCULATION (FIXED) -----
+  // ----- ✅ FIXED CALCULATION -----
   const basePriceKES = BASE_PRICES_KES[tier];
   const rate = EXCHANGE_RATES[currency];
   
-  // Display amount (e.g., 500 KES × 0.0077 = 3.85 USD)
+  // Display amount (e.g., 500 × 0.0077 = 3.85)
   const displayAmount = Math.round(basePriceKES * rate * 100) / 100;
   
   // Paystack amount (subunits for non-KES)
@@ -666,22 +657,23 @@ app.post('/api/create-checkout', auth, async (req, res) => {
     paystackAmount = Math.round(displayAmount * 100);
   }
 
-  // ----- LOGGING -----
-  console.log('💳 PAYMENT CALCULATION:');
-  console.log(`   Tier: ${tier}`);
+  // ----- 📊 LOGGING -----
+  console.log('💳 ===== PAYMENT CALCULATION =====');
   console.log(`   Base KES price: ${basePriceKES} KES`);
   console.log(`   Exchange rate (1 KES → ${currency}): ${rate}`);
   console.log(`   Display amount: ${displayAmount} ${currency}`);
   console.log(`   Paystack amount (subunits): ${paystackAmount}`);
   console.log(`   Currency: ${currency}`);
+  console.log('====================================');
 
-  // If the amount is too small, reject
+  // Reject if amount is too small
   if (paystackAmount < 1) {
     return res.status(400).json({ 
-      error: `Amount too small: ${displayAmount} ${currency}. Please select a valid currency.` 
+      error: `Amount too small: ${displayAmount} ${currency}. Please use KES or contact support.` 
     });
   }
 
+  // Make Paystack request
   const response = await fetch('https://api.paystack.co/transaction/initialize', {
     method: 'POST',
     headers: {
@@ -704,13 +696,13 @@ app.post('/api/create-checkout', auth, async (req, res) => {
   });
 
   const data = await response.json();
-  console.log('📤 Paystack response:', data.status ? 'SUCCESS' : 'FAILED', data.message);
+  console.log('📤 Paystack response:', data.status ? '✅ SUCCESS' : '❌ FAILED');
+  console.log('   Message:', data.message);
 
   if (!data.status) {
-    // If Paystack says currency not supported, give a helpful error
     if (data.message && data.message.includes('currency')) {
       return res.status(400).json({ 
-        error: `Currency "${currency}" is not supported by your Paystack account. Please use KES or contact support.` 
+        error: `Currency "${currency}" is not supported by your Paystack account. Please use KES.` 
       });
     }
     return res.status(500).json({ error: data.message || 'Paystack initialization failed' });
@@ -729,18 +721,13 @@ app.post('/api/create-checkout', auth, async (req, res) => {
 });
 
 // ============================================================
-//  13. PAYSTACK WEBHOOK
+//  14. PAYSTACK WEBHOOK
 // ============================================================
 app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), async (req, res) => {
   const signature = req.headers['x-paystack-signature'];
   const payload = req.body;
   const event = payload.event;
   const data = payload.data;
-
-  // 🔐 Optional: Verify signature
-  // const crypto = require('crypto');
-  // const hash = crypto.createHmac('sha256', PAYSTACK_SECRET_KEY).update(JSON.stringify(payload)).digest('hex');
-  // if (hash !== signature) return res.status(401).send('Unauthorized');
 
   if (event === 'charge.success') {
     const metadata = data.metadata || {};
@@ -767,6 +754,10 @@ app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), as
 });
 
 // ============================================================
-//  14. START SERVER
+//  15. START SERVER
 // ============================================================
-app.listen(PORT, () => console.log(`🚀 TechNovaphy AI backend running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`🚀 TechNovaphy AI backend running on port ${PORT}`);
+  console.log('📊 Exchange rates loaded:', EXCHANGE_RATES);
+  console.log('💳 Sample: 500 KES → ', Math.round(500 * EXCHANGE_RATES.USD * 100) / 100, 'USD');
+});
