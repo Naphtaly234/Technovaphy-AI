@@ -635,7 +635,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
   await supabase.from('payments').insert({
     user_id: user.id,
     transaction_id: idempotencyKey,
-    amount: tierPrices[tier],
+    amount: tierPrices[tier]*100,
     currency: 'KES',
     status: 'pending',
   });
