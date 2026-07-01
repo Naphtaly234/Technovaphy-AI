@@ -1,5 +1,6 @@
 // ============================================================
-//  TECHNOVAPHY AI – COMPLETE BACKEND (ALL FEATURES)
+//  TECHNOVAPHY AI – COMPLETE BACKEND
+//  All features: Auth, Chat Streaming, Image Gen, Payments
 // ============================================================
 require('dotenv').config();
 
@@ -91,7 +92,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 // ============================================================
 const TIER_LIMITS = {
     free: 200,
-    basic: 200,      // same as free, but paid
+    basic: 200,
     starter: 550,
     pro: 2500,
     enterprise: Infinity
@@ -218,23 +219,19 @@ const upload = multer({
 async function extractFileContent(file) {
     const mimeType = file.mimetype;
     const buffer = file.buffer;
-    if (mimeType === 'application/pdf') {
-        try {
+    try {
+        if (mimeType === 'application/pdf') {
             const data = await pdfParse(buffer);
             return data.text;
-        } catch (e) {
-            return `[PDF could not be read: ${e.message}]`;
-        }
-    } else if (mimeType.startsWith('image/')) {
-        return `[Image: ${file.originalname} (${(file.size/1024).toFixed(1)}KB) – base64 data available for vision models]`;
-    } else if (mimeType === 'text/plain' || mimeType === 'text/csv') {
-        return buffer.toString('utf-8');
-    } else {
-        try {
+        } else if (mimeType.startsWith('image/')) {
+            return `[Image: ${file.originalname} (${(file.size/1024).toFixed(1)}KB) – base64 data available for vision models]`;
+        } else if (mimeType === 'text/plain' || mimeType === 'text/csv') {
             return buffer.toString('utf-8');
-        } catch (e) {
-            return `[File: ${file.originalname} - ${(file.size/1024).toFixed(1)}KB]`;
+        } else {
+            return buffer.toString('utf-8');
         }
+    } catch (e) {
+        return `[Error reading file: ${e.message}]`;
     }
 }
 
@@ -253,7 +250,7 @@ function generateSuggestions(lastMessage) {
 // ============================================================
 const auth = async (req, res, next) => {
     const authHeader = req.headers.authorization;
-    if (!authHeader) return res.status(401).json({ error: 'No token' });
+    if (!authHeader) return res.status(401).json({ error: 'No token provided' });
     const token = authHeader.split(' ')[1];
     try {
         const decoded = jwt.verify(token, JWT_SECRET);
@@ -262,7 +259,7 @@ const auth = async (req, res, next) => {
         req.user = user;
         next();
     } catch (e) {
-        res.status(401).json({ error: 'Invalid token' });
+        res.status(401).json({ error: 'Invalid or expired token' });
     }
 };
 
@@ -576,19 +573,18 @@ app.post('/api/generate-image', auth, async (req, res) => {
 });
 
 // ============================================================
-//  PAYMENT – Paystack Checkout (NOW SUPPORTS CURRENCY)
+//  PAYMENT – Paystack Checkout (with automatic conversion)
 // ============================================================
 app.post('/api/create-checkout', auth, async (req, res) => {
     try {
         const { idempotencyKey, tier, currency, amount } = req.body;
         const user = req.user;
 
-        // Validate tier (including 'basic')
+        // Validate tier
         if (!tier || !['basic', 'starter', 'pro', 'enterprise'].includes(tier)) {
             return res.status(400).json({ error: 'Invalid tier selected' });
         }
 
-        // Validate amount and currency
         if (!amount || !currency) {
             return res.status(400).json({ error: 'Amount and currency are required' });
         }
@@ -609,9 +605,15 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             return res.status(503).json({ error: 'Payment service not configured' });
         }
 
-        // Paystack expects amount in the smallest currency unit (e.g., cents for USD)
-        // The frontend sends the amount already converted to that unit.
-        const paystackAmount = Math.round(amount); // already in smallest unit
+        // ---------- CONVERT AMOUNT TO SMALLEST UNIT ----------
+        const currenciesWithCents = ['USD', 'EUR', 'GBP', 'ZAR'];
+        let paystackAmount = parseFloat(amount);
+        if (currenciesWithCents.includes(currency)) {
+            paystackAmount = Math.round(paystackAmount * 100);
+        } else {
+            paystackAmount = Math.round(paystackAmount);
+        }
+        // --------------------------------------------------
 
         const response = await fetch('https://api.paystack.co/transaction/initialize', {
             method: 'POST',
@@ -622,7 +624,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             body: JSON.stringify({
                 email: user.email,
                 amount: paystackAmount,
-                currency: currency,          // e.g., 'USD', 'KES', 'EUR', etc.
+                currency: currency,
                 metadata: {
                     idempotencyKey: idempotencyKey,
                     tier: tier,
@@ -637,7 +639,6 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             return res.status(500).json({ error: data.message || 'Paystack initialization failed' });
         }
 
-        // Record the pending payment
         await supabase.from('payments').insert({
             user_id: user.id,
             transaction_id: idempotencyKey,
