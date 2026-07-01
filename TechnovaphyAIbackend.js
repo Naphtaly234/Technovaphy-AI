@@ -38,11 +38,11 @@ app.use('/api/auth/register', authLimiter);
 // ----- Environment Variables (must be set in Render) -----
 const required = [
     'SUPABASE_URL',
-    'SUPABASE_SERVICE_ROLE_KEY',   // exact name
-    'JWT_SECRET',                 // exact name
+    'SUPABASE_SERVICE_ROLE_KEY',
+    'JWT_SECRET',
     'GROQ_API_KEY',
     'PAYSTACK_SECRET_KEY',
-    'OPENAI_API_KEY'
+    'AGNES_API_KEY'   // <-- Agnes key added here
 ];
 const missing = required.filter(key => !process.env[key]);
 if (missing.length) {
@@ -56,7 +56,7 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const AGNES_API_KEY = process.env.AGNES_API_KEY;
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://your-frontend-url.netlify.app';
 const OWNER_EMAIL = process.env.OWNER_EMAIL || null;
 
@@ -83,8 +83,6 @@ const TIER_NAMES = {
 };
 const FREE_SESSION_HOURS = 5;
 const FREE_LOCK_HOURS = 4;
-
-// Base prices in KES (these never change)
 const TIER_PRICES_KES = {
     basic: 500,
     starter: 1700,
@@ -92,7 +90,7 @@ const TIER_PRICES_KES = {
     enterprise: 15000
 };
 
-// ----- Exchange Rate Cache (live rates, 1‑hour TTL) -----
+// ----- Exchange Rate Cache -----
 let exchangeRates = { KES: 1, USD: 0.0077, EUR: 0.0070, GBP: 0.0061, NGN: 12.5, GHS: 0.098, ZAR: 0.14 };
 let ratesLastFetched = 0;
 const RATES_CACHE_TTL = 60 * 60 * 1000;
@@ -121,7 +119,7 @@ async function fetchExchangeRates() {
     }
 }
 
-// ----- User Helpers (unchanged) -----
+// ----- User Helpers -----
 async function findUser(email) {
     const { data, error } = await supabase.from('users').select('*').eq('email', email).maybeSingle();
     if (error) throw new Error('DB: ' + error.message);
@@ -272,7 +270,7 @@ app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 app.get('/api/ping', (req, res) => res.json({ status: 'ok', message: 'Backend is reachable!' }));
 
 // ============================================================
-//  AUTH ROUTES (register, login, profile, update‑memory)
+//  AUTH ROUTES (register, login, profile, update-memory)
 // ============================================================
 app.post('/api/auth/register', async (req, res) => {
     try {
@@ -482,7 +480,7 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
             }
         }
 
-        // Build user message (vision vs text‑only)
+        // Build user message (vision vs text-only)
         let userMessage;
         if (hasImage) {
             const textPart = userContent + (fileTextContent ? `\n\n${fileTextContent}` : '');
@@ -602,34 +600,52 @@ ${memoryPrompt}`;
 });
 
 // ============================================================
-//  IMAGE GENERATION (DALL‑E 2)
+//  IMAGE GENERATION (Agnes AI – free & unlimited)
 // ============================================================
 app.post('/api/generate-image', auth, async (req, res) => {
     try {
         const { prompt } = req.body;
-        if (!prompt) return res.status(400).json({ error: 'Prompt is required' });
-        if (!OPENAI_API_KEY) {
-            return res.status(503).json({ error: 'Image generation not configured' });
+        if (!prompt) {
+            return res.status(400).json({ error: 'Prompt is required' });
         }
 
-        const response = await fetch('https://api.openai.com/v1/images/generations', {
+        if (!AGNES_API_KEY) {
+            return res.status(503).json({ error: 'Image generation not configured (missing AGNES_API_KEY)' });
+        }
+
+        // Agnes OpenAI‑compatible endpoint
+        const response = await fetch('https://apihub.agnes-ai.com/v1/images/generations', {
             method: 'POST',
             headers: {
-                'Authorization': `Bearer ${OPENAI_API_KEY}`,
+                'Authorization': `Bearer ${AGNES_API_KEY}`,
                 'Content-Type': 'application/json'
             },
             body: JSON.stringify({
+                model: 'Agnes-Image-2.0-Flash',   // you can change to 'Agnes-Image-2.1-Flash' if available
                 prompt: prompt,
                 n: 1,
-                size: '512x512',
-                model: 'dall-e-2'
+                size: '1024x1024'
             })
         });
+
+        if (!response.ok) {
+            const errorText = await response.text();
+            console.error('❌ Agnes API error:', errorText);
+            throw new Error(`Agnes API error: ${response.status} - ${errorText}`);
+        }
+
         const data = await response.json();
-        if (!response.ok) throw new Error(data.error?.message || 'Image generation failed');
-        res.json({ url: data.data[0].url });
+        // Expected format: { data: [ { url: '...' } ] } (OpenAI-compatible)
+        const imageUrl = data?.data?.[0]?.url;
+        if (!imageUrl) {
+            console.error('❌ No image URL in Agnes response:', JSON.stringify(data));
+            throw new Error('No image URL returned from Agnes API');
+        }
+
+        console.log('✅ Image generated successfully');
+        res.json({ url: imageUrl });
     } catch(err) {
-        console.error('Image gen error:', err);
+        console.error('❌ Image generation error:', err);
         res.status(500).json({ error: err.message });
     }
 });
