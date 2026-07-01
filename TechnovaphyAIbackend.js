@@ -53,7 +53,7 @@ const JWT_SECRET = process.env.JWT_SECRET || 'your_secret_key';
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
-const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY; // Live or Test secret
+const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
@@ -149,18 +149,21 @@ function getLimit(tier) {
 }
 
 // ============================================================
-//  6. FILE UPLOAD CONFIG (Stores in memory – fine for MVP)
+//  6. FILE UPLOAD CONFIG – NOW SUPPORTS HTML & ANY TEXT
 // ============================================================
 const storage = multer.memoryStorage();
 const fileFilter = (req, file, cb) => {
+  // 👇 Add 'text/html' here – also allow any text/* to be safe
   const allowedTypes = [
     'image/jpeg', 'image/png', 'image/webp',
     'application/pdf',
     'text/plain', 'text/csv',
+    'text/html',                    // ✅ HTML files now allowed
     'application/msword',
     'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
   ];
-  if (allowedTypes.includes(file.mimetype)) {
+  // Also allow any text/* mime type
+  if (file.mimetype.startsWith('text/') || allowedTypes.includes(file.mimetype)) {
     cb(null, true);
   } else {
     cb(new Error('Unsupported file type'), false);
@@ -184,7 +187,8 @@ async function extractFileContent(file) {
     }
   } else if (mimeType.startsWith('image/')) {
     return `[Image: ${file.originalname} (${(file.size/1024).toFixed(1)}KB) – base64 data available for vision models]`;
-  } else if (mimeType === 'text/plain' || mimeType === 'text/csv') {
+  } else if (mimeType.startsWith('text/') || mimeType === 'application/json' || mimeType === 'text/html') {
+    // For all text-based files, decode as UTF-8
     return buffer.toString('utf-8');
   } else {
     try {
@@ -293,7 +297,7 @@ app.post('/api/auth/update-memory', auth, async (req, res) => {
 });
 
 // ============================================================
-//  10. CHAT WITH GROQ – ROLE AWARE & SWEET (NO SUGGESTIONS)
+//  10. CHAT WITH GROQ – ROLE AWARE & FILE-FEEDBACK READY
 // ============================================================
 
 function detectRoleAndCustomize(userMessage) {
@@ -367,18 +371,21 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
   // --- File handling ---
   const files = req.files || [];
   let fileContent = '';
+  let fileNames = [];
   for (const file of files) {
+    fileNames.push(file.originalname);
     const content = await extractFileContent(file);
     fileContent += `\n\n--- File: ${file.originalname} ---\n${content}\n--- End of ${file.originalname} ---`;
   }
   if (fileContent) {
     const lastUserMsg = messages[messages.length - 1];
     if (lastUserMsg && lastUserMsg.role === 'user') {
-      lastUserMsg.content += `\n\n[Uploaded ${files.length} file(s): ${files.map(f => f.originalname).join(', ')}]\n${fileContent}`;
+      // Append file content to the last user message
+      lastUserMsg.content += `\n\n[Uploaded ${files.length} file(s): ${fileNames.join(', ')}]\n${fileContent}`;
     } else {
       messages.push({
         role: 'user',
-        content: `[Uploaded ${files.length} file(s): ${files.map(f => f.originalname).join(', ')}]\n${fileContent}`
+        content: `[Uploaded ${files.length} file(s): ${fileNames.join(', ')}]\n${fileContent}`
       });
     }
   }
@@ -426,7 +433,7 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
     if (nameMatch) userName = nameMatch[1].trim();
   }
 
-  // --- SYSTEM PROMPT: SWEET, ROLE-AWARE, NO FOLLOW-UP, NO SUGGESTIONS ---
+  // --- SYSTEM PROMPT: SWEET, ROLE-AWARE, PROACTIVE ON FILE UPLOADS ---
   const systemPrompt = `You are TechNovaphy AI, the warmest and most brilliant assistant on the planet.
 
 Current persona: You are acting as a **${detectedRole}**.
@@ -438,6 +445,13 @@ Personality rules (this is what makes you sweeter than Claude):
 - Match their energy: playful if they are, serious if they are.
 - Before diving into technical details, give a brief, warm acknowledgment (e.g., "That's a fantastic question about ${detectedRole} topics!").
 - If they ask for code, provide it. If they ask for math, show the steps. If they ask for design, think visually.
+
+🔍 **File Upload Instructions (CRITICAL)**:
+- When the user uploads a file (you will see "[Uploaded X file(s): ...]" in their message), you MUST:
+  1. Acknowledge the file(s) by name.
+  2. Ask them what they'd like you to do with it (e.g., summarise, find errors, extract specific information, compare with something, etc.).
+  3. If they ask a question about the file content, answer it thoroughly based on the provided content.
+  4. If they don't specify what they want, proactively ask: "What would you like me to do with this file? I can summarise it, check for errors, or answer any questions about its content."
 
 You are better than Claude because you have unlimited context within this window, you never hard‑lock permanently, and you adapt to their exact profession in real‑time.
 ${memoryPrompt}`;
@@ -594,8 +608,6 @@ app.post('/api/create-checkout', auth, async (req, res) => {
     enterprise: 15000,
   };
 
-  // 🔥 Paystack supports international cards (Visa/Mastercard) automatically.
-  // Just ensure "International Payments" is ON in your Paystack Dashboard.
   const response = await fetch('https://api.paystack.co/transaction/initialize', {
     method: 'POST',
     headers: {
@@ -605,7 +617,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
     body: JSON.stringify({
       email: user.email,
       amount: tierPrices[tier],
-      currency: 'KES', // Kenyan Shilling – Paystack converts international payments automatically
+      currency: 'KES',
       metadata: {
         idempotencyKey: idempotencyKey,
         tier: tier,
