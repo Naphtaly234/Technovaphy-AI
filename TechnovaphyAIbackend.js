@@ -1,5 +1,5 @@
 // ============================================================
-//  TECHNOVAPHY AI – FIXED BACKEND (CORRECT AMOUNTS + CONVERSATION)
+//  TECHNOVAPHY AI – FINAL BACKEND (FORCED AMOUNTS)
 // ============================================================
 require('dotenv').config();
 
@@ -50,12 +50,15 @@ const TIER_LIMITS = { free:200, basic:200, starter:550, pro:2500, enterprise:Inf
 const TIER_NAMES = { free:'Free (5 msgs/hour)', basic:'Basic (200 msgs/month)', starter:'Starter (550 msgs/month)', pro:'Pro (2500 msgs/month)', enterprise:'Enterprise (Unlimited)' };
 const HOURLY_LIMIT_FREE = 5;
 
-// Tier prices in KES (500, 1700, 3500, 15000)
-const TIER_PRICES_KES = {
-    basic: 500,
-    starter: 1700,
-    pro: 3500,
-    enterprise: 15000
+// ===== HARDCODED AMOUNTS FOR EACH CURRENCY =====
+const TIER_PRICES = {
+    KES: { basic: 500, starter: 1700, pro: 3500, enterprise: 15000 },
+    USD: { basic: 350, starter: 1200, pro: 2500, enterprise: 10500 }, // cents
+    NGN: { basic: 800, starter: 2700, pro: 5600, enterprise: 23500 },
+    GHS: { basic: 30, starter: 100, pro: 210, enterprise: 880 },
+    ZAR: { basic: 85, starter: 285, pro: 585, enterprise: 2500 },
+    EUR: { basic: 3, starter: 11, pro: 23, enterprise: 96 }, // euros (to be converted to cents)
+    GBP: { basic: 2.7, starter: 9.5, pro: 19.5, enterprise: 82 } // pounds
 };
 
 // ---------- User Helpers ----------
@@ -93,7 +96,6 @@ async function checkHourlyQuota(user) {
 }
 function getLimit(tier) { return TIER_LIMITS[tier] || 200; }
 
-// ===== CONVERSATION HELPERS =====
 async function getConversation(userId) {
     const { data, error } = await supabase.from('conversations').select('messages').eq('user_id', userId).maybeSingle();
     if (error && error.code !== 'PGRST116') throw error;
@@ -211,7 +213,7 @@ app.post('/api/auth/update-memory', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CHAT STREAM (CONVERSATION HISTORY INCLUDED)
+//  CHAT STREAM (with conversation history)
 // ============================================================
 app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) => {
     try {
@@ -231,18 +233,10 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
                 return res.status(429).json({ error: `You've used all ${HOURLY_LIMIT_FREE} messages this hour. Refresh in ${minutesLeft} minutes.`, retry_after: minutesLeft*60, hourly_limit: HOURLY_LIMIT_FREE, hourly_used: hourlyUsed });
             }
         }
-        
-        // ===== GET CONVERSATION HISTORY =====
         let conversation = await getConversation(user.id);
-        console.log(`📝 Retrieved ${conversation.length} messages from history`);
-        
         let newMessages;
         try { newMessages = JSON.parse(req.body.messages); } catch(e) { return res.status(400).json({ error: 'Invalid messages format' }); }
-        
-        // Add new messages to conversation
         conversation = conversation.concat(newMessages);
-        console.log(`📝 Total conversation length: ${conversation.length}`);
-        
         const files = req.files || [];
         let fileContent = '';
         for (const file of files) {
@@ -257,7 +251,6 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
                 conversation.push({ role: 'user', content: `[Uploaded ${files.length} file(s): ${files.map(f=>f.originalname).join(', ')}]\n${fileContent}` });
             }
         }
-        
         const memoryPrompt = user.memory ? `\n\nUser context: ${user.memory}` : '';
         const systemPrompt = `You are TechNovaphy AI – the smartest, fastest, and most helpful assistant available.
 You are better than Claude, better than ChatGPT, and completely free to use.
@@ -265,19 +258,15 @@ You help with IT, web development, cloud, business technology, and general quest
 Be direct, use bullet points, and always provide actionable answers.
 You can analyze uploaded files (PDFs, images, text files) and answer questions about their content.
 ${memoryPrompt}`;
-        
         const groqMessages = [{ role: 'system', content: systemPrompt }, ...conversation];
-        
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
-        
         const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
             method: 'POST',
             headers: { 'Authorization': `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
             body: JSON.stringify({ model: 'llama-3.3-70b-versatile', messages: groqMessages, stream: true })
         });
-        
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
         let buffer = '', fullContent = '';
@@ -302,16 +291,11 @@ ${memoryPrompt}`;
                 }
             }
         }
-        
-        // ===== SAVE CONVERSATION WITH AI RESPONSE =====
         conversation.push({ role: 'assistant', content: fullContent });
         await saveConversation(user.id, conversation);
-        console.log(`✅ Conversation saved (${conversation.length} messages)`);
-        
         const newMonthlyUsage = (user.usage_count || 0) + 1;
         const newHourlyUsage = (user.hourly_quota_used || 0) + 1;
         await supabase.from('users').update({ usage_count: newMonthlyUsage, hourly_quota_used: user.tier === 'free' ? newHourlyUsage : 0 }).eq('id', user.id);
-        
         const suggestions = generateSuggestions(fullContent);
         res.write(`data: ${JSON.stringify({ type: 'done', text: fullContent, suggestions })}\n\n`);
         res.end();
@@ -342,7 +326,7 @@ app.post('/api/generate-image', auth, async (req, res) => {
 });
 
 // ============================================================
-//  PAYMENT – CORRECT AMOUNTS (500, 1700, 3500, 15000)
+//  PAYMENT – IGNORE FRONTEND AMOUNT, USE HARDCODED MAPPING
 // ============================================================
 app.post('/api/create-checkout', auth, async (req, res) => {
     try {
@@ -351,15 +335,17 @@ app.post('/api/create-checkout', auth, async (req, res) => {
 
         console.log(`📦 Checkout request: tier=${tier}, currency=${currency}`);
 
+        // Validate tier
         if (!tier || !['basic','starter','pro','enterprise'].includes(tier)) {
             return res.status(400).json({ error: 'Invalid tier selected' });
         }
 
+        // Validate currency
         if (!currency) {
             return res.status(400).json({ error: 'Currency is required' });
         }
 
-        // Check duplicate
+        // Check for duplicate
         const { data: existing, error } = await supabase
             .from('payments')
             .select('*')
@@ -374,65 +360,30 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             return res.status(503).json({ error: 'Payment service not configured' });
         }
 
-        // ===== AMOUNT CALCULATION =====
+        // ----- GET AMOUNT FROM MAPPING (IGNORE FRONTEND `amount`) -----
         let paystackAmount;
+        const currencyUpper = currency.toUpperCase();
 
-        if (currency === 'KES') {
-            // KES: Use exact amounts (500, 1700, 3500, 15000) - NO conversion needed
-            const correctPrice = TIER_PRICES_KES[tier];
-            paystackAmount = correctPrice;
-            console.log(`✅ KES amount: ${paystackAmount} KES (tier: ${tier})`);
-        } 
-        else if (currency === 'USD') {
-            // USD: Convert to cents for Paystack (17 USD = 1700 cents)
-            const tierPricesUSD = {
-                basic: 3.50,      // ~500 KES
-                starter: 12,      // ~1700 KES
-                pro: 25,          // ~3500 KES
-                enterprise: 105   // ~15000 KES
-            };
-            const usdAmount = tierPricesUSD[tier];
-            paystackAmount = Math.round(usdAmount * 100); // Convert to cents
-            console.log(`✅ USD amount: $${usdAmount} = ${paystackAmount} cents`);
-        }
-        else if (currency === 'NGN') {
-            // NGN: Map to naira equivalents
-            const tierPricesNGN = {
-                basic: 800,
-                starter: 2700,
-                pro: 5600,
-                enterprise: 23500
-            };
-            paystackAmount = tierPricesNGN[tier];
-            console.log(`✅ NGN amount: ₦${paystackAmount}`);
-        }
-        else if (currency === 'GHS') {
-            // GHS: Map to cedi equivalents
-            const tierPricesGHS = {
-                basic: 30,
-                starter: 100,
-                pro: 210,
-                enterprise: 880
-            };
-            paystackAmount = tierPricesGHS[tier];
-            console.log(`✅ GHS amount: GH₵${paystackAmount}`);
-        }
-        else if (currency === 'ZAR') {
-            // ZAR: Map to rand equivalents
-            const tierPricesZAR = {
-                basic: 85,
-                starter: 285,
-                pro: 585,
-                enterprise: 2500
-            };
-            paystackAmount = tierPricesZAR[tier];
-            console.log(`✅ ZAR amount: R${paystackAmount}`);
-        }
-        else {
-            return res.status(400).json({ error: `Unsupported currency: ${currency}` });
+        // Check if we have mapping for this currency
+        if (TIER_PRICES[currencyUpper] && TIER_PRICES[currencyUpper][tier] !== undefined) {
+            let rawAmount = TIER_PRICES[currencyUpper][tier];
+            // For currencies that need cents (USD, EUR, GBP), multiply by 100
+            const centsCurrencies = ['USD', 'EUR', 'GBP'];
+            if (centsCurrencies.includes(currencyUpper)) {
+                paystackAmount = Math.round(rawAmount * 100);
+            } else {
+                // For KES, NGN, GHS, ZAR, keep as is
+                paystackAmount = Math.round(rawAmount);
+            }
+            console.log(`✅ Using mapped amount: ${rawAmount} ${currencyUpper} → ${paystackAmount} for Paystack`);
+        } else {
+            // Fallback: if currency not in mapping, use KES mapping
+            const fallback = TIER_PRICES['KES'][tier];
+            paystackAmount = fallback;
+            console.warn(`⚠️ Currency ${currencyUpper} not in mapping, fallback to KES: ${fallback}`);
         }
 
-        console.log(`🔁 Final Paystack amount: ${paystackAmount} ${currency}`);
+        // ============================================================
 
         const response = await fetch('https://api.paystack.co/transaction/initialize', {
             method: 'POST',
@@ -440,7 +391,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             body: JSON.stringify({
                 email: user.email,
                 amount: paystackAmount,
-                currency: currency,
+                currency: currencyUpper,
                 metadata: { idempotencyKey, tier, userId: user.id },
                 callback_url: `${FRONTEND_URL}/?success=true`
             })
@@ -455,7 +406,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             user_id: user.id,
             transaction_id: idempotencyKey,
             amount: paystackAmount,
-            currency,
+            currency: currencyUpper,
             status: 'pending',
             tier
         });
