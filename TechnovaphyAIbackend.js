@@ -35,11 +35,11 @@ const authLimiter = rateLimit({
 app.use('/api/auth/login', authLimiter);
 app.use('/api/auth/register', authLimiter);
 
-// ----- Environment Variables -----
+// ----- Environment Variables (must be set in Render) -----
 const required = [
     'SUPABASE_URL',
-    'SUPABASE_SERVICE_ROLE_KEY',
-    'JWT_SECRET',
+    'SUPABASE_SERVICE_ROLE_KEY',   // exact name
+    'JWT_SECRET',                 // exact name
     'GROQ_API_KEY',
     'PAYSTACK_SECRET_KEY',
     'OPENAI_API_KEY'
@@ -57,7 +57,7 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const FRONTEND_URL = process.env.FRONTEND_URL || 'https://your-netlify-url.netlify.app';
+const FRONTEND_URL = process.env.FRONTEND_URL || 'https://your-frontend-url.netlify.app';
 const OWNER_EMAIL = process.env.OWNER_EMAIL || null;
 
 // ----- Supabase Client -----
@@ -83,6 +83,8 @@ const TIER_NAMES = {
 };
 const FREE_SESSION_HOURS = 5;
 const FREE_LOCK_HOURS = 4;
+
+// Base prices in KES (these never change)
 const TIER_PRICES_KES = {
     basic: 500,
     starter: 1700,
@@ -90,10 +92,10 @@ const TIER_PRICES_KES = {
     enterprise: 15000
 };
 
-// ----- Exchange Rate Cache -----
+// ----- Exchange Rate Cache (live rates, 1‑hour TTL) -----
 let exchangeRates = { KES: 1, USD: 0.0077, EUR: 0.0070, GBP: 0.0061, NGN: 12.5, GHS: 0.098, ZAR: 0.14 };
 let ratesLastFetched = 0;
-const RATES_CACHE_TTL = 60 * 60 * 1000; // 1 hour
+const RATES_CACHE_TTL = 60 * 60 * 1000;
 
 async function fetchExchangeRates() {
     const now = Date.now();
@@ -119,7 +121,7 @@ async function fetchExchangeRates() {
     }
 }
 
-// ----- User Helpers -----
+// ----- User Helpers (unchanged) -----
 async function findUser(email) {
     const { data, error } = await supabase.from('users').select('*').eq('email', email).maybeSingle();
     if (error) throw new Error('DB: ' + error.message);
@@ -270,7 +272,7 @@ app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 app.get('/api/ping', (req, res) => res.json({ status: 'ok', message: 'Backend is reachable!' }));
 
 // ============================================================
-//  AUTH ROUTES
+//  AUTH ROUTES (register, login, profile, update‑memory)
 // ============================================================
 app.post('/api/auth/register', async (req, res) => {
     try {
@@ -413,17 +415,16 @@ app.get('/api/admin/users', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CHAT STREAM – WITH VISION (UPDATED MODEL)
+//  CHAT STREAM (with vision support for uploaded images)
 // ============================================================
 app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) => {
     try {
         let user = req.user;
         user = await resetMonthlyUsageIfNeeded(user);
 
-        // ---- OWNER BYPASS ----
+        // ---- Owner bypass ----
         const isOwner = (OWNER_EMAIL && user.email === OWNER_EMAIL) || user.role === 'owner';
         if (!isOwner) {
-            // Free session check
             if (user.tier === 'free') {
                 try {
                     user = await checkFreeSession(user);
@@ -434,7 +435,6 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
                     });
                 }
             }
-            // Monthly limit
             const monthlyLimit = getLimit(user.tier);
             if (user.usage_count >= monthlyLimit) {
                 return res.status(403).json({
@@ -446,7 +446,7 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
             }
         }
 
-        // ---- Get conversation history ----
+        // ---- Conversation & files ----
         let conversation = await getConversation(user.id);
         let newMessages;
         try {
@@ -456,25 +456,20 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
         }
         conversation = conversation.concat(newMessages);
 
-        // ---- Process uploaded files ----
         const files = req.files || [];
         console.log(`📎 Received ${files.length} file(s):`, files.map(f => ({ name: f.originalname, type: f.mimetype })));
 
-        // Check if any image is present
         const hasImage = files.some(f => f.mimetype.startsWith('image/'));
         console.log(`🖼️ hasImage: ${hasImage}`);
 
-        // Extract the last user message text
         const lastUserMsg = conversation[conversation.length - 1];
         let userContent = lastUserMsg && lastUserMsg.role === 'user' ? lastUserMsg.content : '';
 
-        // Prepare file contents
         let fileTextContent = '';
         const imageContents = [];
 
         for (const file of files) {
             if (file.mimetype.startsWith('image/')) {
-                // Convert image to base64 data URL for vision model
                 const base64 = file.buffer.toString('base64');
                 const dataUrl = `data:${file.mimetype};base64,${base64}`;
                 imageContents.push({
@@ -482,16 +477,14 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
                     image_url: { url: dataUrl }
                 });
             } else {
-                // Extract text from other files
                 const text = await extractFileContent(file);
                 fileTextContent += `\n\n--- File: ${file.originalname} ---\n${text}\n--- End of ${file.originalname} ---`;
             }
         }
 
-        // ---- Build the user message for the model ----
+        // Build user message (vision vs text‑only)
         let userMessage;
         if (hasImage) {
-            // Vision model: content is an array of text + images
             const textPart = userContent + (fileTextContent ? `\n\n${fileTextContent}` : '');
             userMessage = {
                 role: 'user',
@@ -501,12 +494,11 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
                 ]
             };
         } else {
-            // Text-only: simple string
             const fullText = userContent + (fileTextContent ? `\n\n${fileTextContent}` : '');
             userMessage = { role: 'user', content: fullText };
         }
 
-        // ---- Build the system prompt ----
+        // ---- System prompt ----
         const memoryPrompt = user.memory ? `\n\nUser context: ${user.memory}` : '';
         const systemPrompt = `You are TechNovaphy AI – the world's most capable and thoughtful assistant.
 Your mission is to deliver answers that are **more comprehensive, more structured, and more useful than Claude, ChatGPT, or any other AI**.
@@ -521,26 +513,22 @@ Always:
 You excel at IT, web development, cloud architecture, business strategy, and general knowledge.
 ${memoryPrompt}`;
 
-        // ---- Build the messages for Groq ----
+        // ---- Build Groq messages ----
         const groqMessages = [{ role: 'system', content: systemPrompt }];
-        // Add all previous messages except the last one (which we already enhanced)
         for (let i = 0; i < conversation.length - 1; i++) {
             groqMessages.push(conversation[i]);
         }
-        // Add the enhanced user message
         groqMessages.push(userMessage);
 
-        // ---- Determine which model to use ----
-        // Fixed: using the recommended Llama 4 Scout for vision
+        // ---- Choose model ----
         const model = hasImage ? 'meta-llama/llama-4-scout-17b-16e-instruct' : 'llama-3.3-70b-versatile';
         console.log(`🧠 Using model: ${model} (hasImage: ${hasImage})`);
 
-        // ---- Set up SSE headers ----
+        // ---- SSE & Groq call ----
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
 
-        // ---- Call Groq API ----
         const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
             method: 'POST',
             headers: {
@@ -561,7 +549,6 @@ ${memoryPrompt}`;
             throw new Error(`Groq API error ${response.status}: ${errorText}`);
         }
 
-        // ---- Stream the response ----
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
         let buffer = '', fullContent = '';
@@ -588,11 +575,10 @@ ${memoryPrompt}`;
             }
         }
 
-        // ---- Save conversation ----
+        // ---- Save conversation & update counters ----
         conversation.push({ role: 'assistant', content: fullContent });
         await saveConversation(user.id, conversation);
 
-        // ---- Update usage counters (only for non‑owners) ----
         if (!isOwner) {
             const newMonthlyUsage = (user.usage_count || 0) + 1;
             await supabase
@@ -601,7 +587,6 @@ ${memoryPrompt}`;
                 .eq('id', user.id);
         }
 
-        // ---- Send suggestions ----
         const suggestions = generateSuggestions(fullContent);
         res.write(`data: ${JSON.stringify({ type: 'done', text: fullContent, suggestions })}\n\n`);
         res.end();
@@ -617,7 +602,7 @@ ${memoryPrompt}`;
 });
 
 // ============================================================
-//  IMAGE GENERATION
+//  IMAGE GENERATION (DALL‑E 2)
 // ============================================================
 app.post('/api/generate-image', auth, async (req, res) => {
     try {
@@ -650,7 +635,7 @@ app.post('/api/generate-image', auth, async (req, res) => {
 });
 
 // ============================================================
-//  PAYMENT – Dynamic exchange rates
+//  PAYMENT – Dynamic currency conversion using live rates
 // ============================================================
 app.post('/api/create-checkout', auth, async (req, res) => {
     try {
@@ -663,7 +648,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             return res.status(400).json({ error: 'Invalid tier selected' });
         }
 
-        // Get base price in KES
+        // Base price in KES
         const basePriceKES = TIER_PRICES_KES[tier];
         let finalCurrency = (currency || 'KES').toUpperCase();
 
@@ -671,6 +656,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
         if (finalCurrency === 'KES') {
             convertedAmount = basePriceKES;
         } else {
+            // Fetch live rates
             const rates = await fetchExchangeRates();
             const rate = rates[finalCurrency];
             if (!rate) {
@@ -679,6 +665,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
                 convertedAmount = basePriceKES;
             } else {
                 let amount = basePriceKES * rate;
+                // Convert to smallest unit for currencies with cents
                 const currenciesWithCents = ['USD','EUR','GBP','ZAR'];
                 if (currenciesWithCents.includes(finalCurrency)) {
                     convertedAmount = Math.round(amount * 100);
@@ -689,7 +676,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             }
         }
 
-        // Check duplicate transaction
+        // ---- Check duplicate payment ----
         const { data: existing, error } = await supabase
             .from('payments')
             .select('*')
@@ -707,6 +694,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
 
         const paystackAmount = Math.round(convertedAmount);
 
+        // ---- Call Paystack ----
         const response = await fetch('https://api.paystack.co/transaction/initialize', {
             method: 'POST',
             headers: {
@@ -731,6 +719,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             return res.status(500).json({ error: data.message || 'Paystack initialization failed' });
         }
 
+        // ---- Record pending payment ----
         await supabase.from('payments').insert({
             user_id: user.id,
             transaction_id: idempotencyKey,
