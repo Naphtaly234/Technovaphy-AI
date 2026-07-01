@@ -573,7 +573,7 @@ app.post('/api/generate-image', auth, async (req, res) => {
 });
 
 // ============================================================
-//  PAYMENT – Paystack Checkout (with automatic conversion)
+//  PAYMENT – Paystack Checkout (with conversion)
 // ============================================================
 app.post('/api/create-checkout', auth, async (req, res) => {
     try {
@@ -585,8 +585,11 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             return res.status(400).json({ error: 'Invalid tier selected' });
         }
 
-        if (!amount || !currency) {
-            return res.status(400).json({ error: 'Amount and currency are required' });
+        if (amount === undefined || amount === null || isNaN(amount) || amount <= 0) {
+            return res.status(400).json({ error: 'Invalid amount' });
+        }
+        if (!currency) {
+            return res.status(400).json({ error: 'Currency is required' });
         }
 
         // Check for duplicate idempotency key
@@ -613,6 +616,8 @@ app.post('/api/create-checkout', auth, async (req, res) => {
         } else {
             paystackAmount = Math.round(paystackAmount);
         }
+        console.log(`🔁 Converting: ${amount} ${currency} → ${paystackAmount} for Paystack`);
+
         // --------------------------------------------------
 
         const response = await fetch('https://api.paystack.co/transaction/initialize', {
