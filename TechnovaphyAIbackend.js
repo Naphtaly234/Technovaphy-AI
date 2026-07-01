@@ -89,13 +89,22 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 // ============================================================
 //  CONSTANTS & HELPERS
 // ============================================================
-const TIER_LIMITS = { free: 200, starter: 550, pro: 2500, enterprise: Infinity };
+const TIER_LIMITS = {
+    free: 200,
+    basic: 200,      // same as free, but paid
+    starter: 550,
+    pro: 2500,
+    enterprise: Infinity
+};
+
 const TIER_NAMES = {
     free: 'Free (5 msgs/hour)',
-    starter: 'Starter ($17/mo) – 550 msg',
-    pro: 'Pro ($34/mo) – 2,500 msg',
-    enterprise: 'Enterprise ($120/mo) – Unlimited',
+    basic: 'Basic (200 msgs/month)',
+    starter: 'Starter (550 msgs/month)',
+    pro: 'Pro (2500 msgs/month)',
+    enterprise: 'Enterprise (Unlimited)',
 };
+
 const HOURLY_LIMIT_FREE = 5;
 
 // ---------- User Helpers ----------
@@ -174,7 +183,6 @@ async function getConversation(userId) {
 }
 
 async function saveConversation(userId, messages) {
-    // Upsert: insert or update
     const { error } = await supabase
         .from('conversations')
         .upsert({
@@ -315,7 +323,6 @@ app.post('/api/auth/register', async (req, res) => {
             .single();
 
         if (error) throw new Error('Database insert: ' + error.message);
-        // Create empty conversation entry for this user
         await supabase
             .from('conversations')
             .insert({ user_id: data.id, messages: [] });
@@ -423,14 +430,12 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
 
         let newMessages;
         try {
-            newMessages = JSON.parse(req.body.messages); // array of {role, content}
+            newMessages = JSON.parse(req.body.messages);
         } catch (e) {
             return res.status(400).json({ error: 'Invalid messages format' });
         }
 
-        // Load existing conversation history
         let conversation = await getConversation(user.id);
-        // Append new messages
         conversation = conversation.concat(newMessages);
 
         const files = req.files || [];
@@ -509,13 +514,9 @@ ${memoryPrompt}`;
             }
         }
 
-        // Append assistant reply to conversation
         conversation.push({ role: 'assistant', content: fullContent });
-
-        // Save updated conversation to database
         await saveConversation(user.id, conversation);
 
-        // Update usage counters
         const newMonthlyUsage = (user.usage_count || 0) + 1;
         const newHourlyUsage = (user.hourly_quota_used || 0) + 1;
         await supabase
@@ -542,7 +543,7 @@ ${memoryPrompt}`;
 });
 
 // ============================================================
-//  IMAGE GENERATION (OpenAI DALL‑E) – REQUIRED
+//  IMAGE GENERATION (OpenAI DALL‑E)
 // ============================================================
 app.post('/api/generate-image', auth, async (req, res) => {
     try {
@@ -575,17 +576,24 @@ app.post('/api/generate-image', auth, async (req, res) => {
 });
 
 // ============================================================
-//  PAYMENT – Paystack Checkout (REQUIRED)
+//  PAYMENT – Paystack Checkout (NOW SUPPORTS CURRENCY)
 // ============================================================
 app.post('/api/create-checkout', auth, async (req, res) => {
     try {
-        const { idempotencyKey, tier } = req.body;
+        const { idempotencyKey, tier, currency, amount } = req.body;
         const user = req.user;
 
-        if (!tier || !['starter', 'pro', 'enterprise'].includes(tier)) {
+        // Validate tier (including 'basic')
+        if (!tier || !['basic', 'starter', 'pro', 'enterprise'].includes(tier)) {
             return res.status(400).json({ error: 'Invalid tier selected' });
         }
 
+        // Validate amount and currency
+        if (!amount || !currency) {
+            return res.status(400).json({ error: 'Amount and currency are required' });
+        }
+
+        // Check for duplicate idempotency key
         const { data: existing, error } = await supabase
             .from('payments')
             .select('*')
@@ -601,11 +609,9 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             return res.status(503).json({ error: 'Payment service not configured' });
         }
 
-        const tierPrices = {
-            starter: 1700,
-            pro: 3400,
-            enterprise: 12000,
-        };
+        // Paystack expects amount in the smallest currency unit (e.g., cents for USD)
+        // The frontend sends the amount already converted to that unit.
+        const paystackAmount = Math.round(amount); // already in smallest unit
 
         const response = await fetch('https://api.paystack.co/transaction/initialize', {
             method: 'POST',
@@ -615,8 +621,8 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             },
             body: JSON.stringify({
                 email: user.email,
-                amount: tierPrices[tier],
-                currency: 'USD',
+                amount: paystackAmount,
+                currency: currency,          // e.g., 'USD', 'KES', 'EUR', etc.
                 metadata: {
                     idempotencyKey: idempotencyKey,
                     tier: tier,
@@ -631,12 +637,14 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             return res.status(500).json({ error: data.message || 'Paystack initialization failed' });
         }
 
+        // Record the pending payment
         await supabase.from('payments').insert({
             user_id: user.id,
             transaction_id: idempotencyKey,
-            amount: tierPrices[tier],
-            currency: 'USD',
+            amount: paystackAmount,
+            currency: currency,
             status: 'pending',
+            tier: tier,
         });
 
         res.json({ url: data.data.authorization_url });
