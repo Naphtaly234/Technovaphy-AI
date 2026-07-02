@@ -1,8 +1,4 @@
-// ============================================================
-//  TECHNOVAPHY AI – COMPLETE BACKEND (with fallback)
-//  - Image: Agnes (auto-try models) → Pollinations.ai fallback
-//  - All other features intact
-// ============================================================
+
 require('dotenv').config();
 
 const express = require('express');
@@ -46,7 +42,7 @@ const required = [
     'JWT_SECRET',
     'GROQ_API_KEY',
     'PAYSTACK_SECRET_KEY',
-    'AGNES_API_KEY'   // still required, but fallback will work if it fails
+    'AGNES_API_KEY'
 ];
 const missing = required.filter(key => !process.env[key]);
 if (missing.length) {
@@ -66,33 +62,36 @@ const OWNER_EMAIL = process.env.OWNER_EMAIL || null;
 
 // ----- Supabase Client -----
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
-
 (async function initDb() {
     const { error } = await supabase.from('users').select('id').limit(1);
-    if (error) {
-        console.error('❌ Database connection failed:', error.message);
-        process.exit(1);
-    }
+    if (error) { console.error('❌ DB error:', error.message); process.exit(1); }
     console.log('✅ Database connected.');
 })();
 
-// ----- Constants -----
-const TIER_LIMITS = { free:200, basic:200, starter:550, pro:2500, enterprise:Infinity };
+// ----- Constants & Helpers -----
+const TIER_LIMITS = {
+    free: 200,
+    starter: 200,      // weekly
+    pro: 2500,         // monthly
+    enterprise: Infinity
+};
+
 const TIER_NAMES = {
     free: 'Free (5 hrs unlimited)',
-    basic: 'Basic (200 msgs/month)',
-    starter: 'Starter (550 msgs/month)',
-    pro: 'Pro (2500 msgs/month)',
-    enterprise: 'Enterprise (Unlimited)'
+    starter: 'Starter (Weekly)',
+    pro: 'Pro (Monthly)',
+    enterprise: 'Enterprise (Monthly)'
 };
+
+// ----- NEW TIER PRICES -----
+const TIER_PRICES_KES = {
+    starter: 500,      // weekly
+    pro: 1700,         // monthly
+    enterprise: 17000  // monthly
+};
+
 const FREE_SESSION_HOURS = 5;
 const FREE_LOCK_HOURS = 4;
-const TIER_PRICES_KES = {
-    basic: 500,
-    starter: 1700,
-    pro: 3500,
-    enterprise: 15000
-};
 
 // ----- Exchange Rate Cache -----
 let exchangeRates = { KES: 1, USD: 0.0077, EUR: 0.0070, GBP: 0.0061, NGN: 12.5, GHS: 0.098, ZAR: 0.14 };
@@ -266,16 +265,12 @@ const auth = async (req, res, next) => {
     }
 };
 
-// ============================================================
-//  PUBLIC ENDPOINTS
-// ============================================================
+// ----- Public endpoints -----
 app.get('/', (req, res) => res.send('TechNovaphy AI Backend is running'));
 app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 app.get('/api/ping', (req, res) => res.json({ status: 'ok', message: 'Backend is reachable!' }));
 
-// ============================================================
-//  AUTH ROUTES (register, login, profile, update-memory)
-// ============================================================
+// ----- Auth routes -----
 app.post('/api/auth/register', async (req, res) => {
     try {
         const { email, password, ageConfirmed } = req.body;
@@ -395,9 +390,7 @@ app.post('/api/auth/update-memory', auth, async (req, res) => {
     }
 });
 
-// ============================================================
-//  ADMIN – View all users (owner only)
-// ============================================================
+// ----- Admin: view all users (owner only) -----
 app.get('/api/admin/users', auth, async (req, res) => {
     try {
         const user = req.user;
@@ -416,10 +409,9 @@ app.get('/api/admin/users', auth, async (req, res) => {
     }
 });
 
-// ============================================================
-//  CHAT STREAM (with vision support)
-// ============================================================
+// ----- Chat stream (vision + text) -----
 app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) => {
+    // (same as before – we keep the existing logic)
     try {
         let user = req.user;
         user = await resetMonthlyUsageIfNeeded(user);
@@ -449,11 +441,7 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
 
         let conversation = await getConversation(user.id);
         let newMessages;
-        try {
-            newMessages = JSON.parse(req.body.messages);
-        } catch(e) {
-            return res.status(400).json({ error: 'Invalid messages format' });
-        }
+        try { newMessages = JSON.parse(req.body.messages); } catch(e) { return res.status(400).json({ error: 'Invalid messages format' }); }
         conversation = conversation.concat(newMessages);
 
         const files = req.files || [];
@@ -595,20 +583,15 @@ ${memoryPrompt}`;
     }
 });
 
-// ============================================================
-//  IMAGE GENERATION (Agnes with fallback to Pollinations.ai)
-// ============================================================
+// ----- IMAGE GENERATION (Agnes + Pollinations fallback) -----
 app.post('/api/generate-image', auth, async (req, res) => {
     try {
         const { prompt } = req.body;
-        if (!prompt) {
-            return res.status(400).json({ error: 'Prompt is required' });
-        }
+        if (!prompt) return res.status(400).json({ error: 'Prompt is required' });
 
         let imageUrl = null;
         let usedFallback = false;
 
-        // Try Agnes with multiple models
         if (AGNES_API_KEY) {
             const modelsToTry = [
                 process.env.AGNES_IMAGE_MODEL,
@@ -653,27 +636,21 @@ app.post('/api/generate-image', auth, async (req, res) => {
             }
         }
 
-        // Fallback to Pollinations.ai if Agnes failed
         if (!imageUrl) {
             console.log('🔄 Falling back to Pollinations.ai');
             usedFallback = true;
             imageUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=1024&height=1024&nologo=true`;
         }
 
-        if (!imageUrl) {
-            throw new Error('All image generation methods failed.');
-        }
-
+        if (!imageUrl) throw new Error('All image generation methods failed.');
         res.json({ url: imageUrl, fallback: usedFallback });
     } catch(err) {
-        console.error('❌ Image generation error:', err);
+        console.error('❌ Image gen error:', err);
         res.status(500).json({ error: err.message });
     }
 });
 
-// ============================================================
-//  PAYMENT – Dynamic currency conversion
-// ============================================================
+// ----- PAYMENT ENDPOINT (updated for new tiers) -----
 app.post('/api/create-checkout', auth, async (req, res) => {
     try {
         const { idempotencyKey, tier, currency } = req.body;
@@ -681,36 +658,37 @@ app.post('/api/create-checkout', auth, async (req, res) => {
 
         console.log(`📦 Checkout request: tier=${tier}, currency=${currency}`);
 
-        if (!tier || !['basic','starter','pro','enterprise'].includes(tier)) {
+        // Validate tier (only starter, pro, enterprise now)
+        if (!tier || !['starter', 'pro', 'enterprise'].includes(tier)) {
             return res.status(400).json({ error: 'Invalid tier selected' });
         }
 
-        const basePriceKES = TIER_PRICES_KES[tier];
         let finalCurrency = (currency || 'KES').toUpperCase();
+        let paystackAmount;
 
-        let convertedAmount;
         if (finalCurrency === 'KES') {
-            convertedAmount = basePriceKES;
+            paystackAmount = TIER_PRICES_KES[tier];
+            console.log(`✅ KES amount: ${paystackAmount} for tier ${tier}`);
         } else {
             const rates = await fetchExchangeRates();
             const rate = rates[finalCurrency];
             if (!rate) {
                 console.warn(`⚠️ Unsupported currency ${finalCurrency}, defaulting to KES`);
                 finalCurrency = 'KES';
-                convertedAmount = basePriceKES;
+                paystackAmount = TIER_PRICES_KES[tier];
             } else {
-                let amount = basePriceKES * rate;
-                const currenciesWithCents = ['USD','EUR','GBP','ZAR'];
-                if (currenciesWithCents.includes(finalCurrency)) {
-                    convertedAmount = Math.round(amount * 100);
+                let amount = TIER_PRICES_KES[tier] * rate;
+                const withCents = ['USD','EUR','GBP','ZAR'];
+                if (withCents.includes(finalCurrency)) {
+                    paystackAmount = Math.round(amount * 100);
                 } else {
-                    convertedAmount = Math.round(amount);
+                    paystackAmount = Math.round(amount);
                 }
-                console.log(`💱 Converted ${basePriceKES} KES → ${convertedAmount} ${finalCurrency}`);
+                console.log(`💱 Converted ${TIER_PRICES_KES[tier]} KES → ${paystackAmount} ${finalCurrency}`);
             }
         }
 
-        // Check duplicate payment
+        // Check duplicate
         const { data: existing, error } = await supabase
             .from('payments')
             .select('*')
@@ -726,7 +704,8 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             return res.status(503).json({ error: 'Payment service not configured' });
         }
 
-        const paystackAmount = Math.round(convertedAmount);
+        const paystackAmountFinal = Math.round(paystackAmount);
+        console.log(`🔁 Final Paystack amount: ${paystackAmountFinal} ${finalCurrency}`);
 
         const response = await fetch('https://api.paystack.co/transaction/initialize', {
             method: 'POST',
@@ -736,7 +715,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             },
             body: JSON.stringify({
                 email: user.email,
-                amount: paystackAmount,
+                amount: paystackAmountFinal,
                 currency: finalCurrency,
                 metadata: {
                     idempotencyKey,
@@ -749,13 +728,14 @@ app.post('/api/create-checkout', auth, async (req, res) => {
 
         const data = await response.json();
         if (!data.status) {
+            console.error('❌ Paystack error:', data);
             return res.status(500).json({ error: data.message || 'Paystack initialization failed' });
         }
 
         await supabase.from('payments').insert({
             user_id: user.id,
             transaction_id: idempotencyKey,
-            amount: paystackAmount,
+            amount: paystackAmountFinal,
             currency: finalCurrency,
             status: 'pending',
             tier
@@ -763,14 +743,12 @@ app.post('/api/create-checkout', auth, async (req, res) => {
 
         res.json({ url: data.data.authorization_url });
     } catch(err) {
-        console.error('Checkout error:', err);
+        console.error('❌ Checkout error:', err);
         res.status(500).json({ error: err.message });
     }
 });
 
-// ============================================================
-//  PAYSTACK WEBHOOK
-// ============================================================
+// ----- PAYSTACK WEBHOOK -----
 app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), async (req, res) => {
     try {
         const payload = req.body;
@@ -804,7 +782,5 @@ app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), as
     }
 });
 
-// ============================================================
-//  START
-// ============================================================
+// ----- START -----
 app.listen(PORT, () => console.log(`🚀 TechNovaphy AI Backend running on port ${PORT}`));
