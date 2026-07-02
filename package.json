@@ -18,6 +18,9 @@
     "mime-types": "^2.1.35",
     "helmet": "^7.0.0",
     "express-rate-limit": "^7.1.5",
-    "morgan": "^1.10.0"
+    "morgan": "^1.10.0",
+    "rate-limit-redis": "^4.0.0",
+    "ioredis": "^5.3.2",
+    "bullmq": "^5.0.0"
   }
 }
