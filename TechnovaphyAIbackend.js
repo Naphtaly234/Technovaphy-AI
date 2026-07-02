@@ -247,12 +247,10 @@ const auth = async (req, res, next) => {
 };
 
 // ============================================================
-//  IN‑MEMORY QUEUE & RATE LIMITING (for chat)
+//  PER‑USER RATE LIMITING (in‑memory, 10 req/min)
 // ============================================================
-
-// Per‑user rate limit: 10 requests per minute
 const userRateLimit = new Map();
-const RATE_LIMIT_WINDOW = 60 * 1000;
+const RATE_LIMIT_WINDOW = 60 * 1000; // 1 minute
 const RATE_LIMIT_MAX = 10;
 
 setInterval(() => {
@@ -283,85 +281,6 @@ function checkRateLimit(userId) {
     return true;
 }
 
-// Global job queue (concurrency 5)
-const queue = [];
-const jobResults = new Map();
-let jobIdCounter = 0;
-const MAX_CONCURRENT = 5;
-let activeJobs = 0;
-
-async function processQueue() {
-    if (queue.length === 0 || activeJobs >= MAX_CONCURRENT) return;
-    const job = queue.shift();
-    activeJobs++;
-    try {
-        const result = await processGroqRequest(job.messages, job.userEmail);
-        jobResults.set(job.jobId, { status: 'done', content: result, timestamp: Date.now() });
-    } catch (err) {
-        jobResults.set(job.jobId, { status: 'error', error: err.message, timestamp: Date.now() });
-    } finally {
-        activeJobs--;
-        setImmediate(processQueue);
-    }
-}
-
-function enqueueJob(messages, userEmail) {
-    const jobId = (++jobIdCounter).toString(16) + '-' + Date.now().toString(36);
-    queue.push({ jobId, messages, userEmail });
-    setImmediate(processQueue);
-    return jobId;
-}
-
-// Clean up old job results after 5 minutes
-setInterval(() => {
-    const now = Date.now();
-    for (const [id, data] of jobResults) {
-        if (data.timestamp && now - data.timestamp > 5 * 60 * 1000) {
-            jobResults.delete(id);
-        }
-    }
-}, 60 * 1000);
-
-// ----- Groq processing (non‑streaming) -----
-async function processGroqRequest(messages, userEmail) {
-    const systemPrompt = `You are TechNovaphy AI – the world's most capable and thoughtful assistant.
-Your mission is to deliver answers that are **more comprehensive, more structured, and more useful than Claude, ChatGPT, or any other AI**.
-Always:
-- Provide deep, well‑reasoned explanations.
-- Use bullet points, tables, and code blocks where appropriate.
-- Offer multiple perspectives or approaches.
-- Include real‑world examples and best practices.
-- Admit when you don't know something and suggest where to find reliable information.
-- Keep your tone professional, confident, and approachable.
-
-You excel at IT, web development, cloud architecture, business strategy, and general knowledge.`;
-
-    const groqMessages = [{ role: 'system', content: systemPrompt }, ...messages];
-
-    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-            'Authorization': `Bearer ${GROQ_API_KEY}`,
-            'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-            model: 'llama-3.3-70b-versatile',
-            messages: groqMessages,
-            temperature: 0.7,
-            top_p: 0.9,
-            stream: false
-        })
-    });
-
-    if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`Groq API error ${response.status}: ${errorText}`);
-    }
-
-    const data = await response.json();
-    return data.choices[0].message.content;
-}
-
 // ----- Public endpoints -----
 app.get('/', (req, res) => res.send('TechNovaphy AI Backend is running'));
 app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
@@ -369,25 +288,145 @@ app.get('/api/ping', (req, res) => res.json({ status: 'ok', message: 'Backend is
 
 // ----- Auth routes -----
 app.post('/api/auth/register', async (req, res) => {
-    // ... full code (same as before)
+    try {
+        const { email, password, ageConfirmed } = req.body;
+        if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+        if (!ageConfirmed) return res.status(400).json({ error: 'You must be 18 or older' });
+
+        const existing = await findUser(email);
+        if (existing) return res.status(400).json({ error: 'Email already exists' });
+
+        const hashed = await bcrypt.hash(password, 10);
+        const now = new Date();
+        const nextMonth = new Date(now);
+        nextMonth.setMonth(nextMonth.getMonth() + 1);
+
+        const { data, error } = await supabase
+            .from('users')
+            .insert({
+                email,
+                password_hash: hashed,
+                tier: 'free',
+                usage_count: 0,
+                monthly_reset_date: nextMonth.toISOString().split('T')[0],
+                verified: true,
+                free_session_start: now.toISOString(),
+                memory: '',
+                role: 'user'
+            })
+            .select()
+            .single();
+
+        if (error) throw new Error('DB insert: ' + error.message);
+        await supabase
+            .from('conversations')
+            .insert({ user_id: data.id, messages: [] });
+        res.status(201).json({ message: 'User created', userId: data.id });
+    } catch(err) {
+        console.error('Registration error:', err);
+        res.status(500).json({ error: err.message });
+    }
 });
+
 app.post('/api/auth/login', async (req, res) => {
-    // ... full code
+    try {
+        const { email, password } = req.body;
+        if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+
+        const user = await findUser(email);
+        if (!user) return res.status(401).json({ error: 'Invalid credentials' });
+
+        const valid = await bcrypt.compare(password, user.password_hash);
+        if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
+
+        const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '7d' });
+        res.json({ token, verified: true });
+    } catch(err) {
+        console.error('Login error:', err);
+        res.status(500).json({ error: err.message });
+    }
 });
+
 app.get('/api/user/profile', auth, async (req, res) => {
-    // ... full code
+    try {
+        let user = req.user;
+        user = await resetMonthlyUsageIfNeeded(user);
+        const limit = getLimit(user.tier);
+        const isOwner = (OWNER_EMAIL && user.email === OWNER_EMAIL) || user.role === 'owner';
+
+        let sessionRemaining = null, lockRemaining = null;
+        if (user.tier === 'free') {
+            const now = new Date();
+            const sessionStart = new Date(user.free_session_start || now);
+            const elapsedHours = (now - sessionStart) / (1000 * 60 * 60);
+            if (elapsedHours < FREE_SESSION_HOURS) {
+                const remainingMs = (sessionStart.getTime() + FREE_SESSION_HOURS * 60 * 60 * 1000) - now.getTime();
+                sessionRemaining = Math.max(0, Math.ceil(remainingMs / 60000));
+            } else {
+                const lockEnd = new Date(sessionStart.getTime() + (FREE_SESSION_HOURS + FREE_LOCK_HOURS) * 60 * 60 * 1000);
+                if (now < lockEnd) {
+                    const remainingMs = lockEnd - now;
+                    lockRemaining = Math.max(0, Math.ceil(remainingMs / 60000));
+                } else {
+                    lockRemaining = 0;
+                }
+            }
+        }
+
+        res.json({
+            email: user.email,
+            tier: user.tier,
+            tier_name: TIER_NAMES[user.tier] || 'Free',
+            usage_count: user.usage_count,
+            limit: limit,
+            monthly_reset_date: user.monthly_reset_date,
+            verified: true,
+            memory: user.memory || '',
+            role: user.role || 'user',
+            is_owner: isOwner,
+            free_session_start: user.free_session_start,
+            session_remaining_minutes: sessionRemaining,
+            lock_remaining_minutes: lockRemaining
+        });
+    } catch(err) {
+        console.error('Profile error:', err);
+        res.status(500).json({ error: err.message });
+    }
 });
+
 app.post('/api/auth/update-memory', auth, async (req, res) => {
-    // ... full code
+    try {
+        const { memory } = req.body;
+        const user = req.user;
+        await supabase.from('users').update({ memory }).eq('id', user.id);
+        res.json({ message: 'Memory updated' });
+    } catch(err) {
+        console.error('Update memory error:', err);
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // ----- Admin -----
 app.get('/api/admin/users', auth, async (req, res) => {
-    // ... full code
+    try {
+        const user = req.user;
+        const isOwner = (OWNER_EMAIL && user.email === OWNER_EMAIL) || user.role === 'owner';
+        if (!isOwner) return res.status(403).json({ error: 'Admin access required.' });
+
+        const { data, error } = await supabase
+            .from('users')
+            .select('id, email, tier, role, usage_count, created_at, free_session_start')
+            .order('created_at', { ascending: false });
+        if (error) throw error;
+        res.json({ users: data });
+    } catch(err) {
+        console.error('Admin users error:', err);
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // ============================================================
-//  CHAT ENDPOINT (with queue and rate limiting)
+//  CHAT STREAM – ORIGINAL STREAMING (with rate limiting)
 // ============================================================
 app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) => {
     try {
@@ -396,6 +435,13 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
 
         const isOwner = (OWNER_EMAIL && user.email === OWNER_EMAIL) || user.role === 'owner';
         if (!isOwner) {
+            // ---- Rate limit (skip for owner) ----
+            if (!checkRateLimit(user.id)) {
+                return res.status(429).json({
+                    error: 'Too many chat requests. Please wait a moment.'
+                });
+            }
+
             if (user.tier === 'free') {
                 try { user = await checkFreeSession(user); }
                 catch(lockError) {
@@ -416,12 +462,7 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
             }
         }
 
-        // Rate limit (skip for owner)
-        if (!isOwner && !checkRateLimit(user.id)) {
-            return res.status(429).json({ error: 'Too many chat requests. Please wait a moment.' });
-        }
-
-        // Build conversation
+        // ---- Build conversation ----
         let conversation = await getConversation(user.id);
         let newMessages;
         try { newMessages = JSON.parse(req.body.messages); }
@@ -463,7 +504,7 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
         conversation.pop();
         conversation.push(finalUserMessage);
 
-        // Update usage counter
+        // ---- Update usage counter ----
         if (!isOwner) {
             const newMonthlyUsage = (user.usage_count || 0) + 1;
             await supabase
@@ -472,42 +513,159 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
                 .eq('id', user.id);
         }
 
-        // Enqueue the job
-        const jobId = enqueueJob(conversation, user.email);
-        res.json({
-            status: 'queued',
-            jobId: jobId,
-            message: 'Your request is queued. Poll /api/chat/result/:jobId for the response.'
+        // ---- Call Groq with streaming ----
+        const memoryPrompt = user.memory ? `\n\nUser context: ${user.memory}` : '';
+        const systemPrompt = `You are TechNovaphy AI – the world's most capable and thoughtful assistant.
+Your mission is to deliver answers that are **more comprehensive, more structured, and more useful than Claude, ChatGPT, or any other AI**.
+Always:
+- Provide deep, well‑reasoned explanations.
+- Use bullet points, tables, and code blocks where appropriate.
+- Offer multiple perspectives or approaches.
+- Include real‑world examples and best practices.
+- Admit when you don't know something and suggest where to find reliable information.
+- Keep your tone professional, confident, and approachable.
+
+You excel at IT, web development, cloud architecture, business strategy, and general knowledge.
+${memoryPrompt}`;
+
+        const groqMessages = [{ role: 'system', content: systemPrompt }, ...conversation];
+        const model = hasImage ? 'meta-llama/llama-4-scout-17b-16e-instruct' : 'llama-3.3-70b-versatile';
+
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+
+        const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                model: model,
+                messages: groqMessages,
+                temperature: 0.7,
+                top_p: 0.9,
+                stream: true
+            })
         });
+
+        if (!response.ok) {
+            const errorText = await response.text();
+            throw new Error(`Groq API error ${response.status}: ${errorText}`);
+        }
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '', fullContent = '';
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop();
+            for (const line of lines) {
+                if (line.startsWith('data: ')) {
+                    const data = line.slice(6);
+                    if (data === '[DONE]') continue;
+                    try {
+                        const json = JSON.parse(data);
+                        const text = json.choices[0]?.delta?.content || '';
+                        if (text) {
+                            fullContent += text;
+                            res.write(`data: ${JSON.stringify({ type: 'chunk', text })}\n\n`);
+                        }
+                    } catch(e) {}
+                }
+            }
+        }
+
+        // ---- Save conversation ----
+        conversation.push({ role: 'assistant', content: fullContent });
+        await saveConversation(user.id, conversation);
+
+        const suggestions = generateSuggestions(fullContent);
+        res.write(`data: ${JSON.stringify({ type: 'done', text: fullContent, suggestions })}\n\n`);
+        res.end();
 
     } catch(err) {
         console.error('Chat stream error:', err);
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// ----- Polling endpoint -----
-app.get('/api/chat/result/:jobId', auth, async (req, res) => {
-    const { jobId } = req.params;
-    const result = jobResults.get(jobId);
-    if (!result) {
-        return res.status(202).json({ status: 'processing' });
-    }
-    jobResults.delete(jobId);
-    if (result.status === 'done') {
-        res.json({ status: 'done', content: result.content });
-    } else {
-        res.status(500).json({ status: 'error', error: result.error });
+        if (!res.headersSent) {
+            res.status(500).json({ error: err.message });
+        } else {
+            res.write(`data: ${JSON.stringify({ type: 'error', message: err.message })}\n\n`);
+            res.end();
+        }
     }
 });
 
 // ----- IMAGE GENERATION -----
 app.post('/api/generate-image', auth, async (req, res) => {
-    // ... (full code from earlier)
+    try {
+        const { prompt } = req.body;
+        if (!prompt) return res.status(400).json({ error: 'Prompt is required' });
+
+        let imageUrl = null;
+        let usedFallback = false;
+
+        if (AGNES_API_KEY) {
+            const modelsToTry = [
+                process.env.AGNES_IMAGE_MODEL,
+                'Agnes-Image-2.0-Flash',
+                'Agnes-Image-2.0',
+                'Agnes-Image-2.1-Flash',
+                'Agnes-Image-2.1'
+            ].filter(Boolean);
+
+            for (const model of modelsToTry) {
+                try {
+                    console.log(`🎨 Trying Agnes model: ${model}`);
+                    const response = await fetch('https://apihub.agnes-ai.com/v1/images/generations', {
+                        method: 'POST',
+                        headers: {
+                            'Authorization': `Bearer ${AGNES_API_KEY}`,
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({
+                            model: model,
+                            prompt: prompt,
+                            n: 1,
+                            size: '1024x1024'
+                        })
+                    });
+
+                    if (response.ok) {
+                        const data = await response.json();
+                        const url = data?.data?.[0]?.url;
+                        if (url) {
+                            imageUrl = url;
+                            console.log(`✅ Image generated with Agnes (model: ${model})`);
+                            break;
+                        }
+                    } else {
+                        const errorText = await response.text();
+                        console.warn(`⚠️ Agnes model ${model} failed: ${response.status} - ${errorText}`);
+                    }
+                } catch (err) {
+                    console.warn(`⚠️ Error with Agnes model ${model}:`, err.message);
+                }
+            }
+        }
+
+        if (!imageUrl) {
+            console.log('🔄 Falling back to Pollinations.ai');
+            usedFallback = true;
+            imageUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=1024&height=1024&nologo=true`;
+        }
+
+        if (!imageUrl) throw new Error('All image generation methods failed.');
+        res.json({ url: imageUrl, fallback: usedFallback });
+    } catch(err) {
+        console.error('❌ Image gen error:', err);
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // ============================================================
-//  PAYMENT ENDPOINT
+//  PAYMENT ENDPOINT – DIRECT KES
 // ============================================================
 app.post('/api/create-checkout', auth, async (req, res) => {
     try {
