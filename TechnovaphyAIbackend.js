@@ -83,7 +83,7 @@ const TIER_NAMES = {
     enterprise: 'Enterprise (Monthly)'
 };
 
-// ----- NEW TIER PRICES -----
+// ----- KES PRICES (hardcoded) -----
 const TIER_PRICES_KES = {
     starter: 500,      // weekly
     pro: 1700,         // monthly
@@ -92,35 +92,6 @@ const TIER_PRICES_KES = {
 
 const FREE_SESSION_HOURS = 5;
 const FREE_LOCK_HOURS = 4;
-
-// ----- Exchange Rate Cache -----
-let exchangeRates = { KES: 1, USD: 0.0077, EUR: 0.0070, GBP: 0.0061, NGN: 12.5, GHS: 0.098, ZAR: 0.14 };
-let ratesLastFetched = 0;
-const RATES_CACHE_TTL = 60 * 60 * 1000;
-
-async function fetchExchangeRates() {
-    const now = Date.now();
-    if (now - ratesLastFetched < RATES_CACHE_TTL) return exchangeRates;
-    try {
-        const response = await fetch('https://api.exchangerate-api.com/v4/latest/KES');
-        if (!response.ok) throw new Error('Exchange rate API error');
-        const data = await response.json();
-        const rates = data.rates;
-        rates.KES = 1;
-        const supported = ['KES','USD','EUR','GBP','NGN','GHS','ZAR'];
-        const filtered = {};
-        for (const key of supported) {
-            filtered[key] = rates[key] || exchangeRates[key] || 1;
-        }
-        exchangeRates = filtered;
-        ratesLastFetched = now;
-        console.log('✅ Exchange rates updated:', exchangeRates);
-        return exchangeRates;
-    } catch (err) {
-        console.warn('⚠️ Failed to fetch exchange rates, using cached/fallback:', err.message);
-        return exchangeRates;
-    }
-}
 
 // ----- User Helpers -----
 async function findUser(email) {
@@ -390,7 +361,7 @@ app.post('/api/auth/update-memory', auth, async (req, res) => {
     }
 });
 
-// ----- Admin: view all users (owner only) -----
+// ----- Admin: view all users -----
 app.get('/api/admin/users', auth, async (req, res) => {
     try {
         const user = req.user;
@@ -411,7 +382,6 @@ app.get('/api/admin/users', auth, async (req, res) => {
 
 // ----- Chat stream (vision + text) -----
 app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) => {
-    // (same as before – we keep the existing logic)
     try {
         let user = req.user;
         user = await resetMonthlyUsageIfNeeded(user);
@@ -419,9 +389,8 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
         const isOwner = (OWNER_EMAIL && user.email === OWNER_EMAIL) || user.role === 'owner';
         if (!isOwner) {
             if (user.tier === 'free') {
-                try {
-                    user = await checkFreeSession(user);
-                } catch(lockError) {
+                try { user = await checkFreeSession(user); }
+                catch(lockError) {
                     return res.status(429).json({
                         error: lockError.message,
                         lock_remaining_minutes: lockError.minutesLeft || null
@@ -441,7 +410,8 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
 
         let conversation = await getConversation(user.id);
         let newMessages;
-        try { newMessages = JSON.parse(req.body.messages); } catch(e) { return res.status(400).json({ error: 'Invalid messages format' }); }
+        try { newMessages = JSON.parse(req.body.messages); }
+        catch(e) { return res.status(400).json({ error: 'Invalid messages format' }); }
         conversation = conversation.concat(newMessages);
 
         const files = req.files || [];
@@ -460,10 +430,7 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
             if (file.mimetype.startsWith('image/')) {
                 const base64 = file.buffer.toString('base64');
                 const dataUrl = `data:${file.mimetype};base64,${base64}`;
-                imageContents.push({
-                    type: 'image_url',
-                    image_url: { url: dataUrl }
-                });
+                imageContents.push({ type: 'image_url', image_url: { url: dataUrl } });
             } else {
                 const text = await extractFileContent(file);
                 fileTextContent += `\n\n--- File: ${file.originalname} ---\n${text}\n--- End of ${file.originalname} ---`;
@@ -514,10 +481,7 @@ ${memoryPrompt}`;
 
         const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
             method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${GROQ_API_KEY}`,
-                'Content-Type': 'application/json'
-            },
+            headers: { 'Authorization': `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 model: model,
                 messages: groqMessages,
@@ -650,7 +614,7 @@ app.post('/api/generate-image', auth, async (req, res) => {
     }
 });
 
-// ----- PAYMENT ENDPOINT (updated for new tiers) -----
+// ----- PAYMENT ENDPOINT (FORCED KES) -----
 app.post('/api/create-checkout', auth, async (req, res) => {
     try {
         const { idempotencyKey, tier, currency } = req.body;
@@ -658,35 +622,17 @@ app.post('/api/create-checkout', auth, async (req, res) => {
 
         console.log(`📦 Checkout request: tier=${tier}, currency=${currency}`);
 
-        // Validate tier (only starter, pro, enterprise now)
+        // Validate tier
         if (!tier || !['starter', 'pro', 'enterprise'].includes(tier)) {
             return res.status(400).json({ error: 'Invalid tier selected' });
         }
 
-        let finalCurrency = (currency || 'KES').toUpperCase();
-        let paystackAmount;
+        // ---- FORCE KES ----
+        // Always use KES – this is the only currency your Paystack account supports
+        const finalCurrency = 'KES';
+        const paystackAmount = TIER_PRICES_KES[tier]; // 500, 1700, 17000
 
-        if (finalCurrency === 'KES') {
-            paystackAmount = TIER_PRICES_KES[tier];
-            console.log(`✅ KES amount: ${paystackAmount} for tier ${tier}`);
-        } else {
-            const rates = await fetchExchangeRates();
-            const rate = rates[finalCurrency];
-            if (!rate) {
-                console.warn(`⚠️ Unsupported currency ${finalCurrency}, defaulting to KES`);
-                finalCurrency = 'KES';
-                paystackAmount = TIER_PRICES_KES[tier];
-            } else {
-                let amount = TIER_PRICES_KES[tier] * rate;
-                const withCents = ['USD','EUR','GBP','ZAR'];
-                if (withCents.includes(finalCurrency)) {
-                    paystackAmount = Math.round(amount * 100);
-                } else {
-                    paystackAmount = Math.round(amount);
-                }
-                console.log(`💱 Converted ${TIER_PRICES_KES[tier]} KES → ${paystackAmount} ${finalCurrency}`);
-            }
-        }
+        console.log(`✅ Forcing KES: ${paystackAmount} for tier ${tier}`);
 
         // Check duplicate
         const { data: existing, error } = await supabase
@@ -704,9 +650,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             return res.status(503).json({ error: 'Payment service not configured' });
         }
 
-        const paystackAmountFinal = Math.round(paystackAmount);
-        console.log(`🔁 Final Paystack amount: ${paystackAmountFinal} ${finalCurrency}`);
-
+        // ---- Call Paystack with KES only ----
         const response = await fetch('https://api.paystack.co/transaction/initialize', {
             method: 'POST',
             headers: {
@@ -715,8 +659,8 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             },
             body: JSON.stringify({
                 email: user.email,
-                amount: paystackAmountFinal,
-                currency: finalCurrency,
+                amount: paystackAmount,
+                currency: 'KES',
                 metadata: {
                     idempotencyKey,
                     tier,
@@ -732,11 +676,12 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             return res.status(500).json({ error: data.message || 'Paystack initialization failed' });
         }
 
+        // ---- Record pending payment ----
         await supabase.from('payments').insert({
             user_id: user.id,
             transaction_id: idempotencyKey,
-            amount: paystackAmountFinal,
-            currency: finalCurrency,
+            amount: paystackAmount,
+            currency: 'KES',
             status: 'pending',
             tier
         });
