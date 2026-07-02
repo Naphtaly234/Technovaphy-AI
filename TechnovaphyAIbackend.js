@@ -68,11 +68,17 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
     console.log('✅ Database connected.');
 })();
 
-// ----- Constants & Helpers -----
+// ----- TIER PRICES (EXACT KES) -----
+const TIER_PRICES_KES = {
+    starter: 200,      // weekly – 200 KES
+    pro: 1700,         // monthly – 1700 KES
+    enterprise: 17000  // monthly – 17000 KES
+};
+
 const TIER_LIMITS = {
     free: 200,
-    starter: 200,      // weekly
-    pro: 2500,         // monthly
+    starter: 200,
+    pro: 2500,
     enterprise: Infinity
 };
 
@@ -81,13 +87,6 @@ const TIER_NAMES = {
     starter: 'Starter (Weekly)',
     pro: 'Pro (Monthly)',
     enterprise: 'Enterprise (Monthly)'
-};
-
-// ----- KES PRICES (hardcoded) -----
-const TIER_PRICES_KES = {
-    starter: 200,      // weekly
-    pro: 1700,         // monthly
-    enterprise: 17000  // monthly
 };
 
 const FREE_SESSION_HOURS = 5;
@@ -204,7 +203,7 @@ async function extractFileContent(file) {
     } else if (mimeType === 'text/plain' || mimeType === 'text/csv') {
         return buffer.toString('utf-8');
     } else if (mimeType.startsWith('image/')) {
-        return `[Image: ${file.originalname}]`; // handled separately
+        return `[Image: ${file.originalname}]`;
     } else {
         try { return buffer.toString('utf-8'); } catch(e) { return `[File: ${file.originalname}]`; }
     }
@@ -361,7 +360,7 @@ app.post('/api/auth/update-memory', auth, async (req, res) => {
     }
 });
 
-// ----- Admin: view all users -----
+// ----- Admin -----
 app.get('/api/admin/users', auth, async (req, res) => {
     try {
         const user = req.user;
@@ -547,7 +546,7 @@ ${memoryPrompt}`;
     }
 });
 
-// ----- IMAGE GENERATION (Agnes + Pollinations fallback) -----
+// ----- IMAGE GENERATION -----
 app.post('/api/generate-image', auth, async (req, res) => {
     try {
         const { prompt } = req.body;
@@ -614,7 +613,9 @@ app.post('/api/generate-image', auth, async (req, res) => {
     }
 });
 
-// ----- PAYMENT ENDPOINT (FORCED KES) -----
+// ============================================================
+//  PAYMENT ENDPOINT – FORCED KES (EXACT PRICES)
+// ============================================================
 app.post('/api/create-checkout', auth, async (req, res) => {
     try {
         const { idempotencyKey, tier, currency } = req.body;
@@ -624,17 +625,20 @@ app.post('/api/create-checkout', auth, async (req, res) => {
 
         // Validate tier
         if (!tier || !['starter', 'pro', 'enterprise'].includes(tier)) {
-            return res.status(400).json({ error: 'Invalid tier selected' });
+            return res.status(400).json({ error: 'Invalid tier selected. Choose starter, pro, or enterprise.' });
         }
 
         // ---- FORCE KES ----
-        // Always use KES – this is the only currency your Paystack account supports
-        const finalCurrency = 'KES';
-        const paystackAmount = TIER_PRICES_KES[tier]; // 500, 1700, 17000
+        // Get the exact KES price from the tier map
+        const amountInKES = TIER_PRICES_KES[tier];
+        
+        if (!amountInKES) {
+            return res.status(400).json({ error: `No price found for tier: ${tier}` });
+        }
 
-        console.log(`✅ Forcing KES: ${paystackAmount} for tier ${tier}`);
+        console.log(`💰 Amount: ${amountInKES} KES for tier: ${tier}`);
 
-        // Check duplicate
+        // Check duplicate transaction
         const { data: existing, error } = await supabase
             .from('payments')
             .select('*')
@@ -642,7 +646,9 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             .maybeSingle();
 
         if (existing) {
-            if (existing.status === 'completed') return res.json({ alreadyProcessed: true });
+            if (existing.status === 'completed') {
+                return res.json({ alreadyProcessed: true });
+            }
             return res.status(409).json({ error: 'Payment is being processed' });
         }
 
@@ -650,7 +656,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             return res.status(503).json({ error: 'Payment service not configured' });
         }
 
-        // ---- Call Paystack with KES only ----
+        // ---- Call Paystack with exact KES amount ----
         const response = await fetch('https://api.paystack.co/transaction/initialize', {
             method: 'POST',
             headers: {
@@ -659,7 +665,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             },
             body: JSON.stringify({
                 email: user.email,
-                amount: paystackAmount,
+                amount: amountInKES, // This is already in KES
                 currency: 'KES',
                 metadata: {
                     idempotencyKey,
@@ -671,6 +677,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
         });
 
         const data = await response.json();
+        
         if (!data.status) {
             console.error('❌ Paystack error:', data);
             return res.status(500).json({ error: data.message || 'Paystack initialization failed' });
@@ -680,12 +687,13 @@ app.post('/api/create-checkout', auth, async (req, res) => {
         await supabase.from('payments').insert({
             user_id: user.id,
             transaction_id: idempotencyKey,
-            amount: paystackAmount,
+            amount: amountInKES,
             currency: 'KES',
             status: 'pending',
             tier
         });
 
+        console.log(`✅ Payment initialized: ${amountInKES} KES for ${tier}`);
         res.json({ url: data.data.authorization_url });
     } catch(err) {
         console.error('❌ Checkout error:', err);
