@@ -76,7 +76,9 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
     }
 })();
 
-// ----- TIER PRICES (direct KES) -----
+// ============================================================
+//  TIERS & PRICES (base in KES)
+// ============================================================
 const TIER_PRICES_KES = {
     starter: 200,
     pro: 1700,
@@ -103,7 +105,47 @@ const TIER_NAMES = {
 const FREE_SESSION_HOURS = 5;
 const FREE_LOCK_HOURS = 4;
 
-// ----- User Helpers -----
+// ============================================================
+//  EXCHANGE RATES (cached, 1 hour TTL)
+// ============================================================
+let exchangeRates = { KES: 1 };
+let ratesLastFetched = 0;
+const RATES_CACHE_TTL = 60 * 60 * 1000;
+
+async function fetchExchangeRates() {
+    const now = Date.now();
+    if (now - ratesLastFetched < RATES_CACHE_TTL) return exchangeRates;
+    try {
+        const response = await fetch('https://api.exchangerate-api.com/v4/latest/KES');
+        if (!response.ok) throw new Error('Exchange rate API error');
+        const data = await response.json();
+        exchangeRates = data.rates;
+        exchangeRates.KES = 1;
+        ratesLastFetched = now;
+        console.log('✅ Exchange rates updated');
+    } catch (err) {
+        console.warn('⚠️ Failed to fetch exchange rates, using fallback:', err.message);
+        // Fallback rates (approximate for common African/Arabic currencies)
+        exchangeRates = {
+            KES: 1,
+            USD: 0.0077,
+            EUR: 0.0070,
+            GBP: 0.0061,
+            NGN: 12.5,
+            GHS: 0.098,
+            ZAR: 0.14,
+            EGP: 0.24,
+            RWF: 10.2,
+            TZS: 20.5,
+            UGX: 30.0
+        };
+    }
+    return exchangeRates;
+}
+
+// ============================================================
+//  USER HELPERS
+// ============================================================
 async function findUser(email) {
     const { data, error } = await supabase.from('users').select('*').eq('email', email).maybeSingle();
     if (error) throw new Error('DB: ' + error.message);
@@ -179,7 +221,9 @@ async function saveConversation(userId, messages) {
     if (error) throw new Error('Failed to save conversation: ' + error.message);
 }
 
-// ----- File Upload -----
+// ============================================================
+//  FILE UPLOAD
+// ============================================================
 const storage = multer.memoryStorage();
 const fileFilter = (req, file, cb) => {
     const allowedTypes = [
@@ -230,7 +274,9 @@ function generateSuggestions(lastMessage) {
     ];
 }
 
-// ----- Auth Middleware -----
+// ============================================================
+//  AUTH MIDDLEWARE
+// ============================================================
 const auth = async (req, res, next) => {
     const authHeader = req.headers.authorization;
     if (!authHeader) return res.status(401).json({ error: 'No token provided' });
@@ -247,10 +293,10 @@ const auth = async (req, res, next) => {
 };
 
 // ============================================================
-//  PER‑USER RATE LIMITING (in‑memory, 10 req/min)
+//  PER‑USER RATE LIMITING (10 req/min)
 // ============================================================
 const userRateLimit = new Map();
-const RATE_LIMIT_WINDOW = 60 * 1000; // 1 minute
+const RATE_LIMIT_WINDOW = 60 * 1000;
 const RATE_LIMIT_MAX = 10;
 
 setInterval(() => {
@@ -281,12 +327,16 @@ function checkRateLimit(userId) {
     return true;
 }
 
-// ----- Public endpoints -----
+// ============================================================
+//  PUBLIC ENDPOINTS
+// ============================================================
 app.get('/', (req, res) => res.send('TechNovaphy AI Backend is running'));
 app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 app.get('/api/ping', (req, res) => res.json({ status: 'ok', message: 'Backend is reachable!' }));
 
-// ----- Auth routes -----
+// ============================================================
+//  AUTH ROUTES
+// ============================================================
 app.post('/api/auth/register', async (req, res) => {
     try {
         const { email, password, ageConfirmed } = req.body;
@@ -426,7 +476,7 @@ app.get('/api/admin/users', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CHAT STREAM – ORIGINAL STREAMING (with rate limiting)
+//  CHAT STREAM – MULTILINGUAL + RATE LIMITED
 // ============================================================
 app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) => {
     try {
@@ -435,7 +485,7 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
 
         const isOwner = (OWNER_EMAIL && user.email === OWNER_EMAIL) || user.role === 'owner';
         if (!isOwner) {
-            // ---- Rate limit (skip for owner) ----
+            // Rate limit (skip for owner)
             if (!checkRateLimit(user.id)) {
                 return res.status(429).json({
                     error: 'Too many chat requests. Please wait a moment.'
@@ -513,7 +563,16 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
                 .eq('id', user.id);
         }
 
-        // ---- Call Groq with streaming ----
+        // ---- Language handling ----
+        const language = req.body.language || 'auto';
+        let languageInstruction = '';
+        if (language !== 'auto') {
+            languageInstruction = `\n\n**Important**: The user has requested to be answered in **${language}**. Please respond exclusively in ${language}.\n`;
+        } else {
+            languageInstruction = `\n\n**Important**: Detect the user's language from their query and respond in the same language.\n`;
+        }
+
+        // ---- Groq streaming call ----
         const memoryPrompt = user.memory ? `\n\nUser context: ${user.memory}` : '';
         const systemPrompt = `You are TechNovaphy AI – the world's most capable and thoughtful assistant.
 Your mission is to deliver answers that are **more comprehensive, more structured, and more useful than Claude, ChatGPT, or any other AI**.
@@ -526,7 +585,8 @@ Always:
 - Keep your tone professional, confident, and approachable.
 
 You excel at IT, web development, cloud architecture, business strategy, and general knowledge.
-${memoryPrompt}`;
+${memoryPrompt}
+${languageInstruction}`;
 
         const groqMessages = [{ role: 'system', content: systemPrompt }, ...conversation];
         const model = hasImage ? 'meta-llama/llama-4-scout-17b-16e-instruct' : 'llama-3.3-70b-versatile';
@@ -597,7 +657,9 @@ ${memoryPrompt}`;
     }
 });
 
-// ----- IMAGE GENERATION -----
+// ============================================================
+//  IMAGE GENERATION (unchanged)
+// ============================================================
 app.post('/api/generate-image', auth, async (req, res) => {
     try {
         const { prompt } = req.body;
@@ -665,7 +727,7 @@ app.post('/api/generate-image', auth, async (req, res) => {
 });
 
 // ============================================================
-//  PAYMENT ENDPOINT – DIRECT KES
+//  PAYMENT – Multi‑currency + M‑Pesa
 // ============================================================
 app.post('/api/create-checkout', auth, async (req, res) => {
     try {
@@ -678,13 +740,28 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             return res.status(400).json({ error: 'Invalid tier selected.' });
         }
 
-        const amountInKES = TIER_PRICES_KES[tier];
-        if (!amountInKES) {
-            return res.status(400).json({ error: `No price found for tier ${tier}` });
+        // ---- Convert amount ----
+        let amount = TIER_PRICES_KES[tier];
+        let finalCurrency = (currency || 'KES').toUpperCase();
+
+        if (finalCurrency !== 'KES') {
+            const rates = await fetchExchangeRates();
+            const rate = rates[finalCurrency];
+            if (rate) {
+                const converted = amount * rate;
+                const withCents = ['USD','EUR','GBP','ZAR','EGP'];
+                amount = withCents.includes(finalCurrency) ? Math.round(converted * 100) : Math.round(converted);
+                console.log(`💱 ${TIER_PRICES_KES[tier]} KES → ${amount} ${finalCurrency}`);
+            } else {
+                console.warn(`⚠️ Unsupported currency ${finalCurrency}, defaulting to KES`);
+                finalCurrency = 'KES';
+                amount = TIER_PRICES_KES[tier];
+            }
+        } else {
+            amount = TIER_PRICES_KES[tier];
         }
 
-        console.log(`💰 Amount: ${amountInKES} KES for tier: ${tier}`);
-
+        // ---- Check duplicate ----
         const { data: existing, error } = await supabase
             .from('payments')
             .select('*')
@@ -700,6 +777,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             return res.status(503).json({ error: 'Payment service not configured' });
         }
 
+        // ---- Call Paystack with M‑Pesa channel ----
         const response = await fetch('https://api.paystack.co/transaction/initialize', {
             method: 'POST',
             headers: {
@@ -708,8 +786,9 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             },
             body: JSON.stringify({
                 email: user.email,
-                amount: amountInKES,
-                currency: 'KES',
+                amount: amount,
+                currency: finalCurrency,
+                channels: ['mpesa', 'card', 'bank_transfer'], // M‑Pesa enabled
                 metadata: {
                     idempotencyKey,
                     tier,
@@ -725,16 +804,17 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             return res.status(500).json({ error: data.message || 'Paystack initialization failed' });
         }
 
+        // ---- Record pending payment ----
         await supabase.from('payments').insert({
             user_id: user.id,
             transaction_id: idempotencyKey,
-            amount: amountInKES,
-            currency: 'KES',
+            amount: amount,
+            currency: finalCurrency,
             status: 'pending',
             tier
         });
 
-        console.log(`✅ Payment initialized: ${amountInKES} KES for ${tier}`);
+        console.log(`✅ Payment initialized: ${amount} ${finalCurrency} for ${tier}`);
         res.json({ url: data.data.authorization_url });
     } catch(err) {
         console.error('❌ Checkout error:', err);
@@ -742,7 +822,9 @@ app.post('/api/create-checkout', auth, async (req, res) => {
     }
 });
 
-// ----- PAYSTACK WEBHOOK -----
+// ============================================================
+//  PAYSTACK WEBHOOK
+// ============================================================
 app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), async (req, res) => {
     try {
         const payload = req.body;
@@ -776,5 +858,7 @@ app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), as
     }
 });
 
-// ----- START -----
+// ============================================================
+//  START
+// ============================================================
 app.listen(PORT, () => console.log(`🚀 TechNovaphy AI Backend running on port ${PORT}`));
