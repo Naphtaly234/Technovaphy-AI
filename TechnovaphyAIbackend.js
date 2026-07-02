@@ -71,8 +71,8 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 // ----- TIER PRICES (base values, will be multiplied by 100) -----
 const TIER_PRICES_BASE = {
     starter: 2*100,      // 2 × 100 = 200
-    pro: 17,         // 17 × 100 = 1700
-    enterprise: 170  // 170 × 100 = 17000
+    pro: 17*100,       // 17 × 100 = 1700
+    enterprise: 170*100 // 170 × 100 = 17000
 };
 
 const TIER_LIMITS = {
