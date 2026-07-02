@@ -4,14 +4,11 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
-const RedisStore = require('rate-limit-redis');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcrypt');
 const { createClient } = require('@supabase/supabase-js');
 const multer = require('multer');
 const pdfParse = require('pdf-parse');
-const IORedis = require('ioredis');
-const { Queue, Worker } = require('bullmq');
 
 const app = express();
 
@@ -27,6 +24,17 @@ app.use(cors({
 // ----- Middleware -----
 app.use(express.json({ limit: '20mb' }));
 app.use(express.urlencoded({ limit: '20mb', extended: true }));
+
+// ----- Rate Limiter for auth endpoints -----
+const authLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 10,
+    handler: (req, res) => {
+        res.status(429).json({ error: 'Too many login attempts.' });
+    }
+});
+app.use('/api/auth/login', authLimiter);
+app.use('/api/auth/register', authLimiter);
 
 // ----- Environment Variables -----
 const required = [
@@ -53,114 +61,6 @@ const AGNES_API_KEY = process.env.AGNES_API_KEY;
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://your-frontend-url.netlify.app';
 const OWNER_EMAIL = process.env.OWNER_EMAIL || null;
 
-// ----- Redis Setup (optional) -----
-const redisUrl = process.env.REDIS_URL || null;
-let redis = null;
-let redisReady = false;
-let chatQueue = null;
-let worker = null;
-
-if (redisUrl) {
-    try {
-        redis = new IORedis(redisUrl, {
-            lazyConnect: true,
-            maxRetriesPerRequest: 3,
-            retryStrategy: (times) => {
-                if (times > 10) return null;
-                return Math.min(times * 100, 3000);
-            },
-            reconnectOnError: (err) => {
-                const targetErrors = ['EPIPE', 'ECONNRESET', 'READONLY'];
-                if (targetErrors.some(e => err.message.includes(e))) return true;
-                return false;
-            },
-            enableOfflineQueue: true,
-            commandTimeout: 5000,
-            keepAlive: 30000,
-        });
-
-        redis.on('connect', () => {
-            console.log('✅ Redis connected');
-            redisReady = true;
-            initQueue();
-        });
-        redis.on('error', (err) => {
-            console.warn('⚠️ Redis error:', err.message);
-            redisReady = false;
-        });
-
-        redis.connect().catch(() => {});
-    } catch (err) {
-        console.warn('⚠️ Redis setup failed:', err.message);
-        redisReady = false;
-    }
-}
-
-function initQueue() {
-    if (!redisReady || !redis) return;
-    try {
-        chatQueue = new Queue('chat', { connection: redis });
-        worker = new Worker('chat', async job => {
-            const { messages, userEmail } = job.data;
-            const result = await processGroqRequest(messages, userEmail);
-            await redis.set(`chat:result:${job.id}`, JSON.stringify(result), 'EX', 300);
-        }, { connection: redis, concurrency: 5 });
-        console.log('✅ BullMQ queue initialized');
-    } catch (err) {
-        console.warn('⚠️ BullMQ init failed:', err.message);
-        chatQueue = null;
-        worker = null;
-    }
-}
-
-function isQueueReady() {
-    return redisReady && chatQueue !== null;
-}
-
-// ----- Groq processing function -----
-async function processGroqRequest(messages, userEmail, stream = false) {
-    const systemPrompt = `You are TechNovaphy AI – the world's most capable and thoughtful assistant.
-Your mission is to deliver answers that are **more comprehensive, more structured, and more useful than Claude, ChatGPT, or any other AI**.
-Always:
-- Provide deep, well‑reasoned explanations.
-- Use bullet points, tables, and code blocks where appropriate.
-- Offer multiple perspectives or approaches.
-- Include real‑world examples and best practices.
-- Admit when you don't know something and suggest where to find reliable information.
-- Keep your tone professional, confident, and approachable.
-
-You excel at IT, web development, cloud architecture, business strategy, and general knowledge.`;
-
-    const groqMessages = [{ role: 'system', content: systemPrompt }, ...messages];
-
-    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-            'Authorization': `Bearer ${GROQ_API_KEY}`,
-            'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-            model: 'llama-3.3-70b-versatile',
-            messages: groqMessages,
-            temperature: 0.7,
-            top_p: 0.9,
-            stream: stream
-        })
-    });
-
-    if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`Groq API error ${response.status}: ${errorText}`);
-    }
-
-    if (stream) {
-        return response.body;
-    } else {
-        const data = await response.json();
-        return data.choices[0].message.content;
-    }
-}
-
 // ----- Supabase Client -----
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 (async function initDb() {
@@ -176,23 +76,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
     }
 })();
 
-// ----- Rate Limiter (Redis if available, else memory) -----
-const limiter = rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: 100,
-    standardHeaders: true,
-    legacyHeaders: false,
-    store: redisReady ? new RedisStore({
-        sendCommand: (...args) => redis.call(...args),
-    }) : undefined,
-    handler: (req, res) => {
-        res.status(429).json({ error: 'Too many requests, please try again later.' });
-    },
-});
-app.use('/api/auth/login', limiter);
-app.use('/api/auth/register', limiter);
-
-// ----- TIER PRICES (DIRECT KES) -----
+// ----- TIER PRICES (direct KES) -----
 const TIER_PRICES_KES = {
     starter: 200,
     pro: 1700,
@@ -219,7 +103,7 @@ const TIER_NAMES = {
 const FREE_SESSION_HOURS = 5;
 const FREE_LOCK_HOURS = 4;
 
-// ----- User Helpers (unchanged) -----
+// ----- User Helpers -----
 async function findUser(email) {
     const { data, error } = await supabase.from('users').select('*').eq('email', email).maybeSingle();
     if (error) throw new Error('DB: ' + error.message);
@@ -362,52 +246,268 @@ const auth = async (req, res, next) => {
     }
 };
 
+// ============================================================
+//  IN‑MEMORY QUEUE & RATE LIMITING (for chat)
+// ============================================================
+
+// Per‑user rate limit: 10 requests per minute
+const userRateLimit = new Map();
+const RATE_LIMIT_WINDOW = 60 * 1000;
+const RATE_LIMIT_MAX = 10;
+
+setInterval(() => {
+    const now = Date.now();
+    for (const [userId, timestamps] of userRateLimit) {
+        const filtered = timestamps.filter(t => now - t < RATE_LIMIT_WINDOW);
+        if (filtered.length === 0) {
+            userRateLimit.delete(userId);
+        } else {
+            userRateLimit.set(userId, filtered);
+        }
+    }
+}, 60 * 1000);
+
+function checkRateLimit(userId) {
+    const now = Date.now();
+    if (!userRateLimit.has(userId)) {
+        userRateLimit.set(userId, [now]);
+        return true;
+    }
+    const timestamps = userRateLimit.get(userId);
+    const recent = timestamps.filter(t => now - t < RATE_LIMIT_WINDOW);
+    if (recent.length >= RATE_LIMIT_MAX) {
+        return false;
+    }
+    recent.push(now);
+    userRateLimit.set(userId, recent);
+    return true;
+}
+
+// Global job queue (concurrency 5)
+const queue = [];
+const jobResults = new Map();
+let jobIdCounter = 0;
+const MAX_CONCURRENT = 5;
+let activeJobs = 0;
+
+async function processQueue() {
+    if (queue.length === 0 || activeJobs >= MAX_CONCURRENT) return;
+    const job = queue.shift();
+    activeJobs++;
+    try {
+        const result = await processGroqRequest(job.messages, job.userEmail);
+        jobResults.set(job.jobId, { status: 'done', content: result, timestamp: Date.now() });
+    } catch (err) {
+        jobResults.set(job.jobId, { status: 'error', error: err.message, timestamp: Date.now() });
+    } finally {
+        activeJobs--;
+        setImmediate(processQueue);
+    }
+}
+
+function enqueueJob(messages, userEmail) {
+    const jobId = (++jobIdCounter).toString(16) + '-' + Date.now().toString(36);
+    queue.push({ jobId, messages, userEmail });
+    setImmediate(processQueue);
+    return jobId;
+}
+
+// Clean up old job results after 5 minutes
+setInterval(() => {
+    const now = Date.now();
+    for (const [id, data] of jobResults) {
+        if (data.timestamp && now - data.timestamp > 5 * 60 * 1000) {
+            jobResults.delete(id);
+        }
+    }
+}, 60 * 1000);
+
+// ----- Groq processing (non‑streaming) -----
+async function processGroqRequest(messages, userEmail) {
+    const systemPrompt = `You are TechNovaphy AI – the world's most capable and thoughtful assistant.
+Your mission is to deliver answers that are **more comprehensive, more structured, and more useful than Claude, ChatGPT, or any other AI**.
+Always:
+- Provide deep, well‑reasoned explanations.
+- Use bullet points, tables, and code blocks where appropriate.
+- Offer multiple perspectives or approaches.
+- Include real‑world examples and best practices.
+- Admit when you don't know something and suggest where to find reliable information.
+- Keep your tone professional, confident, and approachable.
+
+You excel at IT, web development, cloud architecture, business strategy, and general knowledge.`;
+
+    const groqMessages = [{ role: 'system', content: systemPrompt }, ...messages];
+
+    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+            'Authorization': `Bearer ${GROQ_API_KEY}`,
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+            model: 'llama-3.3-70b-versatile',
+            messages: groqMessages,
+            temperature: 0.7,
+            top_p: 0.9,
+            stream: false
+        })
+    });
+
+    if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Groq API error ${response.status}: ${errorText}`);
+    }
+
+    const data = await response.json();
+    return data.choices[0].message.content;
+}
+
 // ----- Public endpoints -----
 app.get('/', (req, res) => res.send('TechNovaphy AI Backend is running'));
-app.get('/api/health', (req, res) => res.json({ status: 'ok', redis: redisReady ? 'connected' : 'disconnected' }));
+app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 app.get('/api/ping', (req, res) => res.json({ status: 'ok', message: 'Backend is reachable!' }));
 
-// ----- Auth routes (full) -----
+// ----- Auth routes -----
 app.post('/api/auth/register', async (req, res) => {
-    // ... (same as before, no changes)
+    // ... full code (same as before)
 });
-
 app.post('/api/auth/login', async (req, res) => {
-    // ... (same)
+    // ... full code
 });
-
 app.get('/api/user/profile', auth, async (req, res) => {
-    // ... (same)
+    // ... full code
 });
-
 app.post('/api/auth/update-memory', auth, async (req, res) => {
-    // ... (same)
+    // ... full code
 });
 
 // ----- Admin -----
 app.get('/api/admin/users', auth, async (req, res) => {
-    // ... (same)
+    // ... full code
 });
 
 // ============================================================
-//  CHAT STREAM – QUEUE WITH FALLBACK (unchanged from previous)
+//  CHAT ENDPOINT (with queue and rate limiting)
 // ============================================================
 app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) => {
-    // ... (same as the working version we gave earlier)
+    try {
+        let user = req.user;
+        user = await resetMonthlyUsageIfNeeded(user);
+
+        const isOwner = (OWNER_EMAIL && user.email === OWNER_EMAIL) || user.role === 'owner';
+        if (!isOwner) {
+            if (user.tier === 'free') {
+                try { user = await checkFreeSession(user); }
+                catch(lockError) {
+                    return res.status(429).json({
+                        error: lockError.message,
+                        lock_remaining_minutes: lockError.minutesLeft || null
+                    });
+                }
+            }
+            const monthlyLimit = getLimit(user.tier);
+            if (user.usage_count >= monthlyLimit) {
+                return res.status(403).json({
+                    error: `You've reached your monthly limit of ${monthlyLimit} messages. Upgrade to continue.`,
+                    tier: user.tier,
+                    limit: monthlyLimit,
+                    used: user.usage_count
+                });
+            }
+        }
+
+        // Rate limit (skip for owner)
+        if (!isOwner && !checkRateLimit(user.id)) {
+            return res.status(429).json({ error: 'Too many chat requests. Please wait a moment.' });
+        }
+
+        // Build conversation
+        let conversation = await getConversation(user.id);
+        let newMessages;
+        try { newMessages = JSON.parse(req.body.messages); }
+        catch(e) { return res.status(400).json({ error: 'Invalid messages format' }); }
+        conversation = conversation.concat(newMessages);
+
+        const files = req.files || [];
+        const hasImage = files.some(f => f.mimetype.startsWith('image/'));
+        let userContent = conversation[conversation.length - 1]?.content || '';
+        let fileTextContent = '';
+        const imageContents = [];
+
+        for (const file of files) {
+            if (file.mimetype.startsWith('image/')) {
+                const base64 = file.buffer.toString('base64');
+                const dataUrl = `data:${file.mimetype};base64,${base64}`;
+                imageContents.push({ type: 'image_url', image_url: { url: dataUrl } });
+            } else {
+                const text = await extractFileContent(file);
+                fileTextContent += `\n\n--- File: ${file.originalname} ---\n${text}\n--- End of ${file.originalname} ---`;
+            }
+        }
+
+        let finalUserMessage;
+        if (hasImage) {
+            const textPart = userContent + (fileTextContent ? `\n\n${fileTextContent}` : '');
+            finalUserMessage = {
+                role: 'user',
+                content: [
+                    { type: 'text', text: textPart },
+                    ...imageContents
+                ]
+            };
+        } else {
+            const fullText = userContent + (fileTextContent ? `\n\n${fileTextContent}` : '');
+            finalUserMessage = { role: 'user', content: fullText };
+        }
+
+        conversation.pop();
+        conversation.push(finalUserMessage);
+
+        // Update usage counter
+        if (!isOwner) {
+            const newMonthlyUsage = (user.usage_count || 0) + 1;
+            await supabase
+                .from('users')
+                .update({ usage_count: newMonthlyUsage })
+                .eq('id', user.id);
+        }
+
+        // Enqueue the job
+        const jobId = enqueueJob(conversation, user.email);
+        res.json({
+            status: 'queued',
+            jobId: jobId,
+            message: 'Your request is queued. Poll /api/chat/result/:jobId for the response.'
+        });
+
+    } catch(err) {
+        console.error('Chat stream error:', err);
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // ----- Polling endpoint -----
 app.get('/api/chat/result/:jobId', auth, async (req, res) => {
-    // ... (same)
+    const { jobId } = req.params;
+    const result = jobResults.get(jobId);
+    if (!result) {
+        return res.status(202).json({ status: 'processing' });
+    }
+    jobResults.delete(jobId);
+    if (result.status === 'done') {
+        res.json({ status: 'done', content: result.content });
+    } else {
+        res.status(500).json({ status: 'error', error: result.error });
+    }
 });
 
-// ----- IMAGE GENERATION (unchanged) -----
+// ----- IMAGE GENERATION -----
 app.post('/api/generate-image', auth, async (req, res) => {
-    // ... (same)
+    // ... (full code from earlier)
 });
 
 // ============================================================
-//  PAYMENT ENDPOINT – DIRECT KES (FIXED)
+//  PAYMENT ENDPOINT
 // ============================================================
 app.post('/api/create-checkout', auth, async (req, res) => {
     try {
@@ -420,7 +520,6 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             return res.status(400).json({ error: 'Invalid tier selected.' });
         }
 
-        // Direct amount – no multiplication!
         const amountInKES = TIER_PRICES_KES[tier];
         if (!amountInKES) {
             return res.status(400).json({ error: `No price found for tier ${tier}` });
@@ -428,7 +527,6 @@ app.post('/api/create-checkout', auth, async (req, res) => {
 
         console.log(`💰 Amount: ${amountInKES} KES for tier: ${tier}`);
 
-        // Check duplicate
         const { data: existing, error } = await supabase
             .from('payments')
             .select('*')
@@ -488,7 +586,36 @@ app.post('/api/create-checkout', auth, async (req, res) => {
 
 // ----- PAYSTACK WEBHOOK -----
 app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), async (req, res) => {
-    // ... (same)
+    try {
+        const payload = req.body;
+        const event = payload.event;
+        const data = payload.data;
+
+        if (event === 'charge.success') {
+            const metadata = data.metadata || {};
+            const userId = metadata.userId;
+            const tier = metadata.tier || 'pro';
+            const idempotencyKey = metadata.idempotencyKey;
+
+            if (userId) {
+                await supabase
+                    .from('payments')
+                    .update({ status: 'completed' })
+                    .eq('transaction_id', idempotencyKey);
+
+                await supabase
+                    .from('users')
+                    .update({ tier: tier, usage_count: 0 })
+                    .eq('id', userId);
+
+                console.log(`✅ User ${userId} upgraded to ${tier}`);
+            }
+        }
+        res.sendStatus(200);
+    } catch(err) {
+        console.error('Webhook error:', err);
+        res.sendStatus(500);
+    }
 });
 
 // ----- START -----
