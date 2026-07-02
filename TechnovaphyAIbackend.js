@@ -68,11 +68,11 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
     console.log('✅ Database connected.');
 })();
 
-// ----- TIER PRICES (EXACT KES) -----
-const TIER_PRICES_KES = {
-    starter: 200,      // weekly – 200 KES
-    pro: 1700,         // monthly – 1700 KES
-    enterprise: 17000  // monthly – 17000 KES
+// ----- TIER PRICES (base values, will be multiplied by 100) -----
+const TIER_PRICES_BASE = {
+    starter: 2,      // 2 × 100 = 200
+    pro: 17,         // 17 × 100 = 1700
+    enterprise: 170  // 170 × 100 = 17000
 };
 
 const TIER_LIMITS = {
@@ -614,7 +614,7 @@ app.post('/api/generate-image', auth, async (req, res) => {
 });
 
 // ============================================================
-//  PAYMENT ENDPOINT – FORCED KES (EXACT PRICES)
+//  PAYMENT ENDPOINT – FORCED KES WITH ×100 MULTIPLIER
 // ============================================================
 app.post('/api/create-checkout', auth, async (req, res) => {
     try {
@@ -628,15 +628,14 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             return res.status(400).json({ error: 'Invalid tier selected. Choose starter, pro, or enterprise.' });
         }
 
-        // ---- FORCE KES ----
-        // Get the exact KES price from the tier map
-        const amountInKES = TIER_PRICES_KES[tier];
-        
-        if (!amountInKES) {
-            return res.status(400).json({ error: `No price found for tier: ${tier}` });
+        // ---- GET BASE PRICE AND MULTIPLY BY 100 ----
+        const basePrice = TIER_PRICES_BASE[tier];
+        if (!basePrice) {
+            return res.status(400).json({ error: `No base price found for tier: ${tier}` });
         }
+        const amountInKES = basePrice * 100;  // This yields 200, 1700, 17000
 
-        console.log(`💰 Amount: ${amountInKES} KES for tier: ${tier}`);
+        console.log(`💰 Base price: ${basePrice} × 100 = ${amountInKES} KES for tier: ${tier}`);
 
         // Check duplicate transaction
         const { data: existing, error } = await supabase
@@ -665,7 +664,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             },
             body: JSON.stringify({
                 email: user.email,
-                amount: amountInKES, // This is already in KES
+                amount: amountInKES,
                 currency: 'KES',
                 metadata: {
                     idempotencyKey,
@@ -677,7 +676,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
         });
 
         const data = await response.json();
-        
+
         if (!data.status) {
             console.error('❌ Paystack error:', data);
             return res.status(500).json({ error: data.message || 'Paystack initialization failed' });
