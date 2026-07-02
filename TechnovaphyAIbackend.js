@@ -85,7 +85,7 @@ const TIER_NAMES = {
 
 // ----- KES PRICES (hardcoded) -----
 const TIER_PRICES_KES = {
-    starter: 500,      // weekly
+    starter: 200,      // weekly
     pro: 1700,         // monthly
     enterprise: 17000  // monthly
 };
