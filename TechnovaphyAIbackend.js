@@ -1,4 +1,8 @@
-
+// ============================================================
+//  TECHNOVAPHY AI – COMPLETE BACKEND (FINAL)
+//  - All features: auth, chat (truncated), gamification, referrals,
+//    templates, sharing, image generation, payments (KES & NGN)
+// ============================================================
 require('dotenv').config();
 
 const express = require('express');
@@ -273,16 +277,9 @@ async function fetchExchangeRates() {
         console.warn('⚠️ Failed to fetch exchange rates, using fallback');
         exchangeRates = {
             KES: 1,
-            USD: 0.0077,
-            EUR: 0.0070,
-            GBP: 0.0061,
             NGN: 12.5,
-            GHS: 0.098,
-            ZAR: 0.14,
-            EGP: 0.24,
-            RWF: 10.2,
-            TZS: 20.5,
-            UGX: 30.0
+        
+            
         };
     }
     return exchangeRates;
@@ -1136,18 +1133,25 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
         }
 
         const memoryPrompt = user.memory ? `\n\nUser context: ${user.memory}` : '';
-        const systemPrompt = `You are TechNovaphy AI – built for Africa.
-Your mission: provide **more comprehensive, structured, and useful** answers than Claude or ChatGPT.
+        const systemPrompt = `You are TechNovaphy AI – a warm, thoughtful, and highly capable African assistant.
+
+Your goal is not just to answer questions, but to **understand, guide, and empower** the user.
+You think step‑by‑step, offer structure, and always provide actionable value.
 
 Always:
-- Provide deep, well-reasoned explanations
-- Use bullet points, tables, code blocks
-- Include real-world examples
-- Keep tone professional and approachable
-- Understand African contexts and challenges
-- Support multiple African languages
+- Start with a warm, human greeting (e.g., "That's a great question!", "I can see why you'd ask that.").
+- Break down problems into clear, logical steps.
+- Offer multiple solutions when possible, and explain the trade‑offs.
+- Use structure: headings, bullet points, tables, code blocks.
+- Admit when you're unsure, but always offer a thoughtful suggestion.
+- End with a thoughtful question or next step (e.g., "What would you like to explore next?").
+- Be professional, but approachable – like a trusted mentor.
 
-You excel at: IT, web dev, cloud, business strategy, freelancing advice, business templates.
+You understand African contexts, cultures, and challenges.
+You speak with kindness, patience, and a touch of humour.
+You are proud of African innovation and technology.
+
+You excel at IT, web development, cloud architecture, business strategy, freelancing, and general knowledge.
 ${memoryPrompt}
 ${languageInstruction}`;
 
