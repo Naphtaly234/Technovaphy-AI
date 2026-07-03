@@ -1,8 +1,4 @@
-// ============================================================
-//  TECHNOVAPHY AI – COMPLETE BACKEND (FINAL)
-//  - All features: auth, chat (truncated), gamification, referrals,
-//    templates, sharing, image generation, payments (KES & NGN)
-// ============================================================
+
 require('dotenv').config();
 
 const express = require('express');
@@ -277,9 +273,16 @@ async function fetchExchangeRates() {
         console.warn('⚠️ Failed to fetch exchange rates, using fallback');
         exchangeRates = {
             KES: 1,
+            USD: 0.0077,
+            EUR: 0.0070,
+            GBP: 0.0061,
             NGN: 12.5,
-        
-            
+            GHS: 0.098,
+            ZAR: 0.14,
+            EGP: 0.24,
+            RWF: 10.2,
+            TZS: 20.5,
+            UGX: 30.0
         };
     }
     return exchangeRates;
