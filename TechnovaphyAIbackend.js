@@ -901,49 +901,61 @@ app.post('/api/create-checkout', auth, async (req, res) => {
 // ============================================================
 
 app.listen(PORT, () => console.log(`🚀 TechNovaphy AI Backend running on port ${PORT}`));// ============================================================
-//  CODE EXECUTION PROXY (Piston API)
+//// ============================================================
+//  CODE EXECUTION (with fallback when Piston is unavailable)
 // ============================================================
 
 app.post('/api/run-code', auth, async (req, res) => {
     try {
         const { language, version, code } = req.body;
-        if (!code) {
-            return res.status(400).json({ error: 'No code provided' });
-        }
+        if (!code) return res.status(400).json({ error: 'No code provided' });
 
-        // Optional: you can add rate limiting or usage tracking here if desired
-        // For now, we just proxy to Piston
-
-        const pistonResponse = await fetch('https://emkc.org/api/v2/piston/execute', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                language: language,
-                version: version,
-                files: [{ content: code }]
-            })
-        });
-
-        if (!pistonResponse.ok) {
-            const errorText = await pistonResponse.text();
-            return res.status(pistonResponse.status).json({
-                error: `Piston API error: ${errorText}`
-            });
-        }
-
-        const result = await pistonResponse.json();
-
-        // Extract output: run.output or compile.output
         let output = '';
-        if (result.run && result.run.output) {
-            output = result.run.output;
-        } else if (result.compile && result.compile.output) {
-            output = result.compile.output;
-        } else {
-            output = JSON.stringify(result, null, 2);
+        let success = false;
+
+        try {
+            const pistonResponse = await fetch('https://emkc.org/api/v2/piston/execute', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    language: language,
+                    version: version,
+                    files: [{ content: code }]
+                })
+            });
+
+            if (pistonResponse.ok) {
+                const result = await pistonResponse.json();
+                if (result.run?.output) output = result.run.output;
+                else if (result.compile?.output) output = result.compile.output;
+                else output = JSON.stringify(result, null, 2);
+                success = true;
+            } else {
+                const errText = await pistonResponse.text();
+                // If Piston returns whitelist error, fallback
+                if (pistonResponse.status === 403 || errText.includes('whitelist')) {
+                    success = false;
+                } else {
+                    throw new Error(`Piston error: ${errText}`);
+                }
+            }
+        } catch (e) {
+            // Network or other error
+            success = false;
         }
 
-        res.json({ output: output || '✅ Done (no output)' });
+        if (!success) {
+            // Fallback: provide a message and let the user copy the code to run locally
+            output = `⚠️ The public code execution service is currently unavailable.\n\n` +
+                     `To run this code locally:\n` +
+                     `1. Copy the code below\n` +
+                     `2. Paste it into a ${language} environment\n` +
+                     `3. Run it there\n\n` +
+                     `--- Your Code ---\n${code}`;
+            res.json({ output, fallback: true });
+        } else {
+            res.json({ output: output || '✅ Done (no output)' });
+        }
     } catch (err) {
         console.error('Code execution error:', err);
         res.status(500).json({ error: err.message || 'Internal server error' });
