@@ -1,4 +1,3 @@
-
 //  TECHNOVAPHY AI – 
 
 require('dotenv').config();
@@ -545,8 +544,24 @@ app.get('/api/conversations/:conversationId', auth, async (req, res) => {
     }
 });
 
+// ✅ FIXED: Create conversation only if it doesn't exist
 app.post('/api/conversations', auth, async (req, res) => {
     try {
+        // Check if user already has a conversation
+        let { data: existing, error: findError } = await supabase
+            .from('conversations')
+            .select('*')
+            .eq('user_id', req.user.id)
+            .maybeSingle();
+
+        if (findError && findError.code !== 'PGRST116') throw findError;
+
+        if (existing) {
+            // Return existing conversation
+            return res.status(200).json({ conversation: existing });
+        }
+
+        // Create new conversation
         const { data, error } = await supabase.from('conversations').insert({
             user_id: req.user.id,
             messages: [],
@@ -557,6 +572,7 @@ app.post('/api/conversations', auth, async (req, res) => {
         if (error) throw error;
         res.status(201).json({ conversation: data });
     } catch (err) {
+        console.error('Create conversation error:', err);
         res.status(500).json({ error: err.message });
     }
 });
@@ -897,18 +913,15 @@ app.post('/api/create-checkout', auth, async (req, res) => {
 });
 
 // ============================================================
-//  START
-// ============================================================
-
-app.listen(PORT, () => console.log(`🚀 TechNovaphy AI Backend running on port ${PORT}`));// ============================================================
-//// ============================================================
-//  CODE EXECUTION (with fallback when Piston is unavailable)
+//  CODE EXECUTION PROXY (Piston API) – with fallback
 // ============================================================
 
 app.post('/api/run-code', auth, async (req, res) => {
     try {
         const { language, version, code } = req.body;
-        if (!code) return res.status(400).json({ error: 'No code provided' });
+        if (!code) {
+            return res.status(400).json({ error: 'No code provided' });
+        }
 
         let output = '';
         let success = false;
@@ -961,3 +974,9 @@ app.post('/api/run-code', auth, async (req, res) => {
         res.status(500).json({ error: err.message || 'Internal server error' });
     }
 });
+
+// ============================================================
+//  START
+// ============================================================
+
+app.listen(PORT, () => console.log(`🚀 TechNovaphy AI Backend running on port ${PORT}`));
