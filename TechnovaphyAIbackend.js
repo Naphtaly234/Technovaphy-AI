@@ -900,4 +900,52 @@ app.post('/api/create-checkout', auth, async (req, res) => {
 //  START
 // ============================================================
 
-app.listen(PORT, () => console.log(`🚀 TechNovaphy AI Backend running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 TechNovaphy AI Backend running on port ${PORT}`));// ============================================================
+//  CODE EXECUTION PROXY (Piston API)
+// ============================================================
+
+app.post('/api/run-code', auth, async (req, res) => {
+    try {
+        const { language, version, code } = req.body;
+        if (!code) {
+            return res.status(400).json({ error: 'No code provided' });
+        }
+
+        // Optional: you can add rate limiting or usage tracking here if desired
+        // For now, we just proxy to Piston
+
+        const pistonResponse = await fetch('https://emkc.org/api/v2/piston/execute', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                language: language,
+                version: version,
+                files: [{ content: code }]
+            })
+        });
+
+        if (!pistonResponse.ok) {
+            const errorText = await pistonResponse.text();
+            return res.status(pistonResponse.status).json({
+                error: `Piston API error: ${errorText}`
+            });
+        }
+
+        const result = await pistonResponse.json();
+
+        // Extract output: run.output or compile.output
+        let output = '';
+        if (result.run && result.run.output) {
+            output = result.run.output;
+        } else if (result.compile && result.compile.output) {
+            output = result.compile.output;
+        } else {
+            output = JSON.stringify(result, null, 2);
+        }
+
+        res.json({ output: output || '✅ Done (no output)' });
+    } catch (err) {
+        console.error('Code execution error:', err);
+        res.status(500).json({ error: err.message || 'Internal server error' });
+    }
+});
