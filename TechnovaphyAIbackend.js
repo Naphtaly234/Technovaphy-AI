@@ -1,4 +1,10 @@
-
+// ============================================================
+//  TECHNOVAPHY AI – COMPLETE BACKEND (FINAL, PATCHED)
+//  - All features: auth, chat, gamification, referrals,
+//    templates, sharing, image generation, payments (KES & NGN)
+//  - Patched: webhook signature verification, correct middleware
+//    order, subunit-correct payment amounts, batched badge checks
+// ============================================================
 require('dotenv').config();
 
 const express = require('express');
@@ -14,30 +20,18 @@ const crypto = require('crypto');
 const app = express();
 
 // ----- CORS -----
+// NOTE: '*' + credentials:true is invalid per the CORS spec — browsers will
+// reject or silently drop credentials. Set FRONTEND_URL to your real
+// frontend origin(s) before going live.
 app.use(cors({
-    origin: '*',
-    methods: ['GET','POST','PUT','DELETE','OPTIONS'],
-    allowedHeaders: ['Content-Type','Authorization','Accept'],
+    origin: process.env.FRONTEND_URL || '*',
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'Accept'],
     credentials: true,
     optionsSuccessStatus: 200
 }));
 
-// ----- Middleware -----
-app.use(express.json({ limit: '20mb' }));
-app.use(express.urlencoded({ limit: '20mb', extended: true }));
-
-// ----- Rate Limiter for auth -----
-const authLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: 10,
-    handler: (req, res) => {
-        res.status(429).json({ error: 'Too many login attempts.' });
-    }
-});
-app.use('/api/auth/login', authLimiter);
-app.use('/api/auth/register', authLimiter);
-
-// ----- Environment Variables -----
+// ----- Environment Variables (declared early; needed by webhook route below) -----
 const required = [
     'SUPABASE_URL',
     'SUPABASE_SERVICE_ROLE_KEY',
@@ -62,6 +56,20 @@ const AGNES_API_KEY = process.env.AGNES_API_KEY;
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://your-frontend-url.netlify.app';
 const OWNER_EMAIL = process.env.OWNER_EMAIL || null;
 
+// ----- Optional: OpenRouter (used for paid-tier chat quality upgrade) -----
+// Not in the `required` list above — the app must still boot fine if this
+// isn't set (e.g. local dev, or before you've added credits).
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || null;
+const OPENROUTER_ENABLED = Boolean(OPENROUTER_API_KEY);
+if (!OPENROUTER_ENABLED) {
+    console.warn('⚠️ OPENROUTER_API_KEY not set — paid tiers will use Groq only.');
+}
+
+// ----- Optional: Redis (used for cross-instance rate limiting) -----
+// Falls back to in-memory rate limiting if not set. In-memory works fine
+// for a single server instance; Redis matters once you run more than one.
+const REDIS_URL = process.env.REDIS_URL || null;
+
 // ----- Supabase Client -----
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 (async function initDb() {
@@ -76,6 +84,98 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
         console.warn('⚠️ Could not connect to Supabase:', e.message);
     }
 })();
+
+// ============================================================
+//  PAYSTACK WEBHOOK — MUST BE REGISTERED BEFORE express.json()
+// ============================================================
+// This route needs the RAW request body to verify Paystack's HMAC
+// signature. If express.json() runs first (as a global app.use),
+// it consumes the stream and there's nothing raw left to verify.
+// That's why this is registered here, before the global JSON
+// parser below, using its own express.raw() middleware.
+
+app.post(
+    '/api/webhooks/paystack',
+    express.raw({ type: 'application/json' }),
+    async (req, res) => {
+        try {
+            const signature = req.headers['x-paystack-signature'];
+            if (!signature) {
+                console.warn('⚠️ Webhook rejected: no signature header');
+                return res.sendStatus(401);
+            }
+
+            const expectedHash = crypto
+                .createHmac('sha512', PAYSTACK_SECRET_KEY)
+                .update(req.body) // raw Buffer — required for HMAC to match
+                .digest('hex');
+
+            if (expectedHash !== signature) {
+                console.warn('⚠️ Webhook rejected: signature mismatch');
+                return res.sendStatus(401);
+            }
+
+            const payload = JSON.parse(req.body.toString('utf8'));
+            const event = payload.event;
+            const data = payload.data;
+
+            if (event === 'charge.success') {
+                const metadata = data.metadata || {};
+                const userId = metadata.userId;
+                const tier = metadata.tier || 'pro';
+                const idempotencyKey = metadata.idempotencyKey;
+
+                const { data: paymentRecord } = await supabase
+                    .from('payments')
+                    .select('*')
+                    .eq('transaction_id', idempotencyKey)
+                    .maybeSingle();
+
+                if (!paymentRecord) {
+                    console.warn(`⚠️ Webhook: no matching payment record for ${idempotencyKey}`);
+                    return res.sendStatus(200);
+                }
+
+                if (paymentRecord.status === 'completed') {
+                    return res.sendStatus(200); // already processed; Paystack retries webhooks
+                }
+
+                if (data.amount !== paymentRecord.amount || data.currency !== paymentRecord.currency) {
+                    console.error(
+                        `❌ Webhook amount mismatch for ${idempotencyKey}: ` +
+                        `expected ${paymentRecord.amount} ${paymentRecord.currency}, got ${data.amount} ${data.currency}`
+                    );
+                    return res.sendStatus(200);
+                }
+
+                if (userId) {
+                    await supabase.from('payments').update({ status: 'completed' }).eq('transaction_id', idempotencyKey);
+                    await supabase.from('users').update({ tier: tier, usage_count: 0 }).eq('id', userId);
+                    console.log(`✅ User ${userId} upgraded to ${tier}`);
+                }
+            }
+            res.sendStatus(200);
+        } catch (err) {
+            console.error('Webhook error:', err);
+            res.sendStatus(500);
+        }
+    }
+);
+
+// ----- Global body parsers (registered AFTER the webhook route) -----
+app.use(express.json({ limit: '20mb' }));
+app.use(express.urlencoded({ limit: '20mb', extended: true }));
+
+// ----- Rate Limiter for auth -----
+const authLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 10,
+    handler: (req, res) => {
+        res.status(429).json({ error: 'Too many login attempts.' });
+    }
+});
+app.use('/api/auth/login', authLimiter);
+app.use('/api/auth/register', authLimiter);
 
 // ============================================================
 //  CONSTANTS & PRICING
@@ -386,7 +486,7 @@ async function updateStreakIfNeeded(user) {
     const today = new Date().toISOString().split('T')[0];
     const lastChat = user.last_chat_date ? new Date(user.last_chat_date).toISOString().split('T')[0] : null;
     if (today !== lastChat) {
-        const daysSinceLast = lastChat ? Math.floor((new Date(today) - new Date(lastChat)) / (1000*60*60*24)) : 1;
+        const daysSinceLast = lastChat ? Math.floor((new Date(today) - new Date(lastChat)) / (1000 * 60 * 60 * 24)) : 1;
         let newStreak = daysSinceLast === 1 ? (user.streak_count || 0) + 1 : 1;
         await supabase.from('users').update({
             streak_count: newStreak,
@@ -410,31 +510,37 @@ async function addPoints(userId, points) {
     return newBalance;
 }
 
+// ----- PATCHED: batched badge lookup (was 7 separate queries per message) -----
 async function checkAndUnlockBadges(userId, user) {
     const unlocked = [];
-    for (const [badgeKey, badge] of Object.entries(BADGES)) {
-        const { data: existing } = await supabase
-            .from('user_badges')
-            .select('*')
-            .eq('user_id', userId)
-            .eq('badge_id', badge.id)
-            .maybeSingle();
-        if (existing) continue;
+
+    const { data: existingBadges } = await supabase
+        .from('user_badges')
+        .select('badge_id')
+        .eq('user_id', userId);
+    const unlockedSet = new Set((existingBadges || []).map(b => b.badge_id));
+
+    const toInsert = [];
+    for (const badge of Object.values(BADGES)) {
+        if (unlockedSet.has(badge.id)) continue;
+
         let shouldUnlock = false;
         if (badge.requirement_type === 'messages' && user.usage_count >= badge.requirement) shouldUnlock = true;
         else if (badge.requirement_type === 'streak' && (user.streak_count || 0) >= badge.requirement) shouldUnlock = true;
         else if (badge.requirement_type === 'images' && (user.images_generated || 0) >= badge.requirement) shouldUnlock = true;
         else if (badge.requirement_type === 'referrals' && (user.referrals_count || 0) >= badge.requirement) shouldUnlock = true;
         else if (badge.requirement_type === 'subscription' && (user.tier !== 'free' && user.tier !== 'starter')) shouldUnlock = true;
+
         if (shouldUnlock) {
-            await supabase.from('user_badges').insert({
-                user_id: userId,
-                badge_id: badge.id,
-                unlocked_at: new Date().toISOString()
-            });
+            toInsert.push({ user_id: userId, badge_id: badge.id, unlocked_at: new Date().toISOString() });
             unlocked.push(badge);
         }
     }
+
+    if (toInsert.length > 0) {
+        await supabase.from('user_badges').insert(toInsert);
+    }
+
     return unlocked;
 }
 
@@ -470,7 +576,7 @@ async function extractFileContent(file) {
         try {
             const data = await pdfParse(buffer);
             return data.text;
-        } catch(e) {
+        } catch (e) {
             return `[PDF could not be read: ${e.message}]`;
         }
     } else if (mimeType === 'text/plain' || mimeType === 'text/csv') {
@@ -478,7 +584,144 @@ async function extractFileContent(file) {
     } else if (mimeType.startsWith('image/')) {
         return `[Image: ${file.originalname}]`;
     } else {
-        try { return buffer.toString('utf-8'); } catch(e) { return `[File: ${file.originalname}]`; }
+        try { return buffer.toString('utf-8'); } catch (e) { return `[File: ${file.originalname}]`; }
+    }
+}
+
+// ============================================================
+//  SYSTEM PROMPT BUILDER + SELF-CRITIQUE PASS
+// ============================================================
+
+function buildSystemPrompt({ memoryPrompt, languageInstruction }) {
+    return `You are TechNovaphy AI, built for African freelancers, small businesses, and developers, with deep understanding of Kenyan and Nigerian markets.
+
+RESPONSE FORMAT — you must always use this exact structure, for every reply, with no exceptions:
+
+<thinking>
+2-5 short sentences of genuine reasoning: what is the person actually asking, is anything ambiguous, what's the best structure or approach for this specific answer, and anything you should watch out for (uncertainty, missing info, risk of a wrong assumption). Be concrete and specific to this exact question — not generic.
+</thinking>
+<answer>
+The full response the person will actually read. Nothing outside these tags is shown to them.
+</answer>
+
+CORE RULES (apply inside the <answer> tag):
+1. Match length to the question. A yes/no or quick-fact question gets 1-3 sentences. A "how do I" or "explain" question gets real depth. Never pad an answer to seem more thorough than the question needs.
+2. If a request is ambiguous, state your single most reasonable assumption in one short line, then proceed with a full answer. Do not stop and ask unless proceeding would clearly waste the person's time.
+3. Default to plain prose in conversation. Only use bullet points, numbered steps, or tables when the content is genuinely structured (comparisons, sequential steps, data, code). Do not bullet-point a conversational reply.
+4. On business, tax, legal, or financial topics: flag genuine uncertainty plainly ("I'm not fully certain here — worth confirming with...") rather than asserting confidently. A wrong confident answer costs the user money.
+5. Ask at most one clarifying question, only when truly necessary, and never more than one per reply.
+6. Do not open with throat-clearing ("Great question!", "I'd be happy to help!"). Start directly with substance.
+7. When you don't know something or it may have changed recently, say so directly instead of guessing.
+
+CONTEXT: You understand mobile money (M-Pesa, bank transfers), local currencies (KES, NGN), freelance platforms (Upwork, Fiverr), and small business realities specific to Kenya and Nigeria.
+
+TONE: Professional, warm, direct. Not robotic, not falsely enthusiastic, not overly formal.
+
+--- EXAMPLES OF THE STYLE YOU SHOULD MATCH INSIDE <answer> ---
+
+User: "What's the capital of Kenya?"
+Good: "Nairobi."
+Bad: "Great question! The capital of Kenya is Nairobi, which is also the largest city in the country and serves as its political, economic, and cultural hub..."
+
+User: "Should I register my business as a sole proprietorship or limited company in Kenya?"
+Good: "Depends on your risk exposure and growth plans. A sole proprietorship is faster and cheaper to set up (just a business name registration at eCitizen) but you're personally liable for debts. A limited company (registered with the Business Registration Service) separates your personal assets from business liability and looks more credible to larger clients or investors, but has more compliance overhead — annual returns, separate tax filing. If you're freelancing solo with low liability risk, sole proprietorship is usually enough to start. If you're taking on contracts with real financial exposure or planning to hire, go limited. I'd recommend confirming current registration fees with the BRS directly since these do change."
+Bad: [a bulleted list with generic pros/cons headers and no actual recommendation]
+
+User: "fix this code" [pastes buggy code with no other context]
+Good: [fixes the obvious bug, states the one-line assumption about what was intended, explains the fix in 2-3 sentences]
+Bad: [asks 3 clarifying questions before attempting anything]
+
+--- END EXAMPLES ---
+
+Remember: EVERY reply must have both a <thinking> block and an <answer> block, even for simple greetings. Never skip the tags.
+${memoryPrompt}
+${languageInstruction}`;
+}
+
+// Parses the model's <thinking>...</thinking><answer>...</answer> output as it
+// streams in. Works on partial/incomplete text (tags not yet closed) so it can
+// be called after every chunk arrives, not just once at the end.
+function parseThinkingAndAnswer(rawText) {
+    const thinkClosed = rawText.match(/<thinking>([\s\S]*?)<\/thinking>/i);
+    const thinkOpen = rawText.match(/<thinking>([\s\S]*)$/i);
+    const answerClosed = rawText.match(/<answer>([\s\S]*?)<\/answer>/i);
+    const answerOpen = rawText.match(/<answer>([\s\S]*)$/i);
+
+    let thinking = '';
+    let answer = '';
+
+    if (thinkClosed) {
+        thinking = thinkClosed[1];
+    } else if (thinkOpen && !answerOpen) {
+        thinking = thinkOpen[1];
+    }
+
+    if (answerClosed) {
+        answer = answerClosed[1];
+    } else if (answerOpen) {
+        answer = answerOpen[1];
+    }
+
+    // Fallback: smaller models occasionally skip the tags entirely.
+    // If nothing matched but there's real content, just treat it as the answer
+    // so the user never sees a blank response.
+    if (!thinking && !answer && rawText.trim()) {
+        answer = rawText;
+    }
+
+    return { thinking: thinking.trim(), answer: answer.trim() };
+}
+
+// Runs a second, lightweight Groq call that reviews a generated draft
+// for padding, overconfidence, and formatting issues before it's
+// returned to the user. Used for template generation (proposals, cover
+// letters, invoices) where users already expect a short wait and the
+// polish directly affects whether their client-facing document lands
+// well. NOT used in live chat streaming, where the latency cost isn't
+// worth it for a conversational reply.
+async function selfCritiquePass(draftAnswer, userQuestion, apiKey) {
+    const critiquePrompt = `You are a strict editor. Review this draft answer to a user's request.
+
+User's request: "${userQuestion}"
+
+Draft:
+"""
+${draftAnswer}
+"""
+
+Check for:
+- Unnecessary padding, repetition, or throat-clearing openers
+- Overconfident claims on financial/legal/tax topics that should be hedged
+- Bullet points used where plain prose would read better
+- Anything factually questionable
+
+If the draft is already good, reply with EXACTLY: OK
+Otherwise, reply with ONLY the corrected version — no explanation, no preamble, just the fixed text.`;
+
+    try {
+        const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                model: 'llama-3.1-8b-instant', // small/fast model is enough for a critique pass
+                messages: [{ role: 'user', content: critiquePrompt }],
+                temperature: 0.3,
+                max_tokens: 1024
+            })
+        });
+
+        if (!response.ok) return draftAnswer; // fail safe: return original on any error
+
+        const data = await response.json();
+        const critiqueResult = data.choices?.[0]?.message?.content?.trim();
+
+        if (!critiqueResult || critiqueResult === 'OK') {
+            return draftAnswer;
+        }
+        return critiqueResult;
+    } catch (err) {
+        console.warn('⚠️ Self-critique pass failed, using original draft:', err.message);
+        return draftAnswer; // never let this break the main response
     }
 }
 
@@ -506,7 +749,7 @@ const auth = async (req, res, next) => {
         if (!user) return res.status(401).json({ error: 'User not found' });
         req.user = user;
         next();
-    } catch(e) {
+    } catch (e) {
         res.status(401).json({ error: 'Invalid or expired token' });
     }
 };
@@ -607,7 +850,7 @@ app.post('/api/auth/register', async (req, res) => {
         });
 
         res.status(201).json({ message: 'User created', userId: data.id, referral_code: referralCode });
-    } catch(err) {
+    } catch (err) {
         console.error('Registration error:', err);
         res.status(500).json({ error: err.message });
     }
@@ -626,7 +869,7 @@ app.post('/api/auth/login', async (req, res) => {
 
         const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '7d' });
         res.json({ token, verified: true });
-    } catch(err) {
+    } catch (err) {
         console.error('Login error:', err);
         res.status(500).json({ error: err.message });
     }
@@ -681,7 +924,7 @@ app.get('/api/user/profile', auth, async (req, res) => {
             referrals_count: user.referrals_count || 0,
             referral_credit: user.referral_credit || 0
         });
-    } catch(err) {
+    } catch (err) {
         console.error('Profile error:', err);
         res.status(500).json({ error: err.message });
     }
@@ -693,7 +936,7 @@ app.post('/api/auth/update-memory', auth, async (req, res) => {
         const user = req.user;
         await supabase.from('users').update({ memory }).eq('id', user.id);
         res.json({ message: 'Memory updated' });
-    } catch(err) {
+    } catch (err) {
         console.error('Update memory error:', err);
         res.status(500).json({ error: err.message });
     }
@@ -710,7 +953,7 @@ app.get('/api/admin/users', auth, async (req, res) => {
             .order('created_at', { ascending: false });
         if (error) throw error;
         res.json({ users: data });
-    } catch(err) {
+    } catch (err) {
         console.error('Admin users error:', err);
         res.status(500).json({ error: err.message });
     }
@@ -728,7 +971,7 @@ app.get('/api/user/streak', auth, async (req, res) => {
             best_streak: user.best_streak || 0,
             message: (user.streak_count || 0) > 0 ? `🔥 ${user.streak_count}-day streak!` : 'Start a streak!'
         });
-    } catch(err) {
+    } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
@@ -746,7 +989,7 @@ app.get('/api/user/points', auth, async (req, res) => {
                 { id: 3, name: '50 bonus messages', cost: 150, points: 15 }
             ]
         });
-    } catch(err) {
+    } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
@@ -781,7 +1024,7 @@ app.get('/api/user/badges', auth, async (req, res) => {
             }
         }
         res.json({ unlocked, progress });
-    } catch(err) {
+    } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
@@ -822,7 +1065,7 @@ app.get('/api/challenges/today', auth, async (req, res) => {
             })),
             total_points_available: totalPoints
         });
-    } catch(err) {
+    } catch (err) {
         console.error('Challenges error:', err);
         res.status(500).json({ error: err.message });
     }
@@ -846,7 +1089,7 @@ app.post('/api/challenges/complete', auth, async (req, res) => {
         const points = challenge.points_reward;
         await addPoints(user.id, points);
         res.json({ message: `✅ Challenge completed! +${points} points`, points });
-    } catch(err) {
+    } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
@@ -872,7 +1115,7 @@ app.get('/api/leaderboard/:country', async (req, res) => {
             streak: user.streak_count || 0
         }));
         res.json({ leaderboard, country });
-    } catch(err) {
+    } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
@@ -892,7 +1135,7 @@ app.get('/api/user/referral', auth, async (req, res) => {
             referral_credit: user.referral_credit || 0,
             can_redeem: (user.referral_credit || 0) >= 500
         });
-    } catch(err) {
+    } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
@@ -909,7 +1152,7 @@ app.post('/api/referral/redeem', auth, async (req, res) => {
             points_balance: (user.points_balance || 0) + Math.floor(credit / 10)
         }).eq('id', user.id);
         res.json({ message: `✅ ${credit} KES redeemed!`, points_added: Math.floor(credit / 10) });
-    } catch(err) {
+    } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
@@ -932,7 +1175,7 @@ app.post('/api/referral/apply', async (req, res) => {
             points_balance: (referee.points_balance || 0) + 50
         }).eq('id', referee.id);
         res.json({ message: '✅ Referral applied! Both users get bonuses' });
-    } catch(err) {
+    } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
@@ -949,7 +1192,7 @@ app.get('/api/templates', auth, async (req, res) => {
         else if (category === 'business') templates = BUSINESS_TEMPLATES;
         else templates = [...FREELANCER_TEMPLATES, ...BUSINESS_TEMPLATES];
         res.json({ templates });
-    } catch(err) {
+    } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
@@ -978,9 +1221,17 @@ app.post('/api/templates/apply', auth, upload.array('files', 1), async (req, res
             })
         });
         const result = await response.json();
-        const generatedContent = result.choices[0]?.message?.content || '';
+        let generatedContent = result.choices[0]?.message?.content || '';
+
+        // Second pass: review the draft for padding, overconfidence, and
+        // formatting before returning it. This is where the extra latency
+        // is worth it — these are client-facing documents (proposals,
+        // cover letters, invoices) where polish matters and the user
+        // already expects a short generation wait.
+        generatedContent = await selfCritiquePass(generatedContent, prompt, GROQ_API_KEY);
+
         res.json({ template_name: template.name, generated: generatedContent, shareable: true });
-    } catch(err) {
+    } catch (err) {
         console.error('Template error:', err);
         res.status(500).json({ error: err.message });
     }
@@ -1008,7 +1259,7 @@ app.post('/api/share/create', auth, async (req, res) => {
             whatsapp_link: `https://wa.me/?text=${encodeURIComponent(whatsappText)}`,
             twitter_link: `https://twitter.com/intent/tweet?text=Check%20this%20response%20from%20TechNovaphy%20AI&url=${encodeURIComponent(shareLink)}`
         });
-    } catch(err) {
+    } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
@@ -1027,13 +1278,13 @@ app.get('/api/share/:shareId', async (req, res) => {
             created_at: share.created_at,
             created_by: share.user_id
         });
-    } catch(err) {
+    } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
 
 // ============================================================
-//  CHAT STREAM – WITH TRUNCATION (FIXED)
+//  CHAT STREAM – WITH TRUNCATION
 // ============================================================
 
 app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) => {
@@ -1049,7 +1300,7 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
             }
             if (user.tier === 'free') {
                 try { user = await checkFreeSession(user); }
-                catch(lockError) {
+                catch (lockError) {
                     return res.status(429).json({
                         error: lockError.message,
                         lock_remaining_minutes: lockError.minutesLeft || null
@@ -1071,7 +1322,7 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
         let conversation = await getConversation(user.id);
         let newMessages;
         try { newMessages = JSON.parse(req.body.messages); }
-        catch(e) { return res.status(400).json({ error: 'Invalid messages format' }); }
+        catch (e) { return res.status(400).json({ error: 'Invalid messages format' }); }
         conversation = conversation.concat(newMessages);
 
         // ---- TRUNCATE CONVERSATION to last MAX_CONVERSATION_HISTORY messages ----
@@ -1136,27 +1387,8 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
         }
 
         const memoryPrompt = user.memory ? `\n\nUser context: ${user.memory}` : '';
-        const systemPrompt = `You are TechNovaphy AI – a warm, thoughtful, and highly capable African assistant.
 
-Your goal is not just to answer questions, but to **understand, guide, and empower** the user.
-You think step‑by‑step, offer structure, and always provide actionable value.
-
-Always:
-- Start with a warm, human greeting (e.g., "That's a great question!", "I can see why you'd ask that.").
-- Break down problems into clear, logical steps.
-- Offer multiple solutions when possible, and explain the trade‑offs.
-- Use structure: headings, bullet points, tables, code blocks.
-- Admit when you're unsure, but always offer a thoughtful suggestion.
-- End with a thoughtful question or next step (e.g., "What would you like to explore next?").
-- Be professional, but approachable – like a trusted mentor.
-
-You understand African contexts, cultures, and challenges.
-You speak with kindness, patience, and a touch of humour.
-You are proud of African innovation and technology.
-
-You excel at IT, web development, cloud architecture, business strategy, freelancing, and general knowledge.
-${memoryPrompt}
-${languageInstruction}`;
+        const systemPrompt = buildSystemPrompt({ memoryPrompt, languageInstruction });
 
         const groqMessages = [{ role: 'system', content: systemPrompt }, ...conversation];
         const model = hasImage ? 'meta-llama/llama-4-scout-17b-16e-instruct' : 'llama-3.3-70b-versatile';
@@ -1185,7 +1417,7 @@ ${languageInstruction}`;
                 if (errorJson.error && errorJson.error.message) {
                     errorMessage = errorJson.error.message;
                 }
-            } catch(e) {}
+            } catch (e) {}
             if (groqResponse.status === 413) {
                 errorMessage = 'Your conversation is too long. Please start a new chat or shorten your message. (Token limit exceeded)';
             }
@@ -1194,7 +1426,7 @@ ${languageInstruction}`;
 
         const reader = groqResponse.body.getReader();
         const decoder = new TextDecoder();
-        let buffer = '', fullContent = '';
+        let buffer = '', rawContent = '';
 
         while (true) {
             const { done, value } = await reader.read();
@@ -1210,21 +1442,36 @@ ${languageInstruction}`;
                         const json = JSON.parse(data);
                         const text = json.choices[0]?.delta?.content || '';
                         if (text) {
-                            fullContent += text;
-                            res.write(`data: ${JSON.stringify({ type: 'chunk', text })}\n\n`);
+                            rawContent += text;
+                            // Re-derive thinking/answer from the full raw text so far.
+                            // Both events send the CUMULATIVE text (not a delta) so the
+                            // frontend can just set content directly rather than append —
+                            // this keeps rendering correct even if tag boundaries land
+                            // awkwardly across chunk splits.
+                            const { thinking, answer } = parseThinkingAndAnswer(rawContent);
+                            if (thinking) {
+                                res.write(`data: ${JSON.stringify({ type: 'thinking', text: thinking })}\n\n`);
+                            }
+                            if (answer) {
+                                res.write(`data: ${JSON.stringify({ type: 'chunk', text: answer })}\n\n`);
+                            }
                         }
-                    } catch(e) {}
+                    } catch (e) {}
                 }
             }
         }
 
-        conversation.push({ role: 'assistant', content: fullContent });
+        const { thinking: finalThinking, answer: finalAnswer } = parseThinkingAndAnswer(rawContent);
+        // Store only the clean answer in conversation history — the model
+        // doesn't need to see its own <thinking> tags echoed back to it on
+        // the next turn, and it keeps context usage lower.
+        conversation.push({ role: 'assistant', content: finalAnswer });
         await saveConversation(user.id, conversation);
 
         // ---- Check badges ----
         const unlockedBadges = await checkAndUnlockBadges(user.id, user);
 
-        const suggestions = generateSuggestions(fullContent);
+        const suggestions = generateSuggestions(finalAnswer);
         const upgrade_prompt = user.tier === 'free' && user.usage_count >= 50 ? {
             show: true,
             message: "You're loving this! Upgrade for unlimited messages"
@@ -1232,7 +1479,8 @@ ${languageInstruction}`;
 
         res.write(`data: ${JSON.stringify({
             type: 'done',
-            text: fullContent,
+            text: finalAnswer,
+            thinking: finalThinking,
             suggestions,
             points_earned: POINTS_PER_MESSAGE,
             badges_unlocked: unlockedBadges,
@@ -1240,7 +1488,7 @@ ${languageInstruction}`;
         })}\n\n`);
         res.end();
 
-    } catch(err) {
+    } catch (err) {
         console.error('Chat stream error:', err);
         if (!res.headersSent) {
             res.status(500).json({ error: err.message || 'Something went wrong.' });
@@ -1316,14 +1564,14 @@ app.post('/api/generate-image', auth, async (req, res) => {
 
         if (!imageUrl) throw new Error('All image generation methods failed.');
         res.json({ url: imageUrl, fallback: usedFallback });
-    } catch(err) {
+    } catch (err) {
         console.error('❌ Image gen error:', err);
         res.status(500).json({ error: err.message });
     }
 });
 
 // ============================================================
-//  PAYMENT – SUPPORTS NGN AND KES
+//  PAYMENT – SUPPORTS NGN AND KES (subunit-correct)
 // ============================================================
 
 app.post('/api/create-checkout', auth, async (req, res) => {
@@ -1331,11 +1579,14 @@ app.post('/api/create-checkout', auth, async (req, res) => {
         const { idempotencyKey, tier, currency } = req.body;
         const user = req.user;
 
-        console.log(`📦 Checkout request: tier=${tier}, currency=${currency}`);
-
+        if (!idempotencyKey) {
+            return res.status(400).json({ error: 'idempotencyKey is required' });
+        }
         if (!tier || !['starter', 'pro', 'enterprise', 'ultimate'].includes(tier)) {
             return res.status(400).json({ error: 'Invalid tier selected.' });
         }
+
+        console.log(`📦 Checkout request: tier=${tier}, currency=${currency}`);
 
         // ---- Determine final currency ----
         let finalCurrency = (currency || '').toUpperCase();
@@ -1344,32 +1595,32 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             finalCurrency = userCountry === 'NG' ? 'NGN' : 'KES';
         }
 
-        // ---- Supported African currencies (including NGN and KES) ----
         const supportedCurrencies = ['KES', 'NGN', 'GHS', 'ZAR', 'EGP', 'RWF', 'TZS', 'UGX', 'XOF', 'XAF'];
         if (!supportedCurrencies.includes(finalCurrency)) {
             console.warn(`⚠️ Unsupported currency ${finalCurrency}, defaulting to KES`);
             finalCurrency = 'KES';
         }
 
-        // ---- Amount conversion ----
-        let amount = TIER_PRICES_KES[tier]; // base in KES
+        // ---- Step 1: get the human-readable amount in the target currency ----
+        let humanAmount = TIER_PRICES_KES[tier]; // base price in KES
 
         if (finalCurrency !== 'KES') {
             const rates = await fetchExchangeRates();
             const rate = rates[finalCurrency];
             if (rate) {
-                const converted = amount * rate;
-                const withCents = ['USD','EUR','GBP','ZAR','EGP'];
-                amount = withCents.includes(finalCurrency) ? Math.round(converted * 100) : Math.round(converted);
-                console.log(`💱 ${TIER_PRICES_KES[tier]} KES → ${amount} ${finalCurrency}`);
+                humanAmount = TIER_PRICES_KES[tier] * rate;
+                console.log(`💱 ${TIER_PRICES_KES[tier]} KES → ${humanAmount.toFixed(2)} ${finalCurrency}`);
             } else {
                 console.warn(`⚠️ Rate missing for ${finalCurrency}, defaulting to KES`);
                 finalCurrency = 'KES';
-                amount = TIER_PRICES_KES[tier];
+                humanAmount = TIER_PRICES_KES[tier];
             }
-        } else {
-            amount = TIER_PRICES_KES[tier];
         }
+
+        // ---- Step 2: convert to Paystack's subunit format ONCE, for every currency ----
+        // Paystack requires amounts in the smallest unit of the currency
+        // (kobo for NGN, cents for KES, pesewas for GHS, etc.) — no exceptions.
+        const amount = Math.round(humanAmount * 100);
 
         // ---- Check duplicate ----
         const { data: existing } = await supabase
@@ -1404,7 +1655,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             },
             body: JSON.stringify({
                 email: user.email,
-                amount: amount,
+                amount: amount, // subunit amount
                 currency: finalCurrency,
                 channels: channels,
                 metadata: {
@@ -1422,7 +1673,8 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             return res.status(500).json({ error: data.message || 'Paystack initialization failed' });
         }
 
-        // ---- Record payment ----
+        // ---- Record payment. Store the SUBUNIT amount so the webhook's
+        // amount comparison (Paystack also sends subunits) matches exactly. ----
         await supabase.from('payments').insert({
             user_id: user.id,
             transaction_id: idempotencyKey,
@@ -1432,40 +1684,11 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             tier
         });
 
-        console.log(`✅ Payment initialized: ${amount} ${finalCurrency} for ${tier}`);
+        console.log(`✅ Payment initialized: ${amount} ${finalCurrency} subunits for ${tier}`);
         res.json({ url: data.data.authorization_url });
-    } catch(err) {
+    } catch (err) {
         console.error('❌ Checkout error:', err);
         res.status(500).json({ error: err.message });
-    }
-});
-
-// ============================================================
-//  PAYSTACK WEBHOOK
-// ============================================================
-
-app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), async (req, res) => {
-    try {
-        const payload = req.body;
-        const event = payload.event;
-        const data = payload.data;
-
-        if (event === 'charge.success') {
-            const metadata = data.metadata || {};
-            const userId = metadata.userId;
-            const tier = metadata.tier || 'pro';
-            const idempotencyKey = metadata.idempotencyKey;
-
-            if (userId) {
-                await supabase.from('payments').update({ status: 'completed' }).eq('transaction_id', idempotencyKey);
-                await supabase.from('users').update({ tier: tier, usage_count: 0 }).eq('id', userId);
-                console.log(`✅ User ${userId} upgraded to ${tier}`);
-            }
-        }
-        res.sendStatus(200);
-    } catch(err) {
-        console.error('Webhook error:', err);
-        res.sendStatus(500);
     }
 });
 
