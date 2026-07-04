@@ -1,10 +1,4 @@
-// ============================================================
-//  TECHNOVAPHY AI – COMPLETE BACKEND (FINAL, PATCHED)
-//  - All features: auth, chat, gamification, referrals,
-//    templates, sharing, image generation, payments (KES & NGN)
-//  - Patched: webhook signature verification, correct middleware
-//    order, subunit-correct payment amounts, batched badge checks
-// ============================================================
+
 require('dotenv').config();
 
 const express = require('express');
@@ -20,9 +14,6 @@ const crypto = require('crypto');
 const app = express();
 
 // ----- CORS -----
-// NOTE: '*' + credentials:true is invalid per the CORS spec — browsers will
-// reject or silently drop credentials. Set FRONTEND_URL to your real
-// frontend origin(s) before going live.
 app.use(cors({
     origin: process.env.FRONTEND_URL || '*',
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
