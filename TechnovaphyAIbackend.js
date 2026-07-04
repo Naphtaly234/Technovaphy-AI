@@ -1,3 +1,6 @@
+
+//  TECHNOVAPHY AI – 
+
 require('dotenv').config();
 
 const express = require('express');
@@ -12,7 +15,6 @@ const crypto = require('crypto');
 
 const app = express();
 
-// CORS
 app.use(cors({
     origin: process.env.FRONTEND_URL || '*',
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
@@ -21,7 +23,7 @@ app.use(cors({
     optionsSuccessStatus: 200
 }));
 
-// Required env vars
+// ----- Environment Variables -----
 const required = [
     'SUPABASE_URL',
     'SUPABASE_SERVICE_ROLE_KEY',
@@ -51,7 +53,7 @@ if (!OPENROUTER_API_KEY) {
     console.warn('⚠️ OPENROUTER_API_KEY not set — fallback disabled.');
 }
 
-// Supabase client
+// ----- Supabase Client -----
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 (async function initDb() {
     try {
@@ -66,7 +68,10 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
     }
 })();
 
-// Paystack webhook – needs raw body
+// ============================================================
+//  PAYSTACK WEBHOOK (MUST BE BEFORE express.json())
+// ============================================================
+
 app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), async (req, res) => {
     try {
         const signature = req.headers['x-paystack-signature'];
@@ -128,11 +133,10 @@ app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), as
     }
 });
 
-// Body parsers
+// ----- Global Middleware -----
 app.use(express.json({ limit: '20mb' }));
 app.use(express.urlencoded({ limit: '20mb', extended: true }));
 
-// Rate limit for auth
 const authLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 10,
@@ -141,7 +145,10 @@ const authLimiter = rateLimit({
 app.use('/api/auth/login', authLimiter);
 app.use('/api/auth/register', authLimiter);
 
-// Constants
+// ============================================================
+//  CONSTANTS
+// ============================================================
+
 const TIER_PRICES_KES = { starter: 200, pro: 1700, enterprise: 17000, ultimate: 100000 };
 const TIER_LIMITS = { free: 200, starter: 200, pro: 2500, enterprise: Infinity, ultimate: 1000000 };
 const TIER_NAMES = { free: 'Free (5 hrs)', starter: 'Starter', pro: 'Pro', enterprise: 'Enterprise', ultimate: 'Ultimate' };
@@ -149,7 +156,10 @@ const FREE_SESSION_HOURS = 5;
 const FREE_LOCK_HOURS = 4;
 const MAX_CONVERSATION_HISTORY = 12;
 
-// System prompt builder
+// ============================================================
+//  SYSTEM PROMPT & PARSING
+// ============================================================
+
 function buildSystemPrompt({ memoryPrompt, languageInstruction }) {
     return `You are TechNovaphy AI, built for African freelancers, small businesses, and developers.
 
@@ -179,7 +189,6 @@ ${memoryPrompt}
 ${languageInstruction}`;
 }
 
-// Parse thinking/answer from output
 function parseThinkingAndAnswer(rawText) {
     const thinkClosed = rawText.match(/<thinking>([\s\S]*?)<\/thinking>/i);
     const thinkOpen = rawText.match(/<thinking>([\s\S]*)$/i);
@@ -200,7 +209,10 @@ function parseThinkingAndAnswer(rawText) {
     return { thinking: thinking.trim(), answer: answer.trim() };
 }
 
-// AI fallback: Groq -> OpenRouter
+// ============================================================
+//  SMART FAILOVER: GROQ → OPENROUTER
+// ============================================================
+
 async function fetchAIResponseWithFailover(groqMessages, model, groqApiKey, openrouterApiKey) {
     const actualGroqModel = model.includes('scout') ? model : 'llama-3.3-70b-versatile';
 
@@ -244,7 +256,10 @@ async function fetchAIResponseWithFailover(groqMessages, model, groqApiKey, open
     return { response: openrouterResponse, source: 'openrouter' };
 }
 
-// DB helpers
+// ============================================================
+//  HELPERS
+// ============================================================
+
 async function findUser(email) {
     const { data, error } = await supabase.from('users').select('*').eq('email', email).maybeSingle();
     if (error) throw new Error('DB: ' + error.message);
@@ -257,7 +272,6 @@ async function findUserById(id) {
     return data;
 }
 
-// Reset monthly usage
 async function resetMonthlyUsageIfNeeded(user) {
     const now = new Date();
     const resetDate = new Date(user.monthly_reset_date);
@@ -274,7 +288,6 @@ async function resetMonthlyUsageIfNeeded(user) {
     return user;
 }
 
-// Free tier session (5h on, 4h lock)
 async function checkFreeSession(user) {
     if (user.tier !== 'free') return user;
     const now = new Date();
@@ -298,7 +311,6 @@ async function checkFreeSession(user) {
 
 function getLimit(tier) { return TIER_LIMITS[tier] || 200; }
 
-// Conversation storage
 async function getConversation(userId) {
     const { data, error } = await supabase.from('conversations').select('messages').eq('user_id', userId).maybeSingle();
     if (error && error.code !== 'PGRST116') throw error;
@@ -314,7 +326,6 @@ async function saveConversation(userId, messages) {
     if (error) throw new Error('Failed to save conversation: ' + error.message);
 }
 
-// Per-user rate limit (in-memory)
 const userRateLimit = new Map();
 const RATE_LIMIT_WINDOW = 60 * 1000;
 const RATE_LIMIT_MAX = 10;
@@ -342,7 +353,10 @@ function checkRateLimit(userId) {
     return true;
 }
 
-// Auth middleware
+// ============================================================
+//  AUTH MIDDLEWARE
+// ============================================================
+
 const auth = async (req, res, next) => {
     const authHeader = req.headers.authorization;
     if (!authHeader) return res.status(401).json({ error: 'No token provided' });
@@ -358,12 +372,14 @@ const auth = async (req, res, next) => {
     }
 };
 
-// Public routes
+// ============================================================
+//  PUBLIC ROUTES
+// ============================================================
+
 app.get('/', (req, res) => res.send('TechNovaphy AI Backend running'));
 app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 app.get('/api/ping', (req, res) => res.json({ status: 'ok' }));
 
-// Register
 app.post('/api/auth/register', async (req, res) => {
     try {
         const { email, password, ageConfirmed, country } = req.body;
@@ -401,7 +417,6 @@ app.post('/api/auth/register', async (req, res) => {
     }
 });
 
-// Login
 app.post('/api/auth/login', async (req, res) => {
     try {
         const { email, password } = req.body;
@@ -421,7 +436,10 @@ app.post('/api/auth/login', async (req, res) => {
     }
 });
 
-// User profile
+// ============================================================
+//  USER ROUTES
+// ============================================================
+
 app.get('/api/user/profile', auth, async (req, res) => {
     try {
         let user = req.user;
@@ -467,7 +485,6 @@ app.get('/api/user/profile', auth, async (req, res) => {
     }
 });
 
-// Update memory
 app.post('/api/auth/update-memory', auth, async (req, res) => {
     try {
         const { memory } = req.body;
@@ -479,7 +496,10 @@ app.post('/api/auth/update-memory', auth, async (req, res) => {
     }
 });
 
-// Conversation history
+// ============================================================
+//  CONVERSATION HISTORY ROUTES
+// ============================================================
+
 app.get('/api/conversations', auth, async (req, res) => {
     try {
         const user = req.user;
@@ -555,7 +575,10 @@ app.delete('/api/conversations/:conversationId', auth, async (req, res) => {
     }
 });
 
-// File upload
+// ============================================================
+//  FILE UPLOAD
+// ============================================================
+
 const storage = multer.memoryStorage();
 const fileFilter = (req, file, cb) => {
     const allowedTypes = ['image/jpeg', 'image/png', 'image/webp', 'application/pdf', 'text/plain', 'text/csv'];
@@ -582,7 +605,10 @@ async function extractFileContent(file) {
     }
 }
 
-// Chat stream
+// ============================================================
+//  CHAT STREAM
+// ============================================================
+
 app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) => {
     try {
         let user = req.user;
@@ -702,7 +728,7 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
                         const text = json.choices[0]?.delta?.content || '';
                         if (text) {
                             rawContent += text;
-                            const { answer } = parseThinkingAndAnswer(rawContent);
+                            const { thinking, answer } = parseThinkingAndAnswer(rawContent);
                             if (answer) {
                                 res.write(`data: ${JSON.stringify({ type: 'chunk', text: answer })}\n\n`);
                             }
@@ -734,7 +760,10 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
     }
 });
 
-// Image generation
+// ============================================================
+//  IMAGE GENERATION
+// ============================================================
+
 app.post('/api/generate-image', auth, async (req, res) => {
     try {
         const { prompt } = req.body;
@@ -772,7 +801,10 @@ app.post('/api/generate-image', auth, async (req, res) => {
     }
 });
 
-// Payment - exchange rates
+// ============================================================
+//  PAYMENT
+// ============================================================
+
 let exchangeRates = { KES: 1 };
 let ratesLastFetched = 0;
 
@@ -792,7 +824,6 @@ async function fetchExchangeRates() {
     return exchangeRates;
 }
 
-// Create checkout
 app.post('/api/create-checkout', auth, async (req, res) => {
     try {
         const { idempotencyKey, tier, currency } = req.body;
@@ -865,5 +896,8 @@ app.post('/api/create-checkout', auth, async (req, res) => {
     }
 });
 
-// Start server
+// ============================================================
+//  START
+// ============================================================
+
 app.listen(PORT, () => console.log(`🚀 TechNovaphy AI Backend running on port ${PORT}`));
