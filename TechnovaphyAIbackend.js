@@ -1,6 +1,8 @@
 // ============================================================
 //  TECHNOVAPHY AI – COMPLETE BACKEND (JWT + OWNER BYPASS + CONCURRENCY)
 //  All features: Auth, Chat, Projects, Code Runner, Subscriptions
+//  FIX APPLIED: broadened Paystack "already subscribed" detection
+//  in /api/subscribe-code so it no longer throws/logs repeatedly.
 // ============================================================
 require('dotenv').config();
 
@@ -39,7 +41,7 @@ try {
 
 const app = express();
 
-// ---- FIX: Trust proxy for rate limiting behind Render ----
+// ---- Trust proxy for rate limiting behind Render ----
 app.set('trust proxy', 1);
 
 // ---- CORS ----
@@ -803,6 +805,9 @@ app.post('/api/create-checkout', auth, async (req, res) => {
 
 // ============================================================
 //  CODE RUNNER SUBSCRIPTION (fixed 1000/month) – with duplicate check
+//  FIX: broadened matching for Paystack's "already subscribed" message
+//  so it stops throwing/logging on every retry and instead returns
+//  a graceful 200 response.
 // ============================================================
 app.post('/api/subscribe-code', auth, async (req, res) => {
     try {
@@ -885,16 +890,28 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
 
         // ---- If Paystack says user already has a subscription, handle gracefully ----
         if (!data.status) {
-            if (data.message && data.message.toLowerCase().includes('subscription already exists')) {
-                // This means the user already has a subscription with Paystack,
-                // but our DB didn't reflect it. We'll mark them as unlocked and return success.
+            const msg = (data.message || '').toLowerCase();
+            const alreadySubscribed =
+                msg.includes('subscription already exists') ||
+                msg.includes('already in place') ||
+                msg.includes('already has a subscription') ||
+                msg.includes('already subscribed');
+
+            if (alreadySubscribed) {
+                // The user already has a Paystack subscription, but our DB
+                // didn't reflect it. Mark them as unlocked and return success
+                // instead of throwing — this is what stopped the repeating
+                // "Code subscription error" log spam.
                 await supabase.from('users').update({ code_runner_unlocked: true }).eq('id', user.id);
                 return res.status(200).json({
                     alreadyActive: true,
                     message: 'You already have an active subscription. Enjoy unlimited code execution!'
                 });
             }
-            throw new Error(data.message || 'Subscription initialization failed');
+
+            // Log the raw Paystack message for visibility instead of a full throw/stack trace
+            console.error('Code subscription error (Paystack):', data.message || 'Unknown error');
+            return res.status(502).json({ error: data.message || 'Subscription initialization failed' });
         }
 
         // Save payment record
@@ -910,7 +927,7 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
 
         res.json({ url: data.data.authorization_url, amount: amount, currency: currency, subscription: true });
     } catch (err) {
-        console.error('Code subscription error:', err);
+        console.error('Code subscription error:', err.message);
         res.status(500).json({ error: err.message });
     }
 });
