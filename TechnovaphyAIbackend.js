@@ -1,9 +1,11 @@
 // ============================================================
-//  TECHNOVAPHY AI – COMPLETE BACKEND (JWT + OWNER BYPASS + CONCURRENCY)
-//  All features: Auth, Chat, Projects, Code Runner, Subscriptions
-//  FIX APPLIED: broadened Paystack "already subscribed" detection
-//  in /api/subscribe-code so it no longer throws/logs repeatedly.
+//  TECHNOVAPHY AI – COMPLETE BACKEND
+//  Purpose: African Assistant with model selection and code runner
+//  Models: MiniMax M3, GLM-5.2, NVIDIA Nemotron 3, Groq Llama 3.3
+//  All via OpenRouter – single API key
 // ============================================================
+
+// Load environment variables
 require('dotenv').config();
 
 const express = require('express');
@@ -15,6 +17,7 @@ const { createClient } = require('@supabase/supabase-js');
 const crypto = require('crypto');
 
 // ---- Redis (optional) ----
+// Shared rate limiting across multiple instances – falls back to memory if not available
 let redisClient = null;
 let redisAvailable = false;
 try {
@@ -39,9 +42,10 @@ try {
     console.log('ℹ️ Redis package not installed, using in‑memory fallback');
 }
 
+// ---- Express app ----
 const app = express();
 
-// ---- Trust proxy for rate limiting behind Render ----
+// Trust proxy – needed behind Render's load balancer
 app.set('trust proxy', 1);
 
 // ---- CORS ----
@@ -54,7 +58,7 @@ app.use(cors({
 }));
 
 // ---- Environment checks ----
-const required = ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'JWT_SECRET', 'GROQ_API_KEY', 'PAYSTACK_SECRET_KEY'];
+const required = ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'JWT_SECRET', 'OPENROUTER_API_KEY', 'PAYSTACK_SECRET_KEY'];
 const missing = required.filter(key => !process.env[key]);
 if (missing.length) {
     console.error('❌ Missing env variables:', missing.join(', '));
@@ -65,40 +69,15 @@ const PORT = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://your-frontend.netlify.app';
 const OWNER_EMAIL = process.env.OWNER_EMAIL || null;
-const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || null;
 
-// ---- Concurrent request limiter ----
-const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT_REQUESTS) || 10000;
-let activeRequests = 0;
-const concurrencyQueue = [];
-
-function acquireConcurrency() {
-    return new Promise((resolve) => {
-        if (activeRequests < MAX_CONCURRENT) {
-            activeRequests++;
-            resolve();
-        } else {
-            concurrencyQueue.push(resolve);
-        }
-    });
-}
-
-function releaseConcurrency() {
-    activeRequests--;
-    if (concurrencyQueue.length > 0) {
-        const next = concurrencyQueue.shift();
-        activeRequests++;
-        next();
-    }
-}
-
+// ---- Supabase client ----
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
-// ---- Database init ----
+// ---- Test database connection ----
 (async function initDb() {
     try {
         const { error } = await supabase.from('users').select('id').limit(1);
@@ -113,6 +92,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 })();
 
 // ---- PAYSTACK WEBHOOK (must be before express.json()) ----
+// Handles both tier upgrades and code runner subscriptions
 app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), async (req, res) => {
     try {
         const signature = req.headers['x-paystack-signature'];
@@ -163,7 +143,7 @@ app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), as
 app.use(express.json({ limit: '20mb' }));
 app.use(express.urlencoded({ limit: '20mb', extended: true }));
 
-// ---- Rate limiting for auth ----
+// ---- Rate limiting for authentication ----
 const authLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 10,
@@ -189,7 +169,7 @@ const PAYMENT_CHANNELS = {
 };
 
 // ============================================================
-//  SYSTEM PROMPT (improved)
+//  SYSTEM PROMPT – for the main chat assistant
 // ============================================================
 function buildSystemPrompt({ memoryPrompt, languageInstruction }) {
     return `You are TechNovaphy AI, built for African freelancers and businesses.
@@ -216,6 +196,7 @@ ${memoryPrompt}
 ${languageInstruction}`;
 }
 
+// ---- Parse the thinking/answer tags (we keep it for compatibility) ----
 function parseThinkingAndAnswer(rawText) {
     const thinkClosed = rawText.match(/<thinking>([\s\S]*?)<\/thinking>/i);
     const thinkOpen = rawText.match(/<thinking>([\s\S]*)$/i);
@@ -232,37 +213,55 @@ function parseThinkingAndAnswer(rawText) {
 }
 
 // ============================================================
-//  SMART FAILOVER: GROQ → OPENROUTER
+//  SMART FAILOVER: OpenRouter models chain
+//  Humanized comment: This function tries the user's chosen model first,
+//  then falls back to a list of other capable models if needed.
 // ============================================================
-async function fetchAIResponseWithFailover(groqMessages, model, groqApiKey, openrouterApiKey) {
-    const actualGroqModel = model.includes('scout') ? model : 'llama-3.3-70b-versatile';
+async function fetchAIResponseWithFailover(messages, userSelectedModel) {
+    // The master list of models – the user's choice comes first, then fallbacks
+    const fallbackModels = [
+        'minimax/minimax-m3-preview',           // Primary: MiniMax M3 – multimodal reasoning
+        'zai-org/glm-5.2',                      // Secondary: GLM-5.2 – agentic & coding
+        'nvidia/nemotron-3-ultra',              // Tertiary: NVIDIA Nemotron 3 Ultra – 1M context
+        'nvidia/nemotron-3-super',              // Quaternary: NVIDIA Nemotron 3 Super – 1M context
+        'groq/llama-3.3-70b-versatile',         // Quintenary: Groq Llama 3.3 – fast fallback
+        'anthropic/claude-haiku-4.5'            // Last resort: Claude Haiku – always available
+    ];
 
-    try {
-        const groqResponse = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-            method: 'POST',
-            headers: { 'Authorization': `Bearer ${groqApiKey}`, 'Content-Type': 'application/json' },
-            body: JSON.stringify({ model: actualGroqModel, messages: groqMessages, temperature: 0.7, top_p: 0.9, stream: true })
-        });
-        if (groqResponse.ok) return { response: groqResponse, source: 'groq' };
-        if (!openrouterApiKey) throw new Error(`Groq ${groqResponse.status}`);
-    } catch (err) {
-        if (!openrouterApiKey) throw err;
+    // Build the ordered list: user's choice first, then all fallbacks (excluding duplicates)
+    const modelsToTry = [userSelectedModel, ...fallbackModels.filter(m => m !== userSelectedModel)];
+
+    for (const model of modelsToTry) {
+        try {
+            console.log(`🔄 Attempting OpenRouter (${model})...`);
+            const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
+                    'Content-Type': 'application/json',
+                    'HTTP-Referer': 'https://technovaphy.ai'
+                },
+                body: JSON.stringify({
+                    model: model,
+                    messages: messages,
+                    temperature: 0.7,
+                    top_p: 0.9,
+                    stream: true
+                })
+            });
+
+            if (response.ok) {
+                console.log(`✅ OpenRouter succeeded with ${model}`);
+                return { response, source: model };
+            }
+
+            console.warn(`⚠️ ${model} failed (${response.status}) – trying next...`);
+        } catch (err) {
+            console.warn(`⚠️ ${model} error: ${err.message}`);
+        }
     }
 
-    const orResponse = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-            'Authorization': `Bearer ${openrouterApiKey}`,
-            'Content-Type': 'application/json',
-            'HTTP-Referer': 'https://technovaphy.ai'
-        },
-        body: JSON.stringify({ model: 'anthropic/claude-haiku-4.5', messages: groqMessages, temperature: 0.7, top_p: 0.9, stream: true })
-    });
-    if (!orResponse.ok) {
-        const err = await orResponse.text();
-        throw new Error(`OpenRouter: ${err}`);
-    }
-    return { response: orResponse, source: 'openrouter' };
+    throw new Error('All AI models failed. Please try again later.');
 }
 
 // ============================================================
@@ -331,8 +330,34 @@ if (!redisAvailable) {
     }, 60 * 1000);
 }
 
+// ---- Concurrent request limiter ----
+// Prevents the server from being overwhelmed by too many concurrent AI requests
+const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT_REQUESTS) || 10000;
+let activeRequests = 0;
+const concurrencyQueue = [];
+
+function acquireConcurrency() {
+    return new Promise((resolve) => {
+        if (activeRequests < MAX_CONCURRENT) {
+            activeRequests++;
+            resolve();
+        } else {
+            concurrencyQueue.push(resolve);
+        }
+    });
+}
+
+function releaseConcurrency() {
+    activeRequests--;
+    if (concurrencyQueue.length > 0) {
+        const next = concurrencyQueue.shift();
+        activeRequests++;
+        next();
+    }
+}
+
 // ============================================================
-//  AUTH MIDDLEWARE (reads Authorization header)
+//  AUTH MIDDLEWARE
 // ============================================================
 const auth = async (req, res, next) => {
     const authHeader = req.headers.authorization;
@@ -356,7 +381,7 @@ app.get('/', (req, res) => res.send('TechNovaphy AI Backend'));
 app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 app.get('/api/ping', (req, res) => res.json({ status: 'ok' }));
 
-// ---- REGISTER ----
+// ---- Registration ----
 app.post('/api/auth/register', async (req, res) => {
     try {
         const { email, password, ageConfirmed, country } = req.body;
@@ -397,7 +422,7 @@ app.post('/api/auth/register', async (req, res) => {
     }
 });
 
-// ---- LOGIN (returns JWT token) ----
+// ---- Login ----
 app.post('/api/auth/login', async (req, res) => {
     try {
         const { email, password } = req.body;
@@ -417,7 +442,7 @@ app.post('/api/auth/login', async (req, res) => {
     }
 });
 
-// ---- PROFILE (with owner bypass) ----
+// ---- User Profile (owner bypass) ----
 app.get('/api/user/profile', auth, async (req, res) => {
     try {
         const user = req.user;
@@ -440,7 +465,7 @@ app.get('/api/user/profile', auth, async (req, res) => {
     }
 });
 
-// ---- UPDATE MEMORY ----
+// ---- Update Memory ----
 app.post('/api/auth/update-memory', auth, async (req, res) => {
     try {
         const { memory } = req.body;
@@ -597,7 +622,7 @@ app.delete('/api/projects/:id', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CHAT STREAM (with owner bypass & concurrency limit)
+//  CHAT STREAM – the heart of the assistant
 // ============================================================
 app.post('/api/chat/stream', auth, async (req, res) => {
     try {
@@ -621,6 +646,7 @@ app.post('/api/chat/stream', auth, async (req, res) => {
             return res.status(403).json({ error: 'Monthly limit reached' });
         }
 
+        // ---- Load conversation history ----
         let conversation = await getConversation(user.id);
         let newMessages;
         try { newMessages = JSON.parse(req.body.messages); } catch (e) {
@@ -633,15 +659,18 @@ app.post('/api/chat/stream', auth, async (req, res) => {
             conversation = conversation.slice(-MAX_CONVERSATION_HISTORY);
         }
 
+        // ---- Append the latest user message ----
         const userContent = conversation[conversation.length - 1]?.content || '';
         const finalUserMessage = { role: 'user', content: userContent };
         conversation.pop();
         conversation.push(finalUserMessage);
 
+        // ---- Increment usage counter (only for non‑owners) ----
         if (!isOwner) {
             await supabase.from('users').update({ usage_count: (user.usage_count || 0) + 1 }).eq('id', user.id);
         }
 
+        // ---- Build system prompt ----
         const language = req.body.language || 'auto';
         let languageInstruction = '';
         if (language !== 'auto') {
@@ -652,6 +681,10 @@ app.post('/api/chat/stream', auth, async (req, res) => {
 
         const groqMessages = [{ role: 'system', content: systemPrompt }, ...conversation];
 
+        // ---- Model selection: use user's choice or fallback to default ----
+        const userModel = req.body.model || 'minimax/minimax-m3-preview';
+
+        // ---- Set up SSE headers ----
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
@@ -663,12 +696,14 @@ app.post('/api/chat/stream', auth, async (req, res) => {
             originalEnd.apply(res, args);
         };
 
-        const { response: aiResponse } = await fetchAIResponseWithFailover(groqMessages, 'llama-3.3-70b-versatile', GROQ_API_KEY, OPENROUTER_API_KEY);
+        // ---- Call the AI with failover ----
+        const { response: aiResponse, source } = await fetchAIResponseWithFailover(groqMessages, userModel);
 
         if (!aiResponse.ok) {
             throw new Error(`AI error ${aiResponse.status}`);
         }
 
+        // ---- Stream the response ----
         const reader = aiResponse.body.getReader();
         const decoder = new TextDecoder();
         let buffer = '', rawContent = '';
@@ -698,14 +733,17 @@ app.post('/api/chat/stream', auth, async (req, res) => {
             }
         }
 
+        // ---- Finalise the conversation ----
         const { thinking: finalThinking, answer: finalAnswer } = parseThinkingAndAnswer(rawContent);
         conversation.push({ role: 'assistant', content: finalAnswer });
         await saveConversation(user.id, conversation);
 
+        // We no longer send 'thinking' to the frontend – but we keep it for logging if needed
         res.write(`data: ${JSON.stringify({
             type: 'done',
             text: finalAnswer,
-            thinking: finalThinking
+            // thinking: finalThinking,  // <-- removed to hide thinking box
+            model: source // optional: tell the client which model actually responded
         })}\n\n`);
         res.end();
 
@@ -804,10 +842,9 @@ app.post('/api/create-checkout', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CODE RUNNER SUBSCRIPTION (fixed 1000/month) – with duplicate check
-//  FIX: broadened matching for Paystack's "already subscribed" message
-//  so it stops throwing/logging on every retry and instead returns
-//  a graceful 200 response.
+//  CODE RUNNER SUBSCRIPTION (fixed 1000/month)
+//  Humanized comment: Users pay to unlock the code runner.
+//  The approval is handled by the same Paystack webhook as tier upgrades.
 // ============================================================
 app.post('/api/subscribe-code', auth, async (req, res) => {
     try {
@@ -815,7 +852,7 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
         const user = req.user;
         if (!idempotencyKey) return res.status(400).json({ error: 'idempotencyKey required' });
 
-        // ---- If already unlocked, return friendly message ----
+        // If already unlocked, return friendly message
         if (user.code_runner_unlocked) {
             return res.status(200).json({
                 alreadyActive: true,
@@ -832,7 +869,7 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
         const planName = `TechNovaphy Code Runner (${currency} ${amount})`;
         let planCode = null;
 
-        // Find existing plan
+        // Find existing Paystack plan
         try {
             const listPlans = await fetch('https://api.paystack.co/plan?perPage=50', {
                 headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}` }
@@ -867,7 +904,7 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
             }
         }
 
-        // ---- Initiate subscription ----
+        // Initiate subscription
         const response = await fetch('https://api.paystack.co/subscription', {
             method: 'POST',
             headers: {
@@ -888,29 +925,23 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
         });
         const data = await response.json();
 
-        // ---- If Paystack says user already has a subscription, handle gracefully ----
+        // Handle "already subscribed" from Paystack gracefully
         if (!data.status) {
             const msg = (data.message || '').toLowerCase();
-            const alreadySubscribed =
-                msg.includes('subscription already exists') ||
-                msg.includes('already in place') ||
-                msg.includes('already has a subscription') ||
-                msg.includes('already subscribed');
-
+            const alreadySubscribed = msg.includes('subscription already exists') ||
+                                      msg.includes('already in place') ||
+                                      msg.includes('already has a subscription') ||
+                                      msg.includes('already subscribed');
             if (alreadySubscribed) {
-                // The user already has a Paystack subscription, but our DB
-                // didn't reflect it. Mark them as unlocked and return success
-                // instead of throwing — this is what stopped the repeating
-                // "Code subscription error" log spam.
+                // Mark as unlocked in our DB and return success
                 await supabase.from('users').update({ code_runner_unlocked: true }).eq('id', user.id);
                 return res.status(200).json({
                     alreadyActive: true,
                     message: 'You already have an active subscription. Enjoy unlimited code execution!'
                 });
             }
-
-            // Log the raw Paystack message for visibility instead of a full throw/stack trace
-            console.error('Code subscription error (Paystack):', data.message || 'Unknown error');
+            // Otherwise, return the error
+            console.error('Code subscription error (Paystack):', data.message);
             return res.status(502).json({ error: data.message || 'Subscription initialization failed' });
         }
 
@@ -933,7 +964,9 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CODE EXECUTION (owner bypass & concurrency limit)
+//  CODE EXECUTION – powered by MiniMax M3 (critical thinking)
+//  Humanized comment: Only subscribed users can run code.
+//  MiniMax analyses the code, explains it, and suggests improvements.
 // ============================================================
 app.post('/api/run-code', auth, async (req, res) => {
     try {
@@ -945,7 +978,7 @@ app.post('/api/run-code', auth, async (req, res) => {
             await acquireConcurrency();
         }
 
-        // ---- Lock check (skip for owner) ----
+        // ---- Lock check: only subscribed users (or owners) can run code ----
         if (!isOwner && user.tier === 'free' && !user.code_runner_unlocked) {
             releaseConcurrency();
             return res.status(403).json({
@@ -960,39 +993,94 @@ app.post('/api/run-code', auth, async (req, res) => {
             return res.status(400).json({ error: 'No code provided' });
         }
 
-        let output = '', success = false;
-        try {
-            const pistonResponse = await fetch('https://emkc.org/api/v2/piston/execute', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ language, version, files: [{ content: code }] })
-            });
-            if (pistonResponse.ok) {
-                const result = await pistonResponse.json();
-                output = result.run?.output || result.compile?.output || JSON.stringify(result, null, 2);
-                success = true;
-            } else {
-                const errText = await pistonResponse.text();
-                if (pistonResponse.status === 403 || errText.includes('whitelist')) {
-                    success = false;
-                } else {
-                    throw new Error(`Piston error: ${errText}`);
-                }
-            }
-        } catch (e) { success = false; }
+        // ---- Build a smart prompt for MiniMax ----
+        const systemPrompt = `You are MiniMax M3, an expert coding assistant with strong reasoning and critical thinking skills.
 
-        if (!success) {
-            output = `⚠️ The public code execution service is currently unavailable.\n\nTo run this code locally:\n1. Copy the code below\n2. Paste it into a ${language} environment\n3. Run it there\n\n--- Your Code ---\n${code}`;
-            res.json({ output, fallback: true });
-        } else {
-            res.json({ output: output || '✅ Done (no output)' });
+You are helping a developer understand and improve their code.
+
+Analyse the following code snippet and provide:
+1. A brief summary of what the code does.
+2. Any potential issues or bugs.
+3. Suggestions for improvement (optimisation, readability, best practices).
+4. A simulation of the output (if it's a runnable script, explain what it would output when executed).
+
+Format your response as a clear, structured explanation – no markdown, just plain text with line breaks.
+
+LANGUAGE: ${language} (version ${version})
+
+CODE:
+\`\`\`
+${code}
+\`\`\`
+`;
+
+        const messages = [{ role: 'system', content: systemPrompt }];
+
+        // ---- Call MiniMax M3 via OpenRouter ----
+        const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
+                'Content-Type': 'application/json',
+                'HTTP-Referer': 'https://technovaphy.ai'
+            },
+            body: JSON.stringify({
+                model: 'minimax/minimax-m3-preview',
+                messages: messages,
+                temperature: 0.7,
+                stream: true,
+                max_tokens: 2000
+            })
+        });
+
+        if (!response.ok) {
+            const errText = await response.text();
+            throw new Error(`MiniMax error: ${errText}`);
         }
 
+        // ---- Stream the response ----
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '', fullContent = '';
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop();
+            for (const line of lines) {
+                if (line.startsWith('data: ')) {
+                    const data = line.slice(6);
+                    if (data === '[DONE]') continue;
+                    try {
+                        const json = JSON.parse(data);
+                        const text = json.choices[0]?.delta?.content || '';
+                        if (text) {
+                            fullContent += text;
+                            res.write(`data: ${JSON.stringify({ type: 'chunk', text: fullContent })}\n\n`);
+                        }
+                    } catch (e) {}
+                }
+            }
+        }
+
+        // ---- Send done event ----
+        res.write(`data: ${JSON.stringify({ type: 'done', text: fullContent })}\n\n`);
+        res.end();
         releaseConcurrency();
+
     } catch (err) {
         console.error('Code execution error:', err);
         if (!res.headersSent) {
             res.status(500).json({ error: err.message || 'Internal server error' });
+        } else {
+            res.write(`data: ${JSON.stringify({ type: 'error', message: err.message })}\n\n`);
+            res.end();
         }
         releaseConcurrency();
     }
