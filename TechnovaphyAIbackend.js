@@ -155,15 +155,50 @@ const TIER_FEATURES = {
 };
 const CODE_RUNNER_PRICE_KES = 1000;
 const MAX_CONVERSATION_HISTORY = 20;
-
 const PAYMENT_CHANNELS = {
-    KE: { country: 'Kenya', currency: 'KES', channels: ['card', 'bank_transfer', 'mpesa'], displayNames: { 'card': '💳 Card', 'bank_transfer': '🏦 Bank Transfer', 'mpesa': '📱 M-Pesa' } },
-    NG: { country: 'Nigeria', currency: 'NGN', channels: ['card', 'bank_transfer', 'ussd', 'bank'], displayNames: { 'card': '💳 Card', 'bank_transfer': '🏦 Bank Transfer', 'ussd': '📞 USSD', 'bank': '📱 Mobile Banking' } },
-    GH: { country: 'Ghana', currency: 'GHS', channels: ['card', 'bank_transfer'], displayNames: { 'card': '💳 Card', 'bank_transfer': '🏦 Bank Transfer' } },
-    UG: { country: 'Uganda', currency: 'UGX', channels: ['card', 'bank_transfer'], displayNames: { 'card': '💳 Card', 'bank_transfer': '🏦 Bank Transfer' } },
-    TZ: { country: 'Tanzania', currency: 'TZS', channels: ['card', 'bank_transfer'], displayNames: { 'card': '💳 Card', 'bank_transfer': '🏦 Bank Transfer' } }
+    KE: {
+        country: 'Kenya',
+        currency: 'KES',
+        channels: ['mpesa', 'mobile_money', 'bank_transfer'],
+        displayNames: {
+            'mpesa': '📱 M-Pesa',
+            'mobile_money': '📱 Airtel Money',
+            'bank_transfer': '🏦 Bank Transfer (Paybill)'
+        }
+    },
+    NG: {
+        country: 'Nigeria',
+        currency: 'NGN',
+        channels: ['bank_transfer'],
+        displayNames: {
+            'bank_transfer': '🏦 Bank Transfer'
+        }
+    },
+    GH: {
+        country: 'Ghana',
+        currency: 'GHS',
+        channels: ['bank_transfer'],
+        displayNames: {
+            'bank_transfer': '🏦 Bank Transfer'
+        }
+    },
+    UG: {
+        country: 'Uganda',
+        currency: 'UGX',
+        channels: ['bank_transfer'],
+        displayNames: {
+            'bank_transfer': '🏦 Bank Transfer'
+        }
+    },
+    TZ: {
+        country: 'Tanzania',
+        currency: 'TZS',
+        channels: ['bank_transfer'],
+        displayNames: {
+            'bank_transfer': '🏦 Bank Transfer'
+        }
+    }
 };
-
 // ============================================================
 //  SYSTEM PROMPT & PARSING
 // ============================================================
