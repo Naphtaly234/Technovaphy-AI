@@ -1,23 +1,8 @@
 // ============================================================
-//  TECHNOVAPHY AI – COMPLETE BACKEND
-//  Purpose: African Assistant with model selection and code runner
-//  Models: MiniMax M3, GLM-5.2, NVIDIA Nemotron 3, Groq Llama 3.3
-//  All via OpenRouter – single API key
-//
-//  ⚠️ PATCHED (see "FIX:" comments):
-//  1. /api/subscribe-code no longer grants access on a Paystack error
-//     message match. It now uses the same "initialize transaction with
-//     a plan attached" pattern as /api/create-checkout, so a user MUST
-//     complete a real Paystack payment before the signed webhook marks
-//     them unlocked. There is no client-trust / no-payment path left.
-//  2. Added GET /api/payment-status/:key so the frontend can poll and
-//     find out (safely, server-side) whether a payment actually cleared
-//     after the user returns from the Paystack checkout page.
-//  3. Added GET /api/pricing so the frontend can render a real, localized
-//     pricing/upgrade screen instead of hardcoding numbers.
+//  TECHNOVAPHY AI – COMPLETE BACKEND (PRODUCTION READY)
+//  All features: Auth, Chat, Projects, Code Runner, Subscriptions
 // ============================================================
 
-// Load environment variables
 require('dotenv').config();
 
 const express = require('express');
@@ -53,7 +38,6 @@ try {
     console.log('ℹ️ Redis package not installed, using in‑memory fallback');
 }
 
-// ---- Express app ----
 const app = express();
 app.set('trust proxy', 1);
 
@@ -84,6 +68,7 @@ const OWNER_EMAIL = process.env.OWNER_EMAIL || null;
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
+// ---- Database init ----
 (async function initDb() {
     try {
         const { error } = await supabase.from('users').select('id').limit(1);
@@ -94,11 +79,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
     }
 })();
 
-// ============================================================
-//  PAYSTACK WEBHOOK (must be before express.json())
-//  This is the ONLY place that ever grants a paid entitlement.
-//  The HMAC signature check below is what proves money actually moved.
-// ============================================================
+// ---- PAYSTACK WEBHOOK (must be before express.json()) ----
 app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), async (req, res) => {
     try {
         const signature = req.headers['x-paystack-signature'];
@@ -111,15 +92,12 @@ app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), as
         const event = payload.event;
         const data = payload.data;
 
-        // FIX: we only ever act on a genuinely successful charge event.
-        // 'subscription.create' by itself does NOT prove a payment cleared,
-        // so it is no longer treated as a trigger for unlocking anything.
         if (event === 'charge.success') {
             const metadata = data.metadata || {};
             const userId = metadata.userId;
             const idempotencyKey = metadata.idempotencyKey;
-            const type = metadata.type; // 'code_runner' or undefined
-            const paystackStatus = data.status; // should be 'success'
+            const type = metadata.type;
+            const paystackStatus = data.status;
 
             if (paystackStatus !== 'success') return res.sendStatus(200);
 
@@ -187,7 +165,7 @@ const PAYMENT_CHANNELS = {
 };
 
 // ============================================================
-//  SYSTEM PROMPT
+//  SYSTEM PROMPT & PARSING
 // ============================================================
 function buildSystemPrompt({ memoryPrompt, languageInstruction }) {
     return `You are TechNovaphy AI, built for African freelancers and businesses.
@@ -233,6 +211,10 @@ function parseThinkingAndAnswer(rawText) {
 //  SMART FAILOVER: OpenRouter models chain
 // ============================================================
 async function fetchAIResponseWithFailover(messages, userSelectedModel) {
+    if (!OPENROUTER_API_KEY) {
+        throw new Error('OpenRouter API key is not configured. Please set OPENROUTER_API_KEY.');
+    }
+
     const fallbackModels = [
         'minimax/minimax-m3-preview',
         'zai-org/glm-5.2',
@@ -244,6 +226,7 @@ async function fetchAIResponseWithFailover(messages, userSelectedModel) {
 
     const modelsToTry = [userSelectedModel, ...fallbackModels.filter(m => m !== userSelectedModel)];
 
+    let lastError = null;
     for (const model of modelsToTry) {
         try {
             console.log(`🔄 Attempting OpenRouter (${model})...`);
@@ -267,12 +250,15 @@ async function fetchAIResponseWithFailover(messages, userSelectedModel) {
                 console.log(`✅ OpenRouter succeeded with ${model}`);
                 return { response, source: model };
             }
-            console.warn(`⚠️ ${model} failed (${response.status}) – trying next...`);
+            const errText = await response.text();
+            console.warn(`⚠️ ${model} failed (${response.status}): ${errText}`);
+            lastError = new Error(`OpenRouter error (${model}): ${response.status} ${errText}`);
         } catch (err) {
             console.warn(`⚠️ ${model} error: ${err.message}`);
+            lastError = err;
         }
     }
-    throw new Error('All AI models failed. Please try again later.');
+    throw lastError || new Error('All AI models failed. Please try again later.');
 }
 
 // ============================================================
@@ -303,6 +289,7 @@ async function saveConversation(userId, messages) {
     if (error) throw new Error('Failed to save conversation: ' + error.message);
 }
 
+// ---- Rate limiting (Redis or memory) ----
 const inMemoryRate = new Map();
 const RATE_LIMIT_WINDOW = 60 * 1000;
 const RATE_LIMIT_MAX = 10;
@@ -339,6 +326,7 @@ if (!redisAvailable) {
     }, 60 * 1000);
 }
 
+// ---- Concurrency limiter ----
 const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT_REQUESTS) || 10000;
 let activeRequests = 0;
 const concurrencyQueue = [];
@@ -388,6 +376,7 @@ app.get('/', (req, res) => res.send('TechNovaphy AI Backend'));
 app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 app.get('/api/ping', (req, res) => res.json({ status: 'ok' }));
 
+// ---- Register ----
 app.post('/api/auth/register', async (req, res) => {
     try {
         const { email, password, ageConfirmed, country } = req.body;
@@ -428,6 +417,7 @@ app.post('/api/auth/register', async (req, res) => {
     }
 });
 
+// ---- Login ----
 app.post('/api/auth/login', async (req, res) => {
     try {
         const { email, password } = req.body;
@@ -447,6 +437,7 @@ app.post('/api/auth/login', async (req, res) => {
     }
 });
 
+// ---- Profile (owner bypass) ----
 app.get('/api/user/profile', auth, async (req, res) => {
     try {
         const user = req.user;
@@ -469,6 +460,7 @@ app.get('/api/user/profile', auth, async (req, res) => {
     }
 });
 
+// ---- Update Memory ----
 app.post('/api/auth/update-memory', auth, async (req, res) => {
     try {
         const { memory } = req.body;
@@ -649,7 +641,9 @@ app.post('/api/chat/stream', auth, async (req, res) => {
 
         let conversation = await getConversation(user.id);
         let newMessages;
-        try { newMessages = JSON.parse(req.body.messages); } catch (e) {
+        try {
+            newMessages = JSON.parse(req.body.messages);
+        } catch (e) {
             releaseConcurrency();
             return res.status(400).json({ error: 'Invalid messages format' });
         }
@@ -677,7 +671,6 @@ app.post('/api/chat/stream', auth, async (req, res) => {
         const systemPrompt = buildSystemPrompt({ memoryPrompt, languageInstruction });
 
         const groqMessages = [{ role: 'system', content: systemPrompt }, ...conversation];
-
         const userModel = req.body.model || 'minimax/minimax-m3-preview';
 
         res.setHeader('Content-Type', 'text/event-stream');
@@ -691,10 +684,7 @@ app.post('/api/chat/stream', auth, async (req, res) => {
         };
 
         const { response: aiResponse, source } = await fetchAIResponseWithFailover(groqMessages, userModel);
-
-        if (!aiResponse.ok) {
-            throw new Error(`AI error ${aiResponse.status}`);
-        }
+        if (!aiResponse.ok) throw new Error(`AI error ${aiResponse.status}`);
 
         const reader = aiResponse.body.getReader();
         const decoder = new TextDecoder();
@@ -749,7 +739,7 @@ app.post('/api/chat/stream', auth, async (req, res) => {
 });
 
 // ============================================================
-//  EXCHANGE RATES (shared by pricing + checkout)
+//  EXCHANGE RATES
 // ============================================================
 let exchangeRates = { KES: 1 };
 let ratesLastFetched = 0;
@@ -770,7 +760,7 @@ async function fetchExchangeRates() {
 }
 
 // ============================================================
-//  PRICING – powers the frontend's Upgrade / Pricing screen
+//  PRICING
 // ============================================================
 app.get('/api/pricing', auth, async (req, res) => {
     try {
@@ -811,8 +801,7 @@ app.get('/api/pricing', auth, async (req, res) => {
 });
 
 // ============================================================
-//  PAYMENT STATUS – lets the frontend safely poll after redirect
-//  back from Paystack, instead of ever trusting the client.
+//  PAYMENT STATUS
 // ============================================================
 app.get('/api/payment-status/:key', auth, async (req, res) => {
     try {
@@ -828,7 +817,7 @@ app.get('/api/payment-status/:key', auth, async (req, res) => {
         if (!data) return res.status(404).json({ error: 'Payment not found' });
 
         res.json({
-            status: data.status, // 'pending' | 'completed'
+            status: data.status,
             tier: data.tier,
             currency: data.currency,
             amount: data.amount
@@ -903,19 +892,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CODE RUNNER SUBSCRIPTION (fixed price/month)
-//
-//  FIX: this used to call Paystack's raw /subscription endpoint (which
-//  requires the customer to already have a saved card) and, on ANY
-//  Paystack error mentioning "already subscribed", it unlocked the
-//  feature with no payment check at all. That is the bug that let
-//  people get access just by tapping the button.
-//
-//  Now it follows the exact same pattern as /api/create-checkout:
-//  we initialize a real Paystack transaction with the plan attached.
-//  Paystack handles first payment + auto-creates the recurring
-//  subscription on success. The ONLY place access is ever granted is
-//  the signature-verified webhook above, after a real charge.success.
+//  CODE RUNNER SUBSCRIPTION (real payment)
 // ============================================================
 app.post('/api/subscribe-code', auth, async (req, res) => {
     try {
@@ -981,10 +958,6 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
             }
         }
 
-        // FIX: initialize a real transaction with the plan attached.
-        // This requires an actual successful payment before Paystack (and
-        // therefore our webhook) will ever fire. No card-on-file assumption,
-        // no silent "already subscribed" bypass.
         const response = await fetch('https://api.paystack.co/transaction/initialize', {
             method: 'POST',
             headers: {
@@ -1031,7 +1004,7 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CODE EXECUTION – powered by MiniMax M3
+//  CODE RUNNER EXECUTION – locked for all non‑owners
 // ============================================================
 app.post('/api/run-code', auth, async (req, res) => {
     try {
@@ -1042,7 +1015,8 @@ app.post('/api/run-code', auth, async (req, res) => {
             await acquireConcurrency();
         }
 
-        if (!isOwner && user.tier === 'free' && !user.code_runner_unlocked) {
+        // 🔥 Only owner bypasses the lock; everyone else must have code_runner_unlocked
+        if (!isOwner && !user.code_runner_unlocked) {
             releaseConcurrency();
             return res.status(403).json({
                 error: '💳 Subscribe to Code Runner to run code.',
