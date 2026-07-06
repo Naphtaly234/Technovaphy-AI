@@ -1,5 +1,6 @@
-//  TECHNOVAPHY AI – 
-
+// ============================================================
+//  TECHNOVAPHY AI – BACKEND WITH LOCALIZED PAYMENTS
+// ============================================================
 require('dotenv').config();
 
 const express = require('express');
@@ -8,8 +9,6 @@ const rateLimit = require('express-rate-limit');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcrypt');
 const { createClient } = require('@supabase/supabase-js');
-const multer = require('multer');
-const pdfParse = require('pdf-parse');
 const crypto = require('crypto');
 
 const app = express();
@@ -17,23 +16,15 @@ const app = express();
 app.use(cors({
     origin: process.env.FRONTEND_URL || '*',
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'Accept'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
     credentials: true,
     optionsSuccessStatus: 200
 }));
 
-// ----- Environment Variables -----
-const required = [
-    'SUPABASE_URL',
-    'SUPABASE_SERVICE_ROLE_KEY',
-    'JWT_SECRET',
-    'GROQ_API_KEY',
-    'PAYSTACK_SECRET_KEY',
-    'AGNES_API_KEY'
-];
+const required = ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'JWT_SECRET', 'GROQ_API_KEY', 'PAYSTACK_SECRET_KEY', 'AGNES_API_KEY'];
 const missing = required.filter(key => !process.env[key]);
 if (missing.length) {
-    console.error('❌ Missing environment variables:', missing.join(', '));
+    console.error('❌ Missing:', missing.join(', '));
     process.exit(1);
 }
 
@@ -44,21 +35,16 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 const AGNES_API_KEY = process.env.AGNES_API_KEY;
-const FRONTEND_URL = process.env.FRONTEND_URL || 'https://your-frontend-url.netlify.app';
-const OWNER_EMAIL = process.env.OWNER_EMAIL || null;
+const FRONTEND_URL = process.env.FRONTEND_URL || 'https://your-frontend.netlify.app';
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || null;
 
-if (!OPENROUTER_API_KEY) {
-    console.warn('⚠️ OPENROUTER_API_KEY not set — fallback disabled.');
-}
-
-// ----- Supabase Client -----
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+
 (async function initDb() {
     try {
         const { error } = await supabase.from('users').select('id').limit(1);
         if (error) {
-            console.warn('⚠️ Supabase connection issue:', error.message);
+            console.warn('⚠️ DB connection issue:', error.message);
         } else {
             console.log('✅ Database connected.');
         }
@@ -67,23 +53,16 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
     }
 })();
 
-// ============================================================
-//  PAYSTACK WEBHOOK (MUST BE BEFORE express.json())
-// ============================================================
-
+// PAYSTACK WEBHOOK
 app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), async (req, res) => {
     try {
         const signature = req.headers['x-paystack-signature'];
         if (!signature) {
-            console.warn('⚠️ Webhook rejected: no signature header');
+            console.warn('⚠️ Webhook rejected: no signature');
             return res.sendStatus(401);
         }
 
-        const expectedHash = crypto
-            .createHmac('sha512', PAYSTACK_SECRET_KEY)
-            .update(req.body)
-            .digest('hex');
-
+        const expectedHash = crypto.createHmac('sha512', PAYSTACK_SECRET_KEY).update(req.body).digest('hex');
         if (expectedHash !== signature) {
             console.warn('⚠️ Webhook rejected: signature mismatch');
             return res.sendStatus(401);
@@ -99,23 +78,12 @@ app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), as
             const tier = metadata.tier || 'pro';
             const idempotencyKey = metadata.idempotencyKey;
 
-            const { data: paymentRecord } = await supabase
-                .from('payments')
-                .select('*')
-                .eq('transaction_id', idempotencyKey)
-                .maybeSingle();
-
+            const { data: paymentRecord } = await supabase.from('payments').select('*').eq('transaction_id', idempotencyKey).maybeSingle();
             if (!paymentRecord) {
-                console.warn(`⚠️ Webhook: no matching payment record for ${idempotencyKey}`);
                 return res.sendStatus(200);
             }
 
             if (paymentRecord.status === 'completed') {
-                return res.sendStatus(200);
-            }
-
-            if (data.amount !== paymentRecord.amount || data.currency !== paymentRecord.currency) {
-                console.error(`❌ Webhook amount mismatch for ${idempotencyKey}`);
                 return res.sendStatus(200);
             }
 
@@ -132,58 +100,89 @@ app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), as
     }
 });
 
-// ----- Global Middleware -----
 app.use(express.json({ limit: '20mb' }));
 app.use(express.urlencoded({ limit: '20mb', extended: true }));
 
 const authLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 10,
-    handler: (req, res) => res.status(429).json({ error: 'Too many login attempts.' })
+    handler: (req, res) => res.status(429).json({ error: 'Too many attempts' })
 });
 app.use('/api/auth/login', authLimiter);
 app.use('/api/auth/register', authLimiter);
 
-// ============================================================
-//  CONSTANTS
-// ============================================================
-
+// CONSTANTS
 const TIER_PRICES_KES = { starter: 200, pro: 1700, enterprise: 17000, ultimate: 100000 };
 const TIER_LIMITS = { free: 200, starter: 200, pro: 2500, enterprise: Infinity, ultimate: 1000000 };
-const TIER_NAMES = { free: 'Free (5 hrs)', starter: 'Starter', pro: 'Pro', enterprise: 'Enterprise', ultimate: 'Ultimate' };
-const FREE_SESSION_HOURS = 5;
-const FREE_LOCK_HOURS = 4;
+const TIER_NAMES = { free: 'Free', starter: 'Starter', pro: 'Pro', enterprise: 'Enterprise', ultimate: 'Ultimate' };
 const MAX_CONVERSATION_HISTORY = 12;
 
-// ============================================================
-//  SYSTEM PROMPT & PARSING
-// ============================================================
+// COUNTRY-SPECIFIC PAYMENT CHANNELS
+const PAYMENT_CHANNELS = {
+    KE: {
+        country: 'Kenya',
+        currency: 'KES',
+        channels: ['card', 'bank_transfer', 'mpesa'],
+        displayNames: {
+            'card': '💳 Card',
+            'bank_transfer': '🏦 Bank Transfer',
+            'mpesa': '📱 M-Pesa'
+        }
+    },
+    NG: {
+        country: 'Nigeria',
+        currency: 'NGN',
+        channels: ['card', 'bank_transfer', 'ussd', 'bank'],
+        displayNames: {
+            'card': '💳 Card',
+            'bank_transfer': '🏦 Bank Transfer',
+            'ussd': '📞 USSD',
+            'bank': '📱 Mobile Banking'
+        }
+    },
+    GH: {
+        country: 'Ghana',
+        currency: 'GHS',
+        channels: ['card', 'bank_transfer'],
+        displayNames: {
+            'card': '💳 Card',
+            'bank_transfer': '🏦 Bank Transfer'
+        }
+    },
+    UG: {
+        country: 'Uganda',
+        currency: 'UGX',
+        channels: ['card', 'bank_transfer'],
+        displayNames: {
+            'card': '💳 Card',
+            'bank_transfer': '🏦 Bank Transfer'
+        }
+    },
+    TZ: {
+        country: 'Tanzania',
+        currency: 'TZS',
+        channels: ['card', 'bank_transfer'],
+        displayNames: {
+            'card': '💳 Card',
+            'bank_transfer': '🏦 Bank Transfer'
+        }
+    }
+};
 
+// SYSTEM PROMPT
 function buildSystemPrompt({ memoryPrompt, languageInstruction }) {
-    return `You are TechNovaphy AI, built for African freelancers, small businesses, and developers.
+    return `You are TechNovaphy AI, built for African freelancers and businesses.
 
-RESPONSE FORMAT — ALWAYS use this structure:
+RESPOND WITH THIS FORMAT:
 
 <thinking>
-2-5 sentences: what they're asking, any ambiguity, how to structure the answer, what to watch out for.
+Brief thoughts on the question.
 </thinking>
 <answer>
-Your actual response that users will read.
+Your response here.
 </answer>
 
-RULES (inside <answer> tag):
-1. Match length to the question — short questions get short answers.
-2. If ambiguous, state your assumption in one line and proceed.
-3. Default to plain prose. Only use bullets/tables for genuinely structured content.
-4. On financial/tax/legal topics: flag uncertainty plainly instead of asserting confidently.
-5. Ask at most one clarifying question, only when truly necessary.
-6. No throat-clearing ("Great question!"). Start with substance.
-7. Say directly if you don't know or if something may have changed.
-
-CONTEXT: You understand M-Pesa, KES, NGN, Upwork, Fiverr, and small business realities in Kenya and Nigeria.
-TONE: Professional, warm, direct.
-
-Remember: EVERY reply must have both <thinking> and <answer> tags, even for simple greetings.
+RULES: Match length to question. Be direct. No throat-clearing.
 ${memoryPrompt}
 ${languageInstruction}`;
 }
@@ -208,15 +207,12 @@ function parseThinkingAndAnswer(rawText) {
     return { thinking: thinking.trim(), answer: answer.trim() };
 }
 
-// ============================================================
-//  SMART FAILOVER: GROQ → OPENROUTER
-// ============================================================
-
+// SMART FAILOVER
 async function fetchAIResponseWithFailover(groqMessages, model, groqApiKey, openrouterApiKey) {
     const actualGroqModel = model.includes('scout') ? model : 'llama-3.3-70b-versatile';
 
     try {
-        console.log(`🔄 Attempting Groq (${actualGroqModel})...`);
+        console.log(`🔄 Groq (${actualGroqModel})`);
         const groqResponse = await fetch('https://api.groq.com/openai/v1/chat/completions', {
             method: 'POST',
             headers: { 'Authorization': `Bearer ${groqApiKey}`, 'Content-Type': 'application/json' },
@@ -224,19 +220,19 @@ async function fetchAIResponseWithFailover(groqMessages, model, groqApiKey, open
         });
 
         if (groqResponse.ok) {
-            console.log('✅ Groq succeeded');
+            console.log('✅ Groq ok');
             return { response: groqResponse, source: 'groq' };
         }
 
-        console.warn(`⚠️ Groq failed (${groqResponse.status}) — attempting failover...`);
-        if (!openrouterApiKey) throw new Error(`Groq error ${groqResponse.status}. No fallback configured.`);
+        console.warn(`⚠️ Groq ${groqResponse.status}`);
+        if (!openrouterApiKey) throw new Error(`Groq ${groqResponse.status}`);
     } catch (err) {
-        console.warn(`⚠️ Groq error: ${err.message}`);
+        console.warn(`⚠️ Groq: ${err.message}`);
         if (!openrouterApiKey) throw err;
     }
 
-    console.log('🔄 Switching to OpenRouter (claude-haiku-4.5)...');
-    const openrouterResponse = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+    console.log('🔄 OpenRouter (Claude Haiku)');
+    const orResponse = await fetch('https://openrouter.ai/api/v1/chat/completions', {
         method: 'POST',
         headers: {
             'Authorization': `Bearer ${openrouterApiKey}`,
@@ -246,19 +242,16 @@ async function fetchAIResponseWithFailover(groqMessages, model, groqApiKey, open
         body: JSON.stringify({ model: 'anthropic/claude-haiku-4.5', messages: groqMessages, temperature: 0.7, top_p: 0.9, stream: true })
     });
 
-    if (!openrouterResponse.ok) {
-        const errorText = await openrouterResponse.text();
-        throw new Error(`OpenRouter failover failed: ${errorText}`);
+    if (!orResponse.ok) {
+        const err = await orResponse.text();
+        throw new Error(`OpenRouter: ${err}`);
     }
 
-    console.log('✅ OpenRouter failover succeeded');
-    return { response: openrouterResponse, source: 'openrouter' };
+    console.log('✅ OpenRouter ok');
+    return { response: orResponse, source: 'openrouter' };
 }
 
-// ============================================================
-//  HELPERS
-// ============================================================
-
+// HELPERS
 async function findUser(email) {
     const { data, error } = await supabase.from('users').select('*').eq('email', email).maybeSingle();
     if (error) throw new Error('DB: ' + error.message);
@@ -269,43 +262,6 @@ async function findUserById(id) {
     const { data, error } = await supabase.from('users').select('*').eq('id', id).maybeSingle();
     if (error) throw new Error('DB: ' + error.message);
     return data;
-}
-
-async function resetMonthlyUsageIfNeeded(user) {
-    const now = new Date();
-    const resetDate = new Date(user.monthly_reset_date);
-    if (now >= resetDate) {
-        const nextMonth = new Date(now);
-        nextMonth.setMonth(nextMonth.getMonth() + 1);
-        await supabase.from('users').update({
-            usage_count: 0,
-            monthly_reset_date: nextMonth.toISOString().split('T')[0]
-        }).eq('id', user.id);
-        user.usage_count = 0;
-        user.monthly_reset_date = nextMonth.toISOString().split('T')[0];
-    }
-    return user;
-}
-
-async function checkFreeSession(user) {
-    if (user.tier !== 'free') return user;
-    const now = new Date();
-    const sessionStart = new Date(user.free_session_start || now);
-    const elapsedHours = (now - sessionStart) / (1000 * 60 * 60);
-    if (elapsedHours < FREE_SESSION_HOURS) return user;
-
-    const lockEnd = new Date(sessionStart.getTime() + (FREE_SESSION_HOURS + FREE_LOCK_HOURS) * 60 * 60 * 1000);
-    if (now < lockEnd) {
-        const minutesLeft = Math.ceil((lockEnd - now) / 60000);
-        const err = new Error(`Free session ended. Try again in ${minutesLeft} minutes.`);
-        err.minutesLeft = minutesLeft;
-        throw err;
-    }
-
-    const newSessionStart = now.toISOString();
-    await supabase.from('users').update({ free_session_start: newSessionStart }).eq('id', user.id);
-    user.free_session_start = newSessionStart;
-    return user;
 }
 
 function getLimit(tier) { return TIER_LIMITS[tier] || 200; }
@@ -352,13 +308,10 @@ function checkRateLimit(userId) {
     return true;
 }
 
-// ============================================================
-//  AUTH MIDDLEWARE
-// ============================================================
-
+// AUTH MIDDLEWARE
 const auth = async (req, res, next) => {
     const authHeader = req.headers.authorization;
-    if (!authHeader) return res.status(401).json({ error: 'No token provided' });
+    if (!authHeader) return res.status(401).json({ error: 'No token' });
     const token = authHeader.split(' ')[1];
     try {
         const decoded = jwt.verify(token, JWT_SECRET);
@@ -367,7 +320,7 @@ const auth = async (req, res, next) => {
         req.user = user;
         next();
     } catch (e) {
-        res.status(401).json({ error: 'Invalid or expired token' });
+        res.status(401).json({ error: 'Invalid token' });
     }
 };
 
@@ -375,7 +328,7 @@ const auth = async (req, res, next) => {
 //  PUBLIC ROUTES
 // ============================================================
 
-app.get('/', (req, res) => res.send('TechNovaphy AI Backend running'));
+app.get('/', (req, res) => res.send('TechNovaphy AI Backend'));
 app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 app.get('/api/ping', (req, res) => res.json({ status: 'ok' }));
 
@@ -383,7 +336,8 @@ app.post('/api/auth/register', async (req, res) => {
     try {
         const { email, password, ageConfirmed, country } = req.body;
         if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
-        if (!ageConfirmed) return res.status(400).json({ error: 'You must be 18 or older' });
+        if (!ageConfirmed) return res.status(400).json({ error: 'You must be 18+' });
+        if (!country || !PAYMENT_CHANNELS[country]) return res.status(400).json({ error: 'Invalid country selected' });
 
         const existing = await findUser(email);
         if (existing) return res.status(400).json({ error: 'Email already exists' });
@@ -403,13 +357,14 @@ app.post('/api/auth/register', async (req, res) => {
             free_session_start: now.toISOString(),
             memory: '',
             role: 'user',
-            country: country || 'KE'
+            country: country
         }).select().single();
 
         if (error) throw new Error('DB insert: ' + error.message);
         await supabase.from('conversations').insert({ user_id: data.id, messages: [] });
 
-        res.status(201).json({ message: 'User created', userId: data.id });
+        console.log(`✅ User registered from ${country}`);
+        res.status(201).json({ message: 'User created', userId: data.id, country: country });
     } catch (err) {
         console.error('Registration error:', err);
         res.status(500).json({ error: err.message });
@@ -428,7 +383,7 @@ app.post('/api/auth/login', async (req, res) => {
         if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
 
         const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '7d' });
-        res.json({ token, verified: true });
+        res.json({ token, verified: true, country: user.country });
     } catch (err) {
         console.error('Login error:', err);
         res.status(500).json({ error: err.message });
@@ -441,29 +396,7 @@ app.post('/api/auth/login', async (req, res) => {
 
 app.get('/api/user/profile', auth, async (req, res) => {
     try {
-        let user = req.user;
-        user = await resetMonthlyUsageIfNeeded(user);
-        const isOwner = (OWNER_EMAIL && user.email === OWNER_EMAIL) || user.role === 'owner';
-
-        let sessionRemaining = null, lockRemaining = null;
-        if (user.tier === 'free') {
-            const now = new Date();
-            const sessionStart = new Date(user.free_session_start || now);
-            const elapsedHours = (now - sessionStart) / (1000 * 60 * 60);
-            if (elapsedHours < FREE_SESSION_HOURS) {
-                const remainingMs = (sessionStart.getTime() + FREE_SESSION_HOURS * 60 * 60 * 1000) - now.getTime();
-                sessionRemaining = Math.max(0, Math.ceil(remainingMs / 60000));
-            } else {
-                const lockEnd = new Date(sessionStart.getTime() + (FREE_SESSION_HOURS + FREE_LOCK_HOURS) * 60 * 60 * 1000);
-                if (now < lockEnd) {
-                    const remainingMs = lockEnd - now;
-                    lockRemaining = Math.max(0, Math.ceil(remainingMs / 60000));
-                } else {
-                    lockRemaining = 0;
-                }
-            }
-        }
-
+        const user = req.user;
         const limit = getLimit(user.tier);
 
         res.json({
@@ -473,9 +406,6 @@ app.get('/api/user/profile', auth, async (req, res) => {
             usage_count: user.usage_count,
             limit: limit,
             verified: true,
-            is_owner: isOwner,
-            session_remaining_minutes: sessionRemaining,
-            lock_remaining_minutes: lockRemaining,
             country: user.country || 'KE'
         });
     } catch (err) {
@@ -484,19 +414,36 @@ app.get('/api/user/profile', auth, async (req, res) => {
     }
 });
 
-app.post('/api/auth/update-memory', auth, async (req, res) => {
+// ============================================================
+//  COUNTRY-SPECIFIC PAYMENT INFO
+// ============================================================
+
+app.get('/api/payment-info', auth, async (req, res) => {
     try {
-        const { memory } = req.body;
-        await supabase.from('users').update({ memory }).eq('id', req.user.id);
-        res.json({ message: 'Memory updated' });
+        const user = req.user;
+        const countryCode = user.country || 'KE';
+        const countryInfo = PAYMENT_CHANNELS[countryCode] || PAYMENT_CHANNELS['KE'];
+
+        res.json({
+            country: countryCode,
+            countryName: countryInfo.country,
+            currency: countryInfo.currency,
+            channels: countryInfo.channels,
+            displayNames: countryInfo.displayNames,
+            prices: {
+                starter: countryCode === 'KE' ? 200 : Math.round(200 * 12.5),
+                pro: countryCode === 'KE' ? 1700 : Math.round(1700 * 12.5),
+                enterprise: countryCode === 'KE' ? 17000 : Math.round(17000 * 12.5),
+                ultimate: countryCode === 'KE' ? 100000 : Math.round(100000 * 12.5)
+            }
+        });
     } catch (err) {
-        console.error('Update memory error:', err);
         res.status(500).json({ error: err.message });
     }
 });
 
 // ============================================================
-//  CONVERSATION HISTORY ROUTES
+//  CONVERSATION ROUTES
 // ============================================================
 
 app.get('/api/conversations', auth, async (req, res) => {
@@ -512,7 +459,7 @@ app.get('/api/conversations', auth, async (req, res) => {
 
         const withSummary = (data || []).map(conv => {
             const firstUserMsg = conv.messages?.find(m => m.role === 'user');
-            const summary = firstUserMsg?.content?.substring(0, 50) + '...' || 'Untitled Conversation';
+            const summary = firstUserMsg?.content?.substring(0, 50) + '...' || 'Untitled';
             return {
                 id: conv.id,
                 created_at: conv.created_at,
@@ -537,31 +484,15 @@ app.get('/api/conversations/:conversationId', auth, async (req, res) => {
             .eq('user_id', req.user.id)
             .single();
 
-        if (error || !data) return res.status(404).json({ error: 'Conversation not found' });
+        if (error || !data) return res.status(404).json({ error: 'Not found' });
         res.json({ conversation: data });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
 
-// ✅ FIXED: Create conversation only if it doesn't exist
 app.post('/api/conversations', auth, async (req, res) => {
     try {
-        // Check if user already has a conversation
-        let { data: existing, error: findError } = await supabase
-            .from('conversations')
-            .select('*')
-            .eq('user_id', req.user.id)
-            .maybeSingle();
-
-        if (findError && findError.code !== 'PGRST116') throw findError;
-
-        if (existing) {
-            // Return existing conversation
-            return res.status(200).json({ conversation: existing });
-        }
-
-        // Create new conversation
         const { data, error } = await supabase.from('conversations').insert({
             user_id: req.user.id,
             messages: [],
@@ -572,7 +503,6 @@ app.post('/api/conversations', auth, async (req, res) => {
         if (error) throw error;
         res.status(201).json({ conversation: data });
     } catch (err) {
-        console.error('Create conversation error:', err);
         res.status(500).json({ error: err.message });
     }
 });
@@ -585,144 +515,67 @@ app.delete('/api/conversations/:conversationId', auth, async (req, res) => {
             .eq('user_id', req.user.id);
 
         if (error) throw error;
-        res.json({ message: 'Conversation deleted' });
+        res.json({ message: 'Deleted' });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
 
 // ============================================================
-//  FILE UPLOAD
-// ============================================================
-
-const storage = multer.memoryStorage();
-const fileFilter = (req, file, cb) => {
-    const allowedTypes = ['image/jpeg', 'image/png', 'image/webp', 'application/pdf', 'text/plain', 'text/csv'];
-    cb(allowedTypes.includes(file.mimetype) ? null : new Error('Unsupported file type'), allowedTypes.includes(file.mimetype));
-};
-const upload = multer({ storage, limits: { fileSize: 10 * 1024 * 1024 }, fileFilter });
-
-async function extractFileContent(file) {
-    const mimeType = file.mimetype;
-    const buffer = file.buffer;
-    if (mimeType === 'application/pdf') {
-        try {
-            const data = await pdfParse(buffer);
-            return data.text;
-        } catch (e) {
-            return `[PDF could not be read: ${e.message}]`;
-        }
-    } else if (mimeType === 'text/plain' || mimeType === 'text/csv') {
-        return buffer.toString('utf-8');
-    } else if (mimeType.startsWith('image/')) {
-        return `[Image: ${file.originalname}]`;
-    } else {
-        try { return buffer.toString('utf-8'); } catch (e) { return `[File: ${file.originalname}]`; }
-    }
-}
-
-// ============================================================
 //  CHAT STREAM
 // ============================================================
 
-app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) => {
+app.post('/api/chat/stream', auth, async (req, res) => {
     try {
-        let user = req.user;
-        user = await resetMonthlyUsageIfNeeded(user);
+        const user = req.user;
 
-        const isOwner = (OWNER_EMAIL && user.email === OWNER_EMAIL) || user.role === 'owner';
-        if (!isOwner) {
-            if (!checkRateLimit(user.id)) return res.status(429).json({ error: 'Too many chat requests. Please wait.' });
-            if (user.tier === 'free') {
-                try { user = await checkFreeSession(user); }
-                catch (lockError) {
-                    return res.status(429).json({
-                        error: lockError.message,
-                        lock_remaining_minutes: lockError.minutesLeft || null
-                    });
-                }
-            }
-            const monthlyLimit = getLimit(user.tier);
-            if (user.usage_count >= monthlyLimit) {
-                return res.status(403).json({
-                    error: `You've reached your monthly limit of ${monthlyLimit} messages. Upgrade to continue.`,
-                    tier: user.tier,
-                    limit: monthlyLimit,
-                    used: user.usage_count
-                });
-            }
+        if (!checkRateLimit(user.id)) return res.status(429).json({ error: 'Too many requests' });
+
+        const monthlyLimit = getLimit(user.tier);
+        if (user.usage_count >= monthlyLimit) {
+            return res.status(403).json({ error: 'Monthly limit reached' });
         }
 
         let conversation = await getConversation(user.id);
         let newMessages;
-        try { newMessages = JSON.parse(req.body.messages); }
-        catch (e) { return res.status(400).json({ error: 'Invalid messages format' }); }
+        try {
+            newMessages = JSON.parse(req.body.messages);
+        } catch (e) {
+            return res.status(400).json({ error: 'Invalid messages format' });
+        }
         conversation = conversation.concat(newMessages);
 
         if (conversation.length > MAX_CONVERSATION_HISTORY) {
             conversation = conversation.slice(-MAX_CONVERSATION_HISTORY);
         }
 
-        const files = req.files || [];
-        const hasImage = files.some(f => f.mimetype.startsWith('image/'));
-        let userContent = conversation[conversation.length - 1]?.content || '';
-        let fileTextContent = '';
-        const imageContents = [];
-
-        for (const file of files) {
-            if (file.mimetype.startsWith('image/')) {
-                const base64 = file.buffer.toString('base64');
-                const dataUrl = `data:${file.mimetype};base64,${base64}`;
-                imageContents.push({ type: 'image_url', image_url: { url: dataUrl } });
-            } else {
-                const text = await extractFileContent(file);
-                fileTextContent += `\n\n--- File: ${file.originalname} ---\n${text}\n--- End ---`;
-            }
-        }
-
-        let finalUserMessage;
-        if (hasImage) {
-            const textPart = userContent + (fileTextContent ? `\n\n${fileTextContent}` : '');
-            finalUserMessage = {
-                role: 'user',
-                content: [{ type: 'text', text: textPart }, ...imageContents]
-            };
-        } else {
-            const fullText = userContent + (fileTextContent ? `\n\n${fileTextContent}` : '');
-            finalUserMessage = { role: 'user', content: fullText };
-        }
+        const userContent = conversation[conversation.length - 1]?.content || '';
+        const finalUserMessage = { role: 'user', content: userContent };
 
         conversation.pop();
         conversation.push(finalUserMessage);
 
-        if (!isOwner) {
-            const newMonthlyUsage = (user.usage_count || 0) + 1;
-            await supabase.from('users').update({ usage_count: newMonthlyUsage }).eq('id', user.id);
-        }
+        await supabase.from('users').update({ usage_count: (user.usage_count || 0) + 1 }).eq('id', user.id);
 
         const language = req.body.language || 'auto';
         let languageInstruction = '';
         if (language !== 'auto') {
-            languageInstruction = `\n\n**Important**: Respond exclusively in **${language}**.\n`;
-        } else {
-            languageInstruction = `\n\n**Important**: Detect the user's language and respond in the same language.\n`;
+            languageInstruction = `\n\nRespond in **${language}**.\n`;
         }
 
         const memoryPrompt = user.memory ? `\n\nUser context: ${user.memory}` : '';
         const systemPrompt = buildSystemPrompt({ memoryPrompt, languageInstruction });
 
         const groqMessages = [{ role: 'system', content: systemPrompt }, ...conversation];
-        const model = hasImage ? 'meta-llama/llama-4-scout-17b-16e-instruct' : 'llama-3.3-70b-versatile';
 
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
 
-        const { response: aiResponse } = await fetchAIResponseWithFailover(groqMessages, model, GROQ_API_KEY, OPENROUTER_API_KEY);
+        const { response: aiResponse } = await fetchAIResponseWithFailover(groqMessages, 'llama-3.3-70b-versatile', GROQ_API_KEY, OPENROUTER_API_KEY);
 
         if (!aiResponse.ok) {
-            const errorText = await aiResponse.text();
-            throw new Error(`AI API error ${aiResponse.status}: ${errorText}`);
+            throw new Error(`AI error ${aiResponse.status}`);
         }
 
         const reader = aiResponse.body.getReader();
@@ -766,9 +619,9 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
         res.end();
 
     } catch (err) {
-        console.error('Chat stream error:', err);
+        console.error('Chat error:', err);
         if (!res.headersSent) {
-            res.status(500).json({ error: err.message || 'Something went wrong.' });
+            res.status(500).json({ error: err.message });
         } else {
             res.write(`data: ${JSON.stringify({ type: 'error', message: err.message })}\n\n`);
             res.end();
@@ -783,7 +636,7 @@ app.post('/api/chat/stream', auth, upload.array('files', 10), async (req, res) =
 app.post('/api/generate-image', auth, async (req, res) => {
     try {
         const { prompt } = req.body;
-        if (!prompt) return res.status(400).json({ error: 'Prompt is required' });
+        if (!prompt) return res.status(400).json({ error: 'Prompt required' });
 
         let imageUrl = null;
         if (AGNES_API_KEY) {
@@ -818,7 +671,7 @@ app.post('/api/generate-image', auth, async (req, res) => {
 });
 
 // ============================================================
-//  PAYMENT
+//  PAYMENT (COUNTRY-SPECIFIC)
 // ============================================================
 
 let exchangeRates = { KES: 1 };
@@ -834,37 +687,31 @@ async function fetchExchangeRates() {
         exchangeRates.KES = 1;
         ratesLastFetched = now;
     } catch (err) {
-        console.warn('⚠️ Exchange rate fetch failed, using fallback');
-        exchangeRates = { KES: 1, USD: 0.0077, EUR: 0.0070, GBP: 0.0061, NGN: 12.5 };
+        console.warn('⚠️ Exchange rate fetch failed');
+        exchangeRates = { KES: 1, NGN: 12.5, GHS: 18.5, UGX: 3700, TZS: 2600 };
     }
     return exchangeRates;
 }
 
 app.post('/api/create-checkout', auth, async (req, res) => {
     try {
-        const { idempotencyKey, tier, currency } = req.body;
+        const { idempotencyKey, tier } = req.body;
         const user = req.user;
 
-        if (!idempotencyKey) return res.status(400).json({ error: 'idempotencyKey is required' });
+        if (!idempotencyKey) return res.status(400).json({ error: 'idempotencyKey required' });
         if (!tier || !['starter', 'pro', 'enterprise', 'ultimate'].includes(tier)) {
-            return res.status(400).json({ error: 'Invalid tier selected.' });
+            return res.status(400).json({ error: 'Invalid tier' });
         }
 
-        let finalCurrency = (currency || '').toUpperCase();
-        if (!finalCurrency) {
-            finalCurrency = user.country === 'NG' ? 'NGN' : 'KES';
-        }
+        const countryCode = user.country || 'KE';
+        const countryInfo = PAYMENT_CHANNELS[countryCode] || PAYMENT_CHANNELS['KE'];
+        const finalCurrency = countryInfo.currency;
 
         let humanAmount = TIER_PRICES_KES[tier];
         if (finalCurrency !== 'KES') {
             const rates = await fetchExchangeRates();
-            const rate = rates[finalCurrency];
-            if (rate) {
-                humanAmount = TIER_PRICES_KES[tier] * rate;
-            } else {
-                finalCurrency = 'KES';
-                humanAmount = TIER_PRICES_KES[tier];
-            }
+            const rate = rates[finalCurrency] || rates.NGN;
+            humanAmount = Math.round(TIER_PRICES_KES[tier] * rate);
         }
 
         const amount = Math.round(humanAmount * 100);
@@ -872,13 +719,13 @@ app.post('/api/create-checkout', auth, async (req, res) => {
         const { data: existing } = await supabase.from('payments').select('*').eq('transaction_id', idempotencyKey).maybeSingle();
         if (existing) {
             if (existing.status === 'completed') return res.json({ alreadyProcessed: true });
-            return res.status(409).json({ error: 'Payment is being processed' });
+            return res.status(409).json({ error: 'Payment processing' });
         }
 
         if (!PAYSTACK_SECRET_KEY) return res.status(503).json({ error: 'Payment service not configured' });
 
-        let channels = ['card', 'bank_transfer'];
-        if (finalCurrency === 'KES') channels.push('mpesa');
+        const channels = countryInfo.channels;
+        const displayNames = countryInfo.displayNames;
 
         const response = await fetch('https://api.paystack.co/transaction/initialize', {
             method: 'POST',
@@ -888,13 +735,13 @@ app.post('/api/create-checkout', auth, async (req, res) => {
                 amount: amount,
                 currency: finalCurrency,
                 channels: channels,
-                metadata: { idempotencyKey, tier, userId: user.id },
+                metadata: { idempotencyKey, tier, userId: user.id, country: countryCode },
                 callback_url: `${FRONTEND_URL}/?success=true`
             })
         });
 
         const data = await response.json();
-        if (!data.status) throw new Error(data.message || 'Paystack initialization failed');
+        if (!data.status) throw new Error(data.message || 'Paystack init failed');
 
         await supabase.from('payments').insert({
             user_id: user.id,
@@ -902,10 +749,20 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             amount: amount,
             currency: finalCurrency,
             status: 'pending',
-            tier
+            tier,
+            country: countryCode
         });
 
-        res.json({ url: data.data.authorization_url });
+        console.log(`✅ Checkout for ${user.email} (${countryCode}): ${humanAmount} ${finalCurrency}`);
+
+        res.json({ 
+            url: data.data.authorization_url,
+            channels: channels,
+            displayNames: displayNames,
+            amount: humanAmount,
+            currency: finalCurrency,
+            country: countryCode
+        });
     } catch (err) {
         console.error('Checkout error:', err);
         res.status(500).json({ error: err.message });
@@ -913,70 +770,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CODE EXECUTION PROXY (Piston API) – with fallback
-// ============================================================
-
-app.post('/api/run-code', auth, async (req, res) => {
-    try {
-        const { language, version, code } = req.body;
-        if (!code) {
-            return res.status(400).json({ error: 'No code provided' });
-        }
-
-        let output = '';
-        let success = false;
-
-        try {
-            const pistonResponse = await fetch('https://emkc.org/api/v2/piston/execute', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    language: language,
-                    version: version,
-                    files: [{ content: code }]
-                })
-            });
-
-            if (pistonResponse.ok) {
-                const result = await pistonResponse.json();
-                if (result.run?.output) output = result.run.output;
-                else if (result.compile?.output) output = result.compile.output;
-                else output = JSON.stringify(result, null, 2);
-                success = true;
-            } else {
-                const errText = await pistonResponse.text();
-                // If Piston returns whitelist error, fallback
-                if (pistonResponse.status === 403 || errText.includes('whitelist')) {
-                    success = false;
-                } else {
-                    throw new Error(`Piston error: ${errText}`);
-                }
-            }
-        } catch (e) {
-            // Network or other error
-            success = false;
-        }
-
-        if (!success) {
-            // Fallback: provide a message and let the user copy the code to run locally
-            output = `⚠️ The public code execution service is currently unavailable.\n\n` +
-                     `To run this code locally:\n` +
-                     `1. Copy the code below\n` +
-                     `2. Paste it into a ${language} environment\n` +
-                     `3. Run it there\n\n` +
-                     `--- Your Code ---\n${code}`;
-            res.json({ output, fallback: true });
-        } else {
-            res.json({ output: output || '✅ Done (no output)' });
-        }
-    } catch (err) {
-        console.error('Code execution error:', err);
-        res.status(500).json({ error: err.message || 'Internal server error' });
-    }
-});
-
-// ============================================================
 //  START
 // ============================================================
 
-app.listen(PORT, () => console.log(`🚀 TechNovaphy AI Backend running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 TechNovaphy AI running on port ${PORT}`));
