@@ -39,6 +39,9 @@ try {
 
 const app = express();
 
+// ---- FIX: Trust proxy for rate limiting behind Render ----
+app.set('trust proxy', 1);
+
 // ---- CORS ----
 app.use(cors({
     origin: process.env.FRONTEND_URL || '*',
@@ -807,10 +810,11 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
         const user = req.user;
         if (!idempotencyKey) return res.status(400).json({ error: 'idempotencyKey required' });
 
+        // ---- If already unlocked, return friendly message ----
         if (user.code_runner_unlocked) {
-            return res.status(400).json({ 
-                error: 'You already have an active subscription. Enjoy unlimited code execution!',
-                alreadyActive: true
+            return res.status(200).json({
+                alreadyActive: true,
+                message: 'You already have an active subscription. Enjoy unlimited code execution!'
             });
         }
 
@@ -858,6 +862,7 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
             }
         }
 
+        // ---- Initiate subscription ----
         const response = await fetch('https://api.paystack.co/subscription', {
             method: 'POST',
             headers: {
@@ -877,8 +882,22 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
             })
         });
         const data = await response.json();
-        if (!data.status) throw new Error(data.message || 'Subscription initialization failed');
 
+        // ---- If Paystack says user already has a subscription, handle gracefully ----
+        if (!data.status) {
+            if (data.message && data.message.toLowerCase().includes('subscription already exists')) {
+                // This means the user already has a subscription with Paystack,
+                // but our DB didn't reflect it. We'll mark them as unlocked and return success.
+                await supabase.from('users').update({ code_runner_unlocked: true }).eq('id', user.id);
+                return res.status(200).json({
+                    alreadyActive: true,
+                    message: 'You already have an active subscription. Enjoy unlimited code execution!'
+                });
+            }
+            throw new Error(data.message || 'Subscription initialization failed');
+        }
+
+        // Save payment record
         await supabase.from('payments').insert({
             user_id: user.id,
             transaction_id: idempotencyKey,
