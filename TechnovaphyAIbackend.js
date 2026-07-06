@@ -3,6 +3,18 @@
 //  Purpose: African Assistant with model selection and code runner
 //  Models: MiniMax M3, GLM-5.2, NVIDIA Nemotron 3, Groq Llama 3.3
 //  All via OpenRouter – single API key
+//
+//  ⚠️ PATCHED (see "FIX:" comments):
+//  1. /api/subscribe-code no longer grants access on a Paystack error
+//     message match. It now uses the same "initialize transaction with
+//     a plan attached" pattern as /api/create-checkout, so a user MUST
+//     complete a real Paystack payment before the signed webhook marks
+//     them unlocked. There is no client-trust / no-payment path left.
+//  2. Added GET /api/payment-status/:key so the frontend can poll and
+//     find out (safely, server-side) whether a payment actually cleared
+//     after the user returns from the Paystack checkout page.
+//  3. Added GET /api/pricing so the frontend can render a real, localized
+//     pricing/upgrade screen instead of hardcoding numbers.
 // ============================================================
 
 // Load environment variables
@@ -17,7 +29,6 @@ const { createClient } = require('@supabase/supabase-js');
 const crypto = require('crypto');
 
 // ---- Redis (optional) ----
-// Shared rate limiting across multiple instances – falls back to memory if not available
 let redisClient = null;
 let redisAvailable = false;
 try {
@@ -44,11 +55,8 @@ try {
 
 // ---- Express app ----
 const app = express();
-
-// Trust proxy – needed behind Render's load balancer
 app.set('trust proxy', 1);
 
-// ---- CORS ----
 app.use(cors({
     origin: process.env.FRONTEND_URL || '*',
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
@@ -74,25 +82,23 @@ const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://your-frontend.netlify.app';
 const OWNER_EMAIL = process.env.OWNER_EMAIL || null;
 
-// ---- Supabase client ----
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
-// ---- Test database connection ----
 (async function initDb() {
     try {
         const { error } = await supabase.from('users').select('id').limit(1);
-        if (error) {
-            console.warn('⚠️ DB connection issue:', error.message);
-        } else {
-            console.log('✅ Database connected.');
-        }
+        if (error) console.warn('⚠️ DB connection issue:', error.message);
+        else console.log('✅ Database connected.');
     } catch (e) {
         console.warn('⚠️ Could not connect to Supabase:', e.message);
     }
 })();
 
-// ---- PAYSTACK WEBHOOK (must be before express.json()) ----
-// Handles both tier upgrades and code runner subscriptions
+// ============================================================
+//  PAYSTACK WEBHOOK (must be before express.json())
+//  This is the ONLY place that ever grants a paid entitlement.
+//  The HMAC signature check below is what proves money actually moved.
+// ============================================================
 app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), async (req, res) => {
     try {
         const signature = req.headers['x-paystack-signature'];
@@ -105,11 +111,17 @@ app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), as
         const event = payload.event;
         const data = payload.data;
 
-        if (event === 'charge.success' || event === 'subscription.create') {
+        // FIX: we only ever act on a genuinely successful charge event.
+        // 'subscription.create' by itself does NOT prove a payment cleared,
+        // so it is no longer treated as a trigger for unlocking anything.
+        if (event === 'charge.success') {
             const metadata = data.metadata || {};
             const userId = metadata.userId;
             const idempotencyKey = metadata.idempotencyKey;
             const type = metadata.type; // 'code_runner' or undefined
+            const paystackStatus = data.status; // should be 'success'
+
+            if (paystackStatus !== 'success') return res.sendStatus(200);
 
             const { data: paymentRecord } = await supabase
                 .from('payments')
@@ -124,11 +136,11 @@ app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), as
             if (userId) {
                 if (type === 'code_runner') {
                     await supabase.from('users').update({ code_runner_unlocked: true }).eq('id', userId);
-                    console.log(`✅ Code runner unlocked for user ${userId}`);
+                    console.log(`✅ Code runner unlocked for user ${userId} (payment verified)`);
                 } else {
                     const tier = metadata.tier || 'pro';
                     await supabase.from('users').update({ tier: tier, usage_count: 0 }).eq('id', userId);
-                    console.log(`✅ User ${userId} upgraded to ${tier}`);
+                    console.log(`✅ User ${userId} upgraded to ${tier} (payment verified)`);
                 }
             }
         }
@@ -139,11 +151,9 @@ app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), as
     }
 });
 
-// ---- Global middleware ----
 app.use(express.json({ limit: '20mb' }));
 app.use(express.urlencoded({ limit: '20mb', extended: true }));
 
-// ---- Rate limiting for authentication ----
 const authLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 10,
@@ -158,6 +168,14 @@ app.use('/api/auth/register', authLimiter);
 const TIER_PRICES_KES = { starter: 200, pro: 1700, enterprise: 17000, ultimate: 100000 };
 const TIER_LIMITS = { free: 200, starter: 200, pro: 2500, enterprise: Infinity, ultimate: 1000000 };
 const TIER_NAMES = { free: 'Free', starter: 'Starter', pro: 'Pro', enterprise: 'Enterprise', ultimate: 'Ultimate' };
+const TIER_FEATURES = {
+    free: ['200 messages / month', 'Standard models', 'Community support'],
+    starter: ['200 messages / month', 'Priority queueing', 'Email support'],
+    pro: ['2,500 messages / month', 'All AI models', 'Priority support'],
+    enterprise: ['Unlimited messages', 'All AI models', 'Dedicated support'],
+    ultimate: ['Unlimited messages', 'Early access to new models', 'White-glove support']
+};
+const CODE_RUNNER_PRICE_KES = 1000;
 const MAX_CONVERSATION_HISTORY = 20;
 
 const PAYMENT_CHANNELS = {
@@ -169,7 +187,7 @@ const PAYMENT_CHANNELS = {
 };
 
 // ============================================================
-//  SYSTEM PROMPT – for the main chat assistant
+//  SYSTEM PROMPT
 // ============================================================
 function buildSystemPrompt({ memoryPrompt, languageInstruction }) {
     return `You are TechNovaphy AI, built for African freelancers and businesses.
@@ -196,7 +214,6 @@ ${memoryPrompt}
 ${languageInstruction}`;
 }
 
-// ---- Parse the thinking/answer tags (we keep it for compatibility) ----
 function parseThinkingAndAnswer(rawText) {
     const thinkClosed = rawText.match(/<thinking>([\s\S]*?)<\/thinking>/i);
     const thinkOpen = rawText.match(/<thinking>([\s\S]*)$/i);
@@ -214,21 +231,17 @@ function parseThinkingAndAnswer(rawText) {
 
 // ============================================================
 //  SMART FAILOVER: OpenRouter models chain
-//  Humanized comment: This function tries the user's chosen model first,
-//  then falls back to a list of other capable models if needed.
 // ============================================================
 async function fetchAIResponseWithFailover(messages, userSelectedModel) {
-    // The master list of models – the user's choice comes first, then fallbacks
     const fallbackModels = [
-        'minimax/minimax-m3-preview',           // Primary: MiniMax M3 – multimodal reasoning
-        'zai-org/glm-5.2',                      // Secondary: GLM-5.2 – agentic & coding
-        'nvidia/nemotron-3-ultra',              // Tertiary: NVIDIA Nemotron 3 Ultra – 1M context
-        'nvidia/nemotron-3-super',              // Quaternary: NVIDIA Nemotron 3 Super – 1M context
-        'groq/llama-3.3-70b-versatile',         // Quintenary: Groq Llama 3.3 – fast fallback
-        'anthropic/claude-haiku-4.5'            // Last resort: Claude Haiku – always available
+        'minimax/minimax-m3-preview',
+        'zai-org/glm-5.2',
+        'nvidia/nemotron-3-ultra',
+        'nvidia/nemotron-3-super',
+        'groq/llama-3.3-70b-versatile',
+        'anthropic/claude-haiku-4.5'
     ];
 
-    // Build the ordered list: user's choice first, then all fallbacks (excluding duplicates)
     const modelsToTry = [userSelectedModel, ...fallbackModels.filter(m => m !== userSelectedModel)];
 
     for (const model of modelsToTry) {
@@ -254,13 +267,11 @@ async function fetchAIResponseWithFailover(messages, userSelectedModel) {
                 console.log(`✅ OpenRouter succeeded with ${model}`);
                 return { response, source: model };
             }
-
             console.warn(`⚠️ ${model} failed (${response.status}) – trying next...`);
         } catch (err) {
             console.warn(`⚠️ ${model} error: ${err.message}`);
         }
     }
-
     throw new Error('All AI models failed. Please try again later.');
 }
 
@@ -292,7 +303,6 @@ async function saveConversation(userId, messages) {
     if (error) throw new Error('Failed to save conversation: ' + error.message);
 }
 
-// ---- Rate limiting (Redis or memory) ----
 const inMemoryRate = new Map();
 const RATE_LIMIT_WINDOW = 60 * 1000;
 const RATE_LIMIT_MAX = 10;
@@ -318,7 +328,6 @@ async function checkRateLimit(userId) {
     }
 }
 
-// Cleanup for memory
 if (!redisAvailable) {
     setInterval(() => {
         const now = Date.now();
@@ -330,8 +339,6 @@ if (!redisAvailable) {
     }, 60 * 1000);
 }
 
-// ---- Concurrent request limiter ----
-// Prevents the server from being overwhelmed by too many concurrent AI requests
 const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT_REQUESTS) || 10000;
 let activeRequests = 0;
 const concurrencyQueue = [];
@@ -381,7 +388,6 @@ app.get('/', (req, res) => res.send('TechNovaphy AI Backend'));
 app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 app.get('/api/ping', (req, res) => res.json({ status: 'ok' }));
 
-// ---- Registration ----
 app.post('/api/auth/register', async (req, res) => {
     try {
         const { email, password, ageConfirmed, country } = req.body;
@@ -422,7 +428,6 @@ app.post('/api/auth/register', async (req, res) => {
     }
 });
 
-// ---- Login ----
 app.post('/api/auth/login', async (req, res) => {
     try {
         const { email, password } = req.body;
@@ -442,7 +447,6 @@ app.post('/api/auth/login', async (req, res) => {
     }
 });
 
-// ---- User Profile (owner bypass) ----
 app.get('/api/user/profile', auth, async (req, res) => {
     try {
         const user = req.user;
@@ -465,7 +469,6 @@ app.get('/api/user/profile', auth, async (req, res) => {
     }
 });
 
-// ---- Update Memory ----
 app.post('/api/auth/update-memory', auth, async (req, res) => {
     try {
         const { memory } = req.body;
@@ -622,19 +625,17 @@ app.delete('/api/projects/:id', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CHAT STREAM – the heart of the assistant
+//  CHAT STREAM
 // ============================================================
 app.post('/api/chat/stream', auth, async (req, res) => {
     try {
         const user = req.user;
         const isOwner = (OWNER_EMAIL && user.email === OWNER_EMAIL);
 
-        // ---- Concurrency limit (skip for owner) ----
         if (!isOwner) {
             await acquireConcurrency();
         }
 
-        // ---- Rate & usage limits (skip for owner) ----
         if (!isOwner && !await checkRateLimit(user.id)) {
             releaseConcurrency();
             return res.status(429).json({ error: 'Too many requests' });
@@ -646,7 +647,6 @@ app.post('/api/chat/stream', auth, async (req, res) => {
             return res.status(403).json({ error: 'Monthly limit reached' });
         }
 
-        // ---- Load conversation history ----
         let conversation = await getConversation(user.id);
         let newMessages;
         try { newMessages = JSON.parse(req.body.messages); } catch (e) {
@@ -659,18 +659,15 @@ app.post('/api/chat/stream', auth, async (req, res) => {
             conversation = conversation.slice(-MAX_CONVERSATION_HISTORY);
         }
 
-        // ---- Append the latest user message ----
         const userContent = conversation[conversation.length - 1]?.content || '';
         const finalUserMessage = { role: 'user', content: userContent };
         conversation.pop();
         conversation.push(finalUserMessage);
 
-        // ---- Increment usage counter (only for non‑owners) ----
         if (!isOwner) {
             await supabase.from('users').update({ usage_count: (user.usage_count || 0) + 1 }).eq('id', user.id);
         }
 
-        // ---- Build system prompt ----
         const language = req.body.language || 'auto';
         let languageInstruction = '';
         if (language !== 'auto') {
@@ -681,29 +678,24 @@ app.post('/api/chat/stream', auth, async (req, res) => {
 
         const groqMessages = [{ role: 'system', content: systemPrompt }, ...conversation];
 
-        // ---- Model selection: use user's choice or fallback to default ----
         const userModel = req.body.model || 'minimax/minimax-m3-preview';
 
-        // ---- Set up SSE headers ----
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
 
-        // ---- Release concurrency after response ends ----
         const originalEnd = res.end;
         res.end = function(...args) {
             releaseConcurrency();
             originalEnd.apply(res, args);
         };
 
-        // ---- Call the AI with failover ----
         const { response: aiResponse, source } = await fetchAIResponseWithFailover(groqMessages, userModel);
 
         if (!aiResponse.ok) {
             throw new Error(`AI error ${aiResponse.status}`);
         }
 
-        // ---- Stream the response ----
         const reader = aiResponse.body.getReader();
         const decoder = new TextDecoder();
         let buffer = '', rawContent = '';
@@ -733,17 +725,14 @@ app.post('/api/chat/stream', auth, async (req, res) => {
             }
         }
 
-        // ---- Finalise the conversation ----
         const { thinking: finalThinking, answer: finalAnswer } = parseThinkingAndAnswer(rawContent);
         conversation.push({ role: 'assistant', content: finalAnswer });
         await saveConversation(user.id, conversation);
 
-        // We no longer send 'thinking' to the frontend – but we keep it for logging if needed
         res.write(`data: ${JSON.stringify({
             type: 'done',
             text: finalAnswer,
-            // thinking: finalThinking,  // <-- removed to hide thinking box
-            model: source // optional: tell the client which model actually responded
+            model: source
         })}\n\n`);
         res.end();
 
@@ -760,7 +749,7 @@ app.post('/api/chat/stream', auth, async (req, res) => {
 });
 
 // ============================================================
-//  TIER UPGRADE CHECKOUT
+//  EXCHANGE RATES (shared by pricing + checkout)
 // ============================================================
 let exchangeRates = { KES: 1 };
 let ratesLastFetched = 0;
@@ -780,6 +769,78 @@ async function fetchExchangeRates() {
     return exchangeRates;
 }
 
+// ============================================================
+//  PRICING – powers the frontend's Upgrade / Pricing screen
+// ============================================================
+app.get('/api/pricing', auth, async (req, res) => {
+    try {
+        const user = req.user;
+        const countryCode = user.country || 'KE';
+        const countryInfo = PAYMENT_CHANNELS[countryCode] || PAYMENT_CHANNELS['KE'];
+        const currency = countryInfo.currency;
+        const rates = await fetchExchangeRates();
+        const rate = currency === 'KES' ? 1 : (rates[currency] || 1);
+
+        const tiers = Object.keys(TIER_PRICES_KES).map(tier => ({
+            tier,
+            name: TIER_NAMES[tier],
+            amount: Math.round(TIER_PRICES_KES[tier] * rate),
+            currency,
+            features: TIER_FEATURES[tier] || [],
+            limit: TIER_LIMITS[tier] === Infinity ? 'Unlimited' : TIER_LIMITS[tier]
+        }));
+
+        const codeRunner = {
+            amount: Math.round(CODE_RUNNER_PRICE_KES * rate),
+            currency,
+            interval: 'monthly'
+        };
+
+        res.json({
+            currentTier: user.tier,
+            codeRunnerUnlocked: user.code_runner_unlocked || false,
+            tiers,
+            codeRunner,
+            channels: countryInfo.channels,
+            country: countryCode
+        });
+    } catch (err) {
+        console.error('Pricing error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ============================================================
+//  PAYMENT STATUS – lets the frontend safely poll after redirect
+//  back from Paystack, instead of ever trusting the client.
+// ============================================================
+app.get('/api/payment-status/:key', auth, async (req, res) => {
+    try {
+        const { key } = req.params;
+        const { data, error } = await supabase
+            .from('payments')
+            .select('status, tier, currency, amount')
+            .eq('transaction_id', key)
+            .eq('user_id', req.user.id)
+            .maybeSingle();
+
+        if (error) throw error;
+        if (!data) return res.status(404).json({ error: 'Payment not found' });
+
+        res.json({
+            status: data.status, // 'pending' | 'completed'
+            tier: data.tier,
+            currency: data.currency,
+            amount: data.amount
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ============================================================
+//  TIER UPGRADE CHECKOUT
+// ============================================================
 app.post('/api/create-checkout', auth, async (req, res) => {
     try {
         const { idempotencyKey, tier } = req.body;
@@ -818,7 +879,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
                 currency: finalCurrency,
                 channels: countryInfo.channels,
                 metadata: { idempotencyKey, tier, userId: user.id, country: countryCode },
-                callback_url: `${FRONTEND_URL}/?success=true`
+                callback_url: `${FRONTEND_URL}/?success=true&key=${idempotencyKey}`
             })
         });
         const data = await response.json();
@@ -842,9 +903,19 @@ app.post('/api/create-checkout', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CODE RUNNER SUBSCRIPTION (fixed 1000/month)
-//  Humanized comment: Users pay to unlock the code runner.
-//  The approval is handled by the same Paystack webhook as tier upgrades.
+//  CODE RUNNER SUBSCRIPTION (fixed price/month)
+//
+//  FIX: this used to call Paystack's raw /subscription endpoint (which
+//  requires the customer to already have a saved card) and, on ANY
+//  Paystack error mentioning "already subscribed", it unlocked the
+//  feature with no payment check at all. That is the bug that let
+//  people get access just by tapping the button.
+//
+//  Now it follows the exact same pattern as /api/create-checkout:
+//  we initialize a real Paystack transaction with the plan attached.
+//  Paystack handles first payment + auto-creates the recurring
+//  subscription on success. The ONLY place access is ever granted is
+//  the signature-verified webhook above, after a real charge.success.
 // ============================================================
 app.post('/api/subscribe-code', auth, async (req, res) => {
     try {
@@ -852,7 +923,6 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
         const user = req.user;
         if (!idempotencyKey) return res.status(400).json({ error: 'idempotencyKey required' });
 
-        // If already unlocked, return friendly message
         if (user.code_runner_unlocked) {
             return res.status(200).json({
                 alreadyActive: true,
@@ -863,13 +933,20 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
         const countryCode = user.country || 'KE';
         const countryInfo = PAYMENT_CHANNELS[countryCode] || PAYMENT_CHANNELS['KE'];
         const currency = countryInfo.currency;
-        const amount = 1000;
-        const amountInMinor = Math.round(amount * 100);
+        const rates = await fetchExchangeRates();
+        const rate = currency === 'KES' ? 1 : (rates[currency] || 1);
+        const humanAmount = Math.round(CODE_RUNNER_PRICE_KES * rate);
+        const amountInMinor = Math.round(humanAmount * 100);
 
-        const planName = `TechNovaphy Code Runner (${currency} ${amount})`;
+        const { data: existing } = await supabase.from('payments').select('*').eq('transaction_id', idempotencyKey).maybeSingle();
+        if (existing) {
+            if (existing.status === 'completed') return res.json({ alreadyProcessed: true });
+            return res.status(409).json({ error: 'Payment already processing' });
+        }
+
+        const planName = `TechNovaphy Code Runner (${currency} ${humanAmount})`;
         let planCode = null;
 
-        // Find existing Paystack plan
         try {
             const listPlans = await fetch('https://api.paystack.co/plan?perPage=50', {
                 headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}` }
@@ -904,15 +981,21 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
             }
         }
 
-        // Initiate subscription
-        const response = await fetch('https://api.paystack.co/subscription', {
+        // FIX: initialize a real transaction with the plan attached.
+        // This requires an actual successful payment before Paystack (and
+        // therefore our webhook) will ever fire. No card-on-file assumption,
+        // no silent "already subscribed" bypass.
+        const response = await fetch('https://api.paystack.co/transaction/initialize', {
             method: 'POST',
             headers: {
                 'Authorization': `Bearer ${PAYSTACK_SECRET_KEY}`,
                 'Content-Type': 'application/json'
             },
             body: JSON.stringify({
-                customer: user.email,
+                email: user.email,
+                amount: amountInMinor,
+                currency: currency,
+                channels: countryInfo.channels,
                 plan: planCode,
                 metadata: {
                     userId: user.id,
@@ -920,32 +1003,16 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
                     country: countryCode,
                     type: 'code_runner'
                 },
-                callback_url: `${FRONTEND_URL}/?success=true`
+                callback_url: `${FRONTEND_URL}/?success=true&key=${idempotencyKey}`
             })
         });
         const data = await response.json();
 
-        // Handle "already subscribed" from Paystack gracefully
         if (!data.status) {
-            const msg = (data.message || '').toLowerCase();
-            const alreadySubscribed = msg.includes('subscription already exists') ||
-                                      msg.includes('already in place') ||
-                                      msg.includes('already has a subscription') ||
-                                      msg.includes('already subscribed');
-            if (alreadySubscribed) {
-                // Mark as unlocked in our DB and return success
-                await supabase.from('users').update({ code_runner_unlocked: true }).eq('id', user.id);
-                return res.status(200).json({
-                    alreadyActive: true,
-                    message: 'You already have an active subscription. Enjoy unlimited code execution!'
-                });
-            }
-            // Otherwise, return the error
             console.error('Code subscription error (Paystack):', data.message);
             return res.status(502).json({ error: data.message || 'Subscription initialization failed' });
         }
 
-        // Save payment record
         await supabase.from('payments').insert({
             user_id: user.id,
             transaction_id: idempotencyKey,
@@ -956,7 +1023,7 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
             country: countryCode
         });
 
-        res.json({ url: data.data.authorization_url, amount: amount, currency: currency, subscription: true });
+        res.json({ url: data.data.authorization_url, amount: humanAmount, currency: currency, subscription: true });
     } catch (err) {
         console.error('Code subscription error:', err.message);
         res.status(500).json({ error: err.message });
@@ -964,25 +1031,21 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CODE EXECUTION – powered by MiniMax M3 (critical thinking)
-//  Humanized comment: Only subscribed users can run code.
-//  MiniMax analyses the code, explains it, and suggests improvements.
+//  CODE EXECUTION – powered by MiniMax M3
 // ============================================================
 app.post('/api/run-code', auth, async (req, res) => {
     try {
         const user = req.user;
         const isOwner = (OWNER_EMAIL && user.email === OWNER_EMAIL);
 
-        // ---- Concurrency limit (skip for owner) ----
         if (!isOwner) {
             await acquireConcurrency();
         }
 
-        // ---- Lock check: only subscribed users (or owners) can run code ----
         if (!isOwner && user.tier === 'free' && !user.code_runner_unlocked) {
             releaseConcurrency();
             return res.status(403).json({
-                error: '💳 Subscribe to Code Runner (1000/month) to run code.',
+                error: '💳 Subscribe to Code Runner to run code.',
                 lock: true
             });
         }
@@ -993,7 +1056,6 @@ app.post('/api/run-code', auth, async (req, res) => {
             return res.status(400).json({ error: 'No code provided' });
         }
 
-        // ---- Build a smart prompt for MiniMax ----
         const systemPrompt = `You are MiniMax M3, an expert coding assistant with strong reasoning and critical thinking skills.
 
 You are helping a developer understand and improve their code.
@@ -1016,7 +1078,6 @@ ${code}
 
         const messages = [{ role: 'system', content: systemPrompt }];
 
-        // ---- Call MiniMax M3 via OpenRouter ----
         const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
             method: 'POST',
             headers: {
@@ -1038,7 +1099,6 @@ ${code}
             throw new Error(`MiniMax error: ${errText}`);
         }
 
-        // ---- Stream the response ----
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
@@ -1069,7 +1129,6 @@ ${code}
             }
         }
 
-        // ---- Send done event ----
         res.write(`data: ${JSON.stringify({ type: 'done', text: fullContent })}\n\n`);
         res.end();
         releaseConcurrency();
