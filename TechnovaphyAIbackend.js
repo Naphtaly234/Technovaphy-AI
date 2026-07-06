@@ -1,5 +1,5 @@
 // ============================================================
-//  TECHNOVAPHY AI – COMPLETE BACKEND (JWT in localStorage)
+//  TECHNOVAPHY AI – COMPLETE BACKEND (JWT + OWNER BYPASS + CONCURRENCY)
 //  All features: Auth, Chat, Projects, Code Runner, Subscriptions
 // ============================================================
 require('dotenv').config();
@@ -65,6 +65,31 @@ const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://your-frontend.netlify.app';
 const OWNER_EMAIL = process.env.OWNER_EMAIL || null;
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || null;
+
+// ---- Concurrent request limiter ----
+const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT_REQUESTS) || 10000;
+let activeRequests = 0;
+const concurrencyQueue = [];
+
+function acquireConcurrency() {
+    return new Promise((resolve) => {
+        if (activeRequests < MAX_CONCURRENT) {
+            activeRequests++;
+            resolve();
+        } else {
+            concurrencyQueue.push(resolve);
+        }
+    });
+}
+
+function releaseConcurrency() {
+    activeRequests--;
+    if (concurrencyQueue.length > 0) {
+        const next = concurrencyQueue.shift();
+        activeRequests++;
+        next();
+    }
+}
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
@@ -387,11 +412,12 @@ app.post('/api/auth/login', async (req, res) => {
     }
 });
 
-// ---- PROFILE ----
+// ---- PROFILE (with owner bypass) ----
 app.get('/api/user/profile', auth, async (req, res) => {
     try {
         const user = req.user;
-        const limit = getLimit(user.tier);
+        const isOwner = (OWNER_EMAIL && user.email === OWNER_EMAIL);
+        const limit = isOwner ? Infinity : getLimit(user.tier);
         res.json({
             email: user.email,
             tier: user.tier,
@@ -400,7 +426,8 @@ app.get('/api/user/profile', auth, async (req, res) => {
             limit: limit,
             verified: true,
             country: user.country || 'KE',
-            code_runner_unlocked: user.code_runner_unlocked || false
+            code_runner_unlocked: isOwner ? true : (user.code_runner_unlocked || false),
+            is_owner: isOwner
         });
     } catch (err) {
         console.error('Profile error:', err);
@@ -565,24 +592,34 @@ app.delete('/api/projects/:id', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CHAT STREAM
+//  CHAT STREAM (with owner bypass & concurrency limit)
 // ============================================================
 app.post('/api/chat/stream', auth, async (req, res) => {
     try {
         const user = req.user;
+        const isOwner = (OWNER_EMAIL && user.email === OWNER_EMAIL);
 
-        if (!await checkRateLimit(user.id)) {
+        // ---- Concurrency limit (skip for owner) ----
+        if (!isOwner) {
+            await acquireConcurrency();
+        }
+
+        // ---- Rate & usage limits (skip for owner) ----
+        if (!isOwner && !await checkRateLimit(user.id)) {
+            releaseConcurrency();
             return res.status(429).json({ error: 'Too many requests' });
         }
 
         const monthlyLimit = getLimit(user.tier);
-        if (user.usage_count >= monthlyLimit) {
+        if (!isOwner && user.usage_count >= monthlyLimit) {
+            releaseConcurrency();
             return res.status(403).json({ error: 'Monthly limit reached' });
         }
 
         let conversation = await getConversation(user.id);
         let newMessages;
         try { newMessages = JSON.parse(req.body.messages); } catch (e) {
+            releaseConcurrency();
             return res.status(400).json({ error: 'Invalid messages format' });
         }
         conversation = conversation.concat(newMessages);
@@ -596,7 +633,9 @@ app.post('/api/chat/stream', auth, async (req, res) => {
         conversation.pop();
         conversation.push(finalUserMessage);
 
-        await supabase.from('users').update({ usage_count: (user.usage_count || 0) + 1 }).eq('id', user.id);
+        if (!isOwner) {
+            await supabase.from('users').update({ usage_count: (user.usage_count || 0) + 1 }).eq('id', user.id);
+        }
 
         const language = req.body.language || 'auto';
         let languageInstruction = '';
@@ -611,6 +650,13 @@ app.post('/api/chat/stream', auth, async (req, res) => {
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
+
+        // ---- Release concurrency after response ends ----
+        const originalEnd = res.end;
+        res.end = function(...args) {
+            releaseConcurrency();
+            originalEnd.apply(res, args);
+        };
 
         const { response: aiResponse } = await fetchAIResponseWithFailover(groqMessages, 'llama-3.3-70b-versatile', GROQ_API_KEY, OPENROUTER_API_KEY);
 
@@ -666,6 +712,7 @@ app.post('/api/chat/stream', auth, async (req, res) => {
             res.write(`data: ${JSON.stringify({ type: 'error', message: err.message })}\n\n`);
             res.end();
         }
+        releaseConcurrency();
     }
 });
 
@@ -752,13 +799,20 @@ app.post('/api/create-checkout', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CODE RUNNER SUBSCRIPTION (fixed 1000/month)
+//  CODE RUNNER SUBSCRIPTION (fixed 1000/month) – with duplicate check
 // ============================================================
 app.post('/api/subscribe-code', auth, async (req, res) => {
     try {
         const { idempotencyKey } = req.body;
         const user = req.user;
         if (!idempotencyKey) return res.status(400).json({ error: 'idempotencyKey required' });
+
+        if (user.code_runner_unlocked) {
+            return res.status(400).json({ 
+                error: 'You already have an active subscription. Enjoy unlimited code execution!',
+                alreadyActive: true
+            });
+        }
 
         const countryCode = user.country || 'KE';
         const countryInfo = PAYMENT_CHANNELS[countryCode] || PAYMENT_CHANNELS['KE'];
@@ -843,19 +897,32 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CODE EXECUTION (locked for free users without subscription)
+//  CODE EXECUTION (owner bypass & concurrency limit)
 // ============================================================
 app.post('/api/run-code', auth, async (req, res) => {
     try {
         const user = req.user;
-        if (user.tier === 'free' && !user.code_runner_unlocked) {
+        const isOwner = (OWNER_EMAIL && user.email === OWNER_EMAIL);
+
+        // ---- Concurrency limit (skip for owner) ----
+        if (!isOwner) {
+            await acquireConcurrency();
+        }
+
+        // ---- Lock check (skip for owner) ----
+        if (!isOwner && user.tier === 'free' && !user.code_runner_unlocked) {
+            releaseConcurrency();
             return res.status(403).json({
                 error: '💳 Subscribe to Code Runner (1000/month) to run code.',
                 lock: true
             });
         }
+
         const { language, version, code } = req.body;
-        if (!code) return res.status(400).json({ error: 'No code provided' });
+        if (!code) {
+            releaseConcurrency();
+            return res.status(400).json({ error: 'No code provided' });
+        }
 
         let output = '', success = false;
         try {
@@ -884,9 +951,14 @@ app.post('/api/run-code', auth, async (req, res) => {
         } else {
             res.json({ output: output || '✅ Done (no output)' });
         }
+
+        releaseConcurrency();
     } catch (err) {
         console.error('Code execution error:', err);
-        res.status(500).json({ error: err.message || 'Internal server error' });
+        if (!res.headersSent) {
+            res.status(500).json({ error: err.message || 'Internal server error' });
+        }
+        releaseConcurrency();
     }
 });
 
