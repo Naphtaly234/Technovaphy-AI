@@ -1,7 +1,7 @@
 // ============================================================
-//  TECHNOVAPHY AI – COMPLETE BACKEND (with Admin Dashboard)
-//  Direct MiniMax + Groq fallback | Multer for files
-//  Admin routes: stats, users list | last_active tracking
+//  TECHNOVAPHY AI – COMPLETE BACKEND (with Vision support)
+//  Direct MiniMax + Groq | Images → Groq Vision
+//  Admin dashboard | last_active tracking | Multer
 // ============================================================
 
 require('dotenv').config();
@@ -324,13 +324,48 @@ async function callGroq(messages) {
     return response;
 }
 
+// ---- NEW: Groq Vision ----
+async function callGroqVision(messages) {
+    const url = 'https://api.groq.com/openai/v1/chat/completions';
+    const payload = {
+        model: 'llama-3.2-11b-vision-preview',  // Free, supports images
+        messages: messages,
+        temperature: 0.7,
+        top_p: 0.9,
+        stream: true,
+        max_tokens: 4000
+    };
+    const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+            'Authorization': `Bearer ${GROQ_API_KEY}`,
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(payload)
+    });
+    if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(`Groq Vision error (${response.status}): ${errText}`);
+    }
+    return response;
+}
+
+// ---- Main failover (with vision support) ----
 async function fetchAIResponseWithFailover(messages, userSelectedModel, hasImage = false) {
+    // If there are images, force Groq Vision (reliable)
+    if (hasImage) {
+        const response = await callGroqVision(messages);
+        return { response, source: 'groq-vision' };
+    }
+
+    // Otherwise, use the user's model choice
     if (userSelectedModel === 'groq/llama-3.3-70b-versatile') {
         const response = await callGroq(messages);
         return { response, source: 'groq' };
     }
+
     try {
-        const response = await callMiniMax(messages, hasImage);
+        const response = await callMiniMax(messages);
         return { response, source: 'minimax' };
     } catch (miniMaxErr) {
         console.warn('⚠️ MiniMax failed, falling back to Groq:', miniMaxErr.message);
@@ -446,7 +481,6 @@ const auth = async (req, res, next) => {
         const user = await findUserById(decoded.userId);
         if (!user) return res.status(401).json({ error: 'User not found' });
         req.user = user;
-        // ---- Update last_active (for tracking) ----
         await supabase.from('users').update({ last_active: new Date().toISOString() }).eq('id', user.id);
         next();
     } catch (e) {
@@ -514,7 +548,6 @@ app.post('/api/auth/login', async (req, res) => {
         if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
 
         const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '7d' });
-        // Update last_active
         await supabase.from('users').update({ last_active: new Date().toISOString() }).eq('id', user.id);
         res.json({ token, verified: true, country: user.country });
     } catch (err) {
@@ -750,7 +783,7 @@ app.delete('/api/projects/:id', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CHAT STREAM WITH FILE UPLOAD (multer)
+//  CHAT STREAM WITH FILE UPLOAD (multer) – FORCES GROQ VISION FOR IMAGES
 // ============================================================
 app.post('/api/chat/stream', auth, upload.array('files', 5), async (req, res) => {
     try {
@@ -836,13 +869,15 @@ app.post('/api/chat/stream', auth, upload.array('files', 5), async (req, res) =>
         const memoryPrompt = user.memory ? `\n\nUser context: ${user.memory}` : '';
         const systemPrompt = buildSystemPrompt({ memoryPrompt, languageInstruction });
 
+        // ---- If there are images, force Groq Vision (we don't use user model) ----
         const userModel = req.body.model || 'minimax/minimax-m3-preview';
         const groqMessages = [{ role: 'system', content: systemPrompt }, ...conversation];
 
-        // Log what we're sending to AI (for debugging)
+        // ---- Log what we're sending (for debugging) ----
         const lastUserMsg = groqMessages[groqMessages.length - 1];
         console.log('📤 Sending to AI – user message length:', lastUserMsg?.content?.length || 0);
         if (fileTextContent) console.log('📄 File content included (first 200 chars):', fileTextContent.substring(0, 200));
+        if (hasImage) console.log('🖼️ Images detected – using Groq Vision');
 
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
@@ -854,6 +889,7 @@ app.post('/api/chat/stream', auth, upload.array('files', 5), async (req, res) =>
             originalEnd.apply(res, args);
         };
 
+        // ---- Call the AI (vision will be handled automatically) ----
         const { response: aiResponse, source } = await fetchAIResponseWithFailover(groqMessages, userModel, hasImage);
         if (!aiResponse.ok) throw new Error(`AI error ${aiResponse.status}`);
 
