@@ -1,6 +1,7 @@
 // ============================================================
 //  TECHNOVAPHY AI – COMPLETE BACKEND
-//  Direct MiniMax + Groq fallback | Bank channels forced
+//  Direct MiniMax + Groq fallback | Bank + Card channels forced
+//  Multer for file uploads | Code runner streaming fixed
 // ============================================================
 
 require('dotenv').config();
@@ -12,6 +13,7 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcrypt');
 const { createClient } = require('@supabase/supabase-js');
 const crypto = require('crypto');
+const multer = require('multer'); // <-- added for file uploads
 
 // ---- Redis (optional) ----
 let redisClient = null;
@@ -65,6 +67,19 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
         console.warn('⚠️ Could not connect to Supabase:', e.message);
     }
 })();
+
+// ---- Multer config ----
+const storage = multer.memoryStorage();
+const fileFilter = (req, file, cb) => {
+    // Accept images and common text file types
+    const allowedTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'text/plain', 'text/csv', 'application/pdf'];
+    if (allowedTypes.includes(file.mimetype)) {
+        cb(null, true);
+    } else {
+        cb(new Error('Unsupported file type'), false);
+    }
+};
+const upload = multer({ storage, limits: { fileSize: 10 * 1024 * 1024 }, fileFilter });
 
 // ---- PAYSTACK WEBHOOK ----
 app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), async (req, res) => {
@@ -148,6 +163,7 @@ const PAYMENT_CHANNELS = {
         country: 'Kenya',
         currency: 'KES',
         displayNames: {
+            'card': '💳 Card',
             'mpesa': '📱 M-Pesa',
             'mobile_money': '📱 Airtel Money',
             'bank_transfer': '🏦 Bank Transfer (Paybill)'
@@ -156,22 +172,34 @@ const PAYMENT_CHANNELS = {
     NG: {
         country: 'Nigeria',
         currency: 'NGN',
-        displayNames: { 'bank_transfer': '🏦 Bank Transfer' }
+        displayNames: {
+            'card': '💳 Card',
+            'bank_transfer': '🏦 Bank Transfer'
+        }
     },
     GH: {
         country: 'Ghana',
         currency: 'GHS',
-        displayNames: { 'bank_transfer': '🏦 Bank Transfer' }
+        displayNames: {
+            'card': '💳 Card',
+            'bank_transfer': '🏦 Bank Transfer'
+        }
     },
     UG: {
         country: 'Uganda',
         currency: 'UGX',
-        displayNames: { 'bank_transfer': '🏦 Bank Transfer' }
+        displayNames: {
+            'card': '💳 Card',
+            'bank_transfer': '🏦 Bank Transfer'
+        }
     },
     TZ: {
         country: 'Tanzania',
         currency: 'TZS',
-        displayNames: { 'bank_transfer': '🏦 Bank Transfer' }
+        displayNames: {
+            'card': '💳 Card',
+            'bank_transfer': '🏦 Bank Transfer'
+        }
     }
 };
 
@@ -717,9 +745,9 @@ app.delete('/api/projects/:id', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CHAT STREAM
+//  CHAT STREAM WITH FILE UPLOAD (multer)
 // ============================================================
-app.post('/api/chat/stream', auth, async (req, res) => {
+app.post('/api/chat/stream', auth, upload.array('files', 5), async (req, res) => {
     try {
         const user = req.user;
         const isOwner = (OWNER_EMAIL && user.email === OWNER_EMAIL);
@@ -735,21 +763,57 @@ app.post('/api/chat/stream', auth, async (req, res) => {
             return res.status(403).json({ error: 'Monthly limit reached' });
         }
 
-        let conversation = await getConversation(user.id);
-        let newMessages;
-        try { newMessages = JSON.parse(req.body.messages); }
-        catch (e) {
+        // ---- Parse messages ----
+        let messages;
+        try {
+            messages = JSON.parse(req.body.messages);
+        } catch (e) {
             releaseConcurrency();
             return res.status(400).json({ error: 'Invalid messages format' });
         }
-        conversation = conversation.concat(newMessages);
+
+        // ---- Handle uploaded files ----
+        const files = req.files || [];
+        const imageUrls = [];
+        let fileTextContent = '';
+
+        for (const file of files) {
+            if (file.mimetype.startsWith('image/')) {
+                const base64 = file.buffer.toString('base64');
+                const dataUrl = `data:${file.mimetype};base64,${base64}`;
+                imageUrls.push({ type: 'image_url', image_url: { url: dataUrl } });
+            } else {
+                // For text files, extract content
+                try {
+                    const text = file.buffer.toString('utf-8');
+                    fileTextContent += `\n\n--- File: ${file.originalname} ---\n${text}\n--- End ---`;
+                } catch (e) {
+                    fileTextContent += `\n\n[File: ${file.originalname} (could not read as text)]`;
+                }
+            }
+        }
+
+        // ---- Build conversation ----
+        let conversation = await getConversation(user.id);
+        let userContent = messages[messages.length - 1]?.content || '';
+
+        if (imageUrls.length > 0) {
+            const textPart = userContent + (fileTextContent ? `\n\n${fileTextContent}` : '');
+            const finalUserMessage = {
+                role: 'user',
+                content: [{ type: 'text', text: textPart }, ...imageUrls]
+            };
+            messages.pop();
+            messages.push(finalUserMessage);
+        } else {
+            const fullText = userContent + (fileTextContent ? `\n\n${fileTextContent}` : '');
+            messages[messages.length - 1].content = fullText;
+        }
+
+        conversation = conversation.concat(messages);
         if (conversation.length > MAX_CONVERSATION_HISTORY) {
             conversation = conversation.slice(-MAX_CONVERSATION_HISTORY);
         }
-        const userContent = conversation[conversation.length - 1]?.content || '';
-        const finalUserMessage = { role: 'user', content: userContent };
-        conversation.pop();
-        conversation.push(finalUserMessage);
 
         if (!isOwner) {
             await supabase.from('users').update({ usage_count: (user.usage_count || 0) + 1 }).eq('id', user.id);
@@ -763,8 +827,8 @@ app.post('/api/chat/stream', auth, async (req, res) => {
         const memoryPrompt = user.memory ? `\n\nUser context: ${user.memory}` : '';
         const systemPrompt = buildSystemPrompt({ memoryPrompt, languageInstruction });
 
-        const groqMessages = [{ role: 'system', content: systemPrompt }, ...conversation];
         const userModel = req.body.model || 'minimax/minimax-m3-preview';
+        const groqMessages = [{ role: 'system', content: systemPrompt }, ...conversation];
 
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
@@ -879,7 +943,8 @@ app.get('/api/pricing', auth, async (req, res) => {
             codeRunnerUnlocked: user.code_runner_unlocked || false,
             tiers,
             codeRunner,
-            channels: countryInfo.channels || ['bank_transfer'],
+            // return available channels (for frontend display)
+            channels: countryInfo.channels ? Object.keys(countryInfo.displayNames) : ['card', 'bank_transfer'],
             country: countryCode
         });
     } catch (err) {
@@ -916,7 +981,7 @@ app.get('/api/payment-status/:key', auth, async (req, res) => {
 });
 
 // ============================================================
-//  TIER UPGRADE CHECKOUT (bank forced)
+//  TIER UPGRADE CHECKOUT (channels with card + bank)
 // ============================================================
 app.post('/api/create-checkout', auth, async (req, res) => {
     try {
@@ -947,10 +1012,11 @@ app.post('/api/create-checkout', auth, async (req, res) => {
 
         if (!PAYSTACK_SECRET_KEY) return res.status(503).json({ error: 'Payment service not configured' });
 
-        // ---- Force bank_transfer ----
-        let channels = ['bank_transfer'];
-        if (countryInfo.channels) {
-            for (const ch of countryInfo.channels) {
+        // ---- Build channels (always include card) ----
+        let channels = ['card', 'bank_transfer'];
+        if (countryInfo.displayNames) {
+            // Add any channels defined in displayNames (but skip if already present)
+            for (const ch of Object.keys(countryInfo.displayNames)) {
                 if (!channels.includes(ch)) channels.push(ch);
             }
         }
@@ -958,6 +1024,8 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             if (!channels.includes('mpesa')) channels.push('mpesa');
             if (!channels.includes('mobile_money')) channels.push('mobile_money');
         }
+
+        console.log('🔗 Sending channels (create-checkout):', channels);
 
         const response = await fetch('https://api.paystack.co/transaction/initialize', {
             method: 'POST',
@@ -992,7 +1060,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CODE RUNNER SUBSCRIPTION (bank forced)
+//  CODE RUNNER SUBSCRIPTION (channels with card + bank)
 // ============================================================
 app.post('/api/subscribe-code', auth, async (req, res) => {
     try {
@@ -1058,10 +1126,10 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
             }
         }
 
-        // ---- Force bank_transfer ----
-        let channels = ['bank_transfer'];
-        if (countryInfo.channels) {
-            for (const ch of countryInfo.channels) {
+        // ---- Build channels (always include card) ----
+        let channels = ['card', 'bank_transfer'];
+        if (countryInfo.displayNames) {
+            for (const ch of Object.keys(countryInfo.displayNames)) {
                 if (!channels.includes(ch)) channels.push(ch);
             }
         }
@@ -1069,6 +1137,8 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
             if (!channels.includes('mpesa')) channels.push('mpesa');
             if (!channels.includes('mobile_money')) channels.push('mobile_money');
         }
+
+        console.log('🔗 Sending channels (subscribe-code):', channels);
 
         const response = await fetch('https://api.paystack.co/transaction/initialize', {
             method: 'POST',
@@ -1116,7 +1186,7 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CODE RUNNER EXECUTION
+//  CODE RUNNER EXECUTION (with MiniMax + Groq fallback)
 // ============================================================
 app.post('/api/run-code', auth, async (req, res) => {
     try {
@@ -1132,24 +1202,49 @@ app.post('/api/run-code', auth, async (req, res) => {
         const { language, version, code } = req.body;
         if (!code) { releaseConcurrency(); return res.status(400).json({ error: 'No code provided' }); }
 
-        const systemPrompt = `You are MiniMax M3, an expert coding assistant.
-Analyse the code and provide:
-1. Brief summary.
-2. Potential issues or bugs.
-3. Suggestions for improvement.
-4. Simulation of the output.
+        const systemPrompt = `You are an expert coding assistant with strong reasoning and critical thinking skills.
 
-LANGUAGE: ${language} (${version})
+You are helping a developer understand and improve their code.
+
+Analyse the following code snippet and provide:
+1. A brief summary of what the code does.
+2. Any potential issues or bugs.
+3. Suggestions for improvement (optimisation, readability, best practices).
+4. A simulation of the output (if it's a runnable script, explain what it would output when executed).
+
+Format your response as a clear, structured explanation – no markdown, just plain text with line breaks.
+
+LANGUAGE: ${language} (version ${version})
+
 CODE:
 \`\`\`
 ${code}
 \`\`\`
 `;
+
         const messages = [{ role: 'system', content: systemPrompt }];
-        const response = await callMiniMax(messages);
+
+        // ---- Try MiniMax first, fallback to Groq ----
+        let response;
+        let source;
+        try {
+            response = await callMiniMax(messages);
+            source = 'minimax';
+        } catch (miniMaxErr) {
+            console.warn('⚠️ MiniMax failed for code, falling back to Groq:', miniMaxErr.message);
+            try {
+                response = await callGroq(messages);
+                source = 'groq';
+            } catch (groqErr) {
+                console.error('❌ Groq also failed for code:', groqErr.message);
+                releaseConcurrency();
+                return res.status(500).json({ error: 'Both AI models failed. Please try again later.' });
+            }
+        }
+
         if (!response.ok) {
-            const err = await response.text();
-            throw new Error(`MiniMax error: ${err}`);
+            const errText = await response.text();
+            throw new Error(`${source} error: ${errText}`);
         }
 
         res.setHeader('Content-Type', 'text/event-stream');
@@ -1159,6 +1254,7 @@ ${code}
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
         let buffer = '', fullContent = '';
+
         while (true) {
             const { done, value } = await reader.read();
             if (done) break;
@@ -1187,7 +1283,7 @@ ${code}
 
     } catch (err) {
         console.error('Code execution error:', err);
-        if (!res.headersSent) res.status(500).json({ error: err.message });
+        if (!res.headersSent) res.status(500).json({ error: err.message || 'Internal server error' });
         else res.write(`data: ${JSON.stringify({ type: 'error', message: err.message })}\n\n`);
         res.end();
         releaseConcurrency();
