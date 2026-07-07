@@ -1,7 +1,7 @@
 // ============================================================
-//  TECHNOVAPHY AI – COMPLETE BACKEND
-//  Direct MiniMax + Groq fallback | Bank + Card channels forced
-//  Multer for file uploads | Code runner streaming fixed
+//  TECHNOVAPHY AI – COMPLETE BACKEND (with Admin Dashboard)
+//  Direct MiniMax + Groq fallback | Multer for files
+//  Admin routes: stats, users list | last_active tracking
 // ============================================================
 
 require('dotenv').config();
@@ -13,7 +13,7 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcrypt');
 const { createClient } = require('@supabase/supabase-js');
 const crypto = require('crypto');
-const multer = require('multer'); // <-- added for file uploads
+const multer = require('multer');
 
 // ---- Redis (optional) ----
 let redisClient = null;
@@ -71,7 +71,6 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 // ---- Multer config ----
 const storage = multer.memoryStorage();
 const fileFilter = (req, file, cb) => {
-    // Accept images and common text file types
     const allowedTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'text/plain', 'text/csv', 'application/pdf'];
     if (allowedTypes.includes(file.mimetype)) {
         cb(null, true);
@@ -250,6 +249,7 @@ RULES:
 - For financial/legal topics, flag uncertainty plainly.
 - For code, provide working examples and explain them.
 - Only mention the website (https://technovaphy-solutions-5nz6.onrender.com) and services if the user asks about TechNovaphy, the company, pricing, or support.
+- **Important:** If the user attaches a file, the content of the file will be included in their message. Always read and respond to the file content directly.
 
 ${memoryPrompt}
 ${languageInstruction}`;
@@ -273,10 +273,11 @@ function parseThinkingAndAnswer(rawText) {
 // ============================================================
 //  AI CALLERS
 // ============================================================
-async function callMiniMax(messages) {
+async function callMiniMax(messages, hasImage = false) {
+    const model = hasImage ? 'minimax-m3' : 'abab6.5s-chat';
     const url = 'https://api.minimax.chat/v1/text/chatcompletion_pro';
     const payload = {
-        model: 'abab6.5s-chat',
+        model: model,
         messages: messages,
         temperature: 0.7,
         top_p: 0.9,
@@ -323,13 +324,13 @@ async function callGroq(messages) {
     return response;
 }
 
-async function fetchAIResponseWithFailover(messages, userSelectedModel) {
+async function fetchAIResponseWithFailover(messages, userSelectedModel, hasImage = false) {
     if (userSelectedModel === 'groq/llama-3.3-70b-versatile') {
         const response = await callGroq(messages);
         return { response, source: 'groq' };
     }
     try {
-        const response = await callMiniMax(messages);
+        const response = await callMiniMax(messages, hasImage);
         return { response, source: 'minimax' };
     } catch (miniMaxErr) {
         console.warn('⚠️ MiniMax failed, falling back to Groq:', miniMaxErr.message);
@@ -434,7 +435,7 @@ function releaseConcurrency() {
 }
 
 // ============================================================
-//  AUTH MIDDLEWARE
+//  AUTH MIDDLEWARE (updates last_active)
 // ============================================================
 const auth = async (req, res, next) => {
     const authHeader = req.headers.authorization;
@@ -445,6 +446,8 @@ const auth = async (req, res, next) => {
         const user = await findUserById(decoded.userId);
         if (!user) return res.status(401).json({ error: 'User not found' });
         req.user = user;
+        // ---- Update last_active (for tracking) ----
+        await supabase.from('users').update({ last_active: new Date().toISOString() }).eq('id', user.id);
         next();
     } catch (e) {
         res.status(401).json({ error: 'Invalid or expired token' });
@@ -484,7 +487,8 @@ app.post('/api/auth/register', async (req, res) => {
             memory: '',
             role: 'user',
             country: country,
-            code_runner_unlocked: false
+            code_runner_unlocked: false,
+            last_active: now.toISOString()
         }).select().single();
 
         if (error) throw new Error('DB insert: ' + error.message);
@@ -510,6 +514,8 @@ app.post('/api/auth/login', async (req, res) => {
         if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
 
         const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '7d' });
+        // Update last_active
+        await supabase.from('users').update({ last_active: new Date().toISOString() }).eq('id', user.id);
         res.json({ token, verified: true, country: user.country });
     } catch (err) {
         console.error('Login error:', err);
@@ -640,7 +646,6 @@ app.delete('/api/conversations/:conversationId', auth, async (req, res) => {
     }
 });
 
-// ===== CLEAR CONVERSATION (New Chat) =====
 app.post('/api/conversations/clear', auth, async (req, res) => {
     try {
         const { data: existing, error: findError } = await supabase
@@ -777,18 +782,21 @@ app.post('/api/chat/stream', auth, upload.array('files', 5), async (req, res) =>
         const imageUrls = [];
         let fileTextContent = '';
 
+        console.log(`📎 Received ${files.length} file(s)`);
+
         for (const file of files) {
+            console.log(`📄 Processing file: ${file.originalname} (${file.mimetype}, ${file.size} bytes)`);
             if (file.mimetype.startsWith('image/')) {
                 const base64 = file.buffer.toString('base64');
                 const dataUrl = `data:${file.mimetype};base64,${base64}`;
                 imageUrls.push({ type: 'image_url', image_url: { url: dataUrl } });
             } else {
-                // For text files, extract content
                 try {
                     const text = file.buffer.toString('utf-8');
-                    fileTextContent += `\n\n--- File: ${file.originalname} ---\n${text}\n--- End ---`;
+                    const truncated = text.length > 50000 ? text.substring(0, 50000) + '\n... (truncated)' : text;
+                    fileTextContent += `\n\n--- 📄 File: ${file.originalname} (${file.mimetype}) ---\n${truncated}\n--- End of file ---`;
                 } catch (e) {
-                    fileTextContent += `\n\n[File: ${file.originalname} (could not read as text)]`;
+                    fileTextContent += `\n\n[File: ${file.originalname} – could not read as text]`;
                 }
             }
         }
@@ -797,17 +805,18 @@ app.post('/api/chat/stream', auth, upload.array('files', 5), async (req, res) =>
         let conversation = await getConversation(user.id);
         let userContent = messages[messages.length - 1]?.content || '';
 
-        if (imageUrls.length > 0) {
-            const textPart = userContent + (fileTextContent ? `\n\n${fileTextContent}` : '');
+        const hasImage = imageUrls.length > 0;
+        const finalUserContent = userContent + fileTextContent;
+
+        if (hasImage) {
             const finalUserMessage = {
                 role: 'user',
-                content: [{ type: 'text', text: textPart }, ...imageUrls]
+                content: [{ type: 'text', text: finalUserContent || '[Attached image]' }, ...imageUrls]
             };
             messages.pop();
             messages.push(finalUserMessage);
         } else {
-            const fullText = userContent + (fileTextContent ? `\n\n${fileTextContent}` : '');
-            messages[messages.length - 1].content = fullText;
+            messages[messages.length - 1].content = finalUserContent || '[Attached files]';
         }
 
         conversation = conversation.concat(messages);
@@ -830,6 +839,11 @@ app.post('/api/chat/stream', auth, upload.array('files', 5), async (req, res) =>
         const userModel = req.body.model || 'minimax/minimax-m3-preview';
         const groqMessages = [{ role: 'system', content: systemPrompt }, ...conversation];
 
+        // Log what we're sending to AI (for debugging)
+        const lastUserMsg = groqMessages[groqMessages.length - 1];
+        console.log('📤 Sending to AI – user message length:', lastUserMsg?.content?.length || 0);
+        if (fileTextContent) console.log('📄 File content included (first 200 chars):', fileTextContent.substring(0, 200));
+
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
@@ -840,7 +854,7 @@ app.post('/api/chat/stream', auth, upload.array('files', 5), async (req, res) =>
             originalEnd.apply(res, args);
         };
 
-        const { response: aiResponse, source } = await fetchAIResponseWithFailover(groqMessages, userModel);
+        const { response: aiResponse, source } = await fetchAIResponseWithFailover(groqMessages, userModel, hasImage);
         if (!aiResponse.ok) throw new Error(`AI error ${aiResponse.status}`);
 
         const reader = aiResponse.body.getReader();
@@ -943,7 +957,6 @@ app.get('/api/pricing', auth, async (req, res) => {
             codeRunnerUnlocked: user.code_runner_unlocked || false,
             tiers,
             codeRunner,
-            // return available channels (for frontend display)
             channels: countryInfo.channels ? Object.keys(countryInfo.displayNames) : ['card', 'bank_transfer'],
             country: countryCode
         });
@@ -981,7 +994,7 @@ app.get('/api/payment-status/:key', auth, async (req, res) => {
 });
 
 // ============================================================
-//  TIER UPGRADE CHECKOUT (channels with card + bank)
+//  TIER UPGRADE CHECKOUT
 // ============================================================
 app.post('/api/create-checkout', auth, async (req, res) => {
     try {
@@ -1012,10 +1025,8 @@ app.post('/api/create-checkout', auth, async (req, res) => {
 
         if (!PAYSTACK_SECRET_KEY) return res.status(503).json({ error: 'Payment service not configured' });
 
-        // ---- Build channels (always include card) ----
         let channels = ['card', 'bank_transfer'];
         if (countryInfo.displayNames) {
-            // Add any channels defined in displayNames (but skip if already present)
             for (const ch of Object.keys(countryInfo.displayNames)) {
                 if (!channels.includes(ch)) channels.push(ch);
             }
@@ -1060,7 +1071,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CODE RUNNER SUBSCRIPTION (channels with card + bank)
+//  CODE RUNNER SUBSCRIPTION
 // ============================================================
 app.post('/api/subscribe-code', auth, async (req, res) => {
     try {
@@ -1126,7 +1137,6 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
             }
         }
 
-        // ---- Build channels (always include card) ----
         let channels = ['card', 'bank_transfer'];
         if (countryInfo.displayNames) {
             for (const ch of Object.keys(countryInfo.displayNames)) {
@@ -1186,7 +1196,7 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CODE RUNNER EXECUTION (with MiniMax + Groq fallback)
+//  CODE RUNNER EXECUTION
 // ============================================================
 app.post('/api/run-code', auth, async (req, res) => {
     try {
@@ -1203,8 +1213,6 @@ app.post('/api/run-code', auth, async (req, res) => {
         if (!code) { releaseConcurrency(); return res.status(400).json({ error: 'No code provided' }); }
 
         const systemPrompt = `You are an expert coding assistant with strong reasoning and critical thinking skills.
-
-You are helping a developer understand and improve their code.
 
 Analyse the following code snippet and provide:
 1. A brief summary of what the code does.
@@ -1224,7 +1232,6 @@ ${code}
 
         const messages = [{ role: 'system', content: systemPrompt }];
 
-        // ---- Try MiniMax first, fallback to Groq ----
         let response;
         let source;
         try {
@@ -1287,6 +1294,107 @@ ${code}
         else res.write(`data: ${JSON.stringify({ type: 'error', message: err.message })}\n\n`);
         res.end();
         releaseConcurrency();
+    }
+});
+
+// ============================================================
+//  ADMIN DASHBOARD ROUTES (owner only)
+// ============================================================
+
+// ---- Admin stats ----
+app.get('/api/admin/stats', auth, async (req, res) => {
+    try {
+        const user = req.user;
+        const isOwner = (OWNER_EMAIL && user.email === OWNER_EMAIL);
+        if (!isOwner) {
+            return res.status(403).json({ error: 'Admin access only' });
+        }
+
+        // 1. Total users
+        const { count: totalUsers, error: usersErr } = await supabase
+            .from('users')
+            .select('*', { count: 'exact', head: true });
+        if (usersErr) throw usersErr;
+
+        // 2. Active users (last 24 hours)
+        const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+        const { count: activeUsers, error: activeErr } = await supabase
+            .from('users')
+            .select('*', { count: 'exact', head: true })
+            .gte('last_active', twentyFourHoursAgo);
+        if (activeErr) throw activeErr;
+
+        // 3. Users active in last 15 minutes (approx "logged in")
+        const fifteenMinutesAgo = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+        const { count: loggedInUsers, error: loggedErr } = await supabase
+            .from('users')
+            .select('*', { count: 'exact', head: true })
+            .gte('last_active', fifteenMinutesAgo);
+        if (loggedErr) throw loggedErr;
+
+        // 4. Payments summary
+        const { data: payments, error: payErr } = await supabase
+            .from('payments')
+            .select('amount, currency, tier, status, created_at')
+            .eq('status', 'completed');
+        if (payErr) throw payErr;
+
+        const totalRevenue = payments.reduce((sum, p) => sum + p.amount, 0);
+        const revenueByTier = {};
+        payments.forEach(p => {
+            revenueByTier[p.tier] = (revenueByTier[p.tier] || 0) + p.amount;
+        });
+
+        // 5. Recent payments (last 5)
+        const { data: recentPayments, error: recentErr } = await supabase
+            .from('payments')
+            .select('amount, currency, tier, status, created_at, user_id')
+            .eq('status', 'completed')
+            .order('created_at', { ascending: false })
+            .limit(5);
+        if (recentErr) throw recentErr;
+
+        // 6. Total code runner unlocks
+        const { count: codeRunnerCount, error: codeErr } = await supabase
+            .from('users')
+            .select('*', { count: 'exact', head: true })
+            .eq('code_runner_unlocked', true);
+        if (codeErr) throw codeErr;
+
+        res.json({
+            totalUsers,
+            activeUsers,
+            loggedInUsers,
+            totalRevenue,
+            revenueByTier,
+            recentPayments,
+            codeRunnerCount,
+            timestamp: new Date().toISOString()
+        });
+    } catch (err) {
+        console.error('Admin stats error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ---- Admin – list all users (with pagination) ----
+app.get('/api/admin/users', auth, async (req, res) => {
+    try {
+        const user = req.user;
+        const isOwner = (OWNER_EMAIL && user.email === OWNER_EMAIL);
+        if (!isOwner) {
+            return res.status(403).json({ error: 'Admin access only' });
+        }
+
+        const { data, error } = await supabase
+            .from('users')
+            .select('id, email, tier, usage_count, code_runner_unlocked, created_at, last_active')
+            .order('created_at', { ascending: false })
+            .limit(50);
+        if (error) throw error;
+        res.json({ users: data });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
     }
 });
 
