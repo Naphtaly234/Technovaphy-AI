@@ -1,6 +1,8 @@
 // ============================================================
-//  TECHNOVAPHY AI – COMPLETE BACKEND (PRODUCTION READY)
-//  All features: Auth, Chat, Projects, Code Runner, Subscriptions
+//  TECHNOVAPHY AI – COMPLETE BACKEND
+//  Models: MiniMax M3 (primary), Groq Llama 3.3 (secondary)
+//  All via OpenRouter – single API key
+//  Features: Auth, Chat, Projects, Code Runner, Subscriptions
 // ============================================================
 
 require('dotenv').config();
@@ -155,50 +157,20 @@ const TIER_FEATURES = {
 };
 const CODE_RUNNER_PRICE_KES = 1000;
 const MAX_CONVERSATION_HISTORY = 20;
+
 const PAYMENT_CHANNELS = {
     KE: {
         country: 'Kenya',
         currency: 'KES',
         channels: ['mpesa', 'mobile_money', 'bank_transfer'],
-        displayNames: {
-            'mpesa': '📱 M-Pesa',
-            'mobile_money': '📱 Airtel Money',
-            'bank_transfer': '🏦 Bank Transfer (Paybill)'
-        }
+        displayNames: { 'mpesa': '📱 M-Pesa', 'mobile_money': '📱 Airtel Money', 'bank_transfer': '🏦 Bank Transfer (Paybill)' }
     },
-    NG: {
-        country: 'Nigeria',
-        currency: 'NGN',
-        channels: ['bank_transfer'],
-        displayNames: {
-            'bank_transfer': '🏦 Bank Transfer'
-        }
-    },
-    GH: {
-        country: 'Ghana',
-        currency: 'GHS',
-        channels: ['bank_transfer'],
-        displayNames: {
-            'bank_transfer': '🏦 Bank Transfer'
-        }
-    },
-    UG: {
-        country: 'Uganda',
-        currency: 'UGX',
-        channels: ['bank_transfer'],
-        displayNames: {
-            'bank_transfer': '🏦 Bank Transfer'
-        }
-    },
-    TZ: {
-        country: 'Tanzania',
-        currency: 'TZS',
-        channels: ['bank_transfer'],
-        displayNames: {
-            'bank_transfer': '🏦 Bank Transfer'
-        }
-    }
+    NG: { country: 'Nigeria', currency: 'NGN', channels: ['bank_transfer'], displayNames: { 'bank_transfer': '🏦 Bank Transfer' } },
+    GH: { country: 'Ghana', currency: 'GHS', channels: ['bank_transfer'], displayNames: { 'bank_transfer': '🏦 Bank Transfer' } },
+    UG: { country: 'Uganda', currency: 'UGX', channels: ['bank_transfer'], displayNames: { 'bank_transfer': '🏦 Bank Transfer' } },
+    TZ: { country: 'Tanzania', currency: 'TZS', channels: ['bank_transfer'], displayNames: { 'bank_transfer': '🏦 Bank Transfer' } }
 };
+
 // ============================================================
 //  SYSTEM PROMPT & PARSING
 // ============================================================
@@ -243,23 +215,20 @@ function parseThinkingAndAnswer(rawText) {
 }
 
 // ============================================================
-//  SMART FAILOVER: OpenRouter models chain
+//  SMART FAILOVER: OpenRouter models (MiniMax → Groq)
 // ============================================================
 async function fetchAIResponseWithFailover(messages, userSelectedModel) {
     if (!OPENROUTER_API_KEY) {
         throw new Error('OpenRouter API key is not configured. Please set OPENROUTER_API_KEY.');
     }
 
-    const fallbackModels = [
-        'minimax/minimax-m3-preview',
-        'zai-org/glm-5.2',
-        'nvidia/nemotron-3-ultra',
-        'nvidia/nemotron-3-super',
-        'groq/llama-3.3-70b-versatile',
-        'anthropic/claude-haiku-4.5'
-    ];
+    // Our two models: MiniMax M3 and Groq Llama 3.3
+    const primaryModel = userSelectedModel || 'minimax/minimax-m3-preview';
+    const fallbackModel = (primaryModel === 'minimax/minimax-m3-preview')
+        ? 'groq/llama-3.3-70b-versatile'
+        : 'minimax/minimax-m3-preview';
 
-    const modelsToTry = [userSelectedModel, ...fallbackModels.filter(m => m !== userSelectedModel)];
+    const modelsToTry = [primaryModel, fallbackModel];
 
     let lastError = null;
     for (const model of modelsToTry) {
@@ -277,7 +246,8 @@ async function fetchAIResponseWithFailover(messages, userSelectedModel) {
                     messages: messages,
                     temperature: 0.7,
                     top_p: 0.9,
-                    stream: true
+                    stream: true,
+                    max_tokens: 4000   // adjust as needed
                 })
             });
 
@@ -652,7 +622,7 @@ app.delete('/api/projects/:id', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CHAT STREAM
+//  CHAT STREAM (MiniMax + Groq via OpenRouter)
 // ============================================================
 app.post('/api/chat/stream', auth, async (req, res) => {
     try {
@@ -718,6 +688,7 @@ app.post('/api/chat/stream', auth, async (req, res) => {
             originalEnd.apply(res, args);
         };
 
+        // ---- Use the failover function (MiniMax → Groq) ----
         const { response: aiResponse, source } = await fetchAIResponseWithFailover(groqMessages, userModel);
         if (!aiResponse.ok) throw new Error(`AI error ${aiResponse.status}`);
 
@@ -757,7 +728,7 @@ app.post('/api/chat/stream', auth, async (req, res) => {
         res.write(`data: ${JSON.stringify({
             type: 'done',
             text: finalAnswer,
-            model: source
+            model: source   // tells frontend which model actually responded
         })}\n\n`);
         res.end();
 
@@ -927,7 +898,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CODE RUNNER SUBSCRIPTION (real payment)
+//  CODE RUNNER SUBSCRIPTION (fixed price/month)
 // ============================================================
 app.post('/api/subscribe-code', auth, async (req, res) => {
     try {
@@ -1039,7 +1010,7 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CODE RUNNER EXECUTION – locked for all non‑owners
+//  CODE RUNNER EXECUTION – MiniMax M3 (reasoning)
 // ============================================================
 app.post('/api/run-code', auth, async (req, res) => {
     try {
@@ -1050,7 +1021,7 @@ app.post('/api/run-code', auth, async (req, res) => {
             await acquireConcurrency();
         }
 
-        // 🔥 Only owner bypasses the lock; everyone else must have code_runner_unlocked
+        // Only owner bypasses the lock; everyone else must have code_runner_unlocked
         if (!isOwner && !user.code_runner_unlocked) {
             releaseConcurrency();
             return res.status(403).json({
@@ -1095,7 +1066,7 @@ ${code}
                 'HTTP-Referer': 'https://technovaphy.ai'
             },
             body: JSON.stringify({
-                model: 'minimax/minimax-m3-preview',
+                model: 'minimax/minimax-m3-preview',   // explicitly use MiniMax for code analysis
                 messages: messages,
                 temperature: 0.7,
                 stream: true,
