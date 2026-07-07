@@ -47,8 +47,7 @@ app.use(cors({
 }));
 
 // ---- Environment checks ----
-// We now use 9Router instead of OpenRouter, so OPENROUTER_API_KEY is no longer required.
-const required = ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'JWT_SECRET', 'PAYSTACK_SECRET_KEY'];
+const required = ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'JWT_SECRET', 'OPENROUTER_API_KEY', 'PAYSTACK_SECRET_KEY'];
 const missing = required.filter(key => !process.env[key]);
 if (missing.length) {
     console.error('❌ Missing env variables:', missing.join(', '));
@@ -59,9 +58,7 @@ const PORT = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-// 9Router configuration – we use environment variables with fallback to the values you've been using
-const ROUTER_BASE_URL = process.env.ROUTER_BASE_URL || 'http://localhost:20128/v1';
-const ROUTER_API_KEY = process.env.ROUTER_API_KEY || 'sk-1bae670c185e8923-jq5k45-2b933d0a';
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://your-frontend.netlify.app';
 const OWNER_EMAIL = process.env.OWNER_EMAIL || null;
@@ -80,8 +77,6 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 // ============================================================
 //  PAYSTACK WEBHOOK (must be before express.json())
-//  This is the ONLY place that ever grants a paid entitlement.
-//  The HMAC signature check below is what proves money actually moved.
 // ============================================================
 app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), async (req, res) => {
     try {
@@ -95,15 +90,12 @@ app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), as
         const event = payload.event;
         const data = payload.data;
 
-        // FIX: we only ever act on a genuinely successful charge event.
-        // 'subscription.create' by itself does NOT prove a payment cleared,
-        // so it is no longer treated as a trigger for unlocking anything.
         if (event === 'charge.success') {
             const metadata = data.metadata || {};
             const userId = metadata.userId;
             const idempotencyKey = metadata.idempotencyKey;
-            const type = metadata.type; // 'code_runner' or undefined
-            const paystackStatus = data.status; // should be 'success'
+            const type = metadata.type;
+            const paystackStatus = data.status;
 
             if (paystackStatus !== 'success') return res.sendStatus(200);
 
@@ -210,23 +202,12 @@ function parseThinkingAndAnswer(rawText) {
     if (answerClosed) answer = answerClosed[1];
     else if (answerOpen) answer = answerOpen[1];
 
-    // FIX: previously, if the model never emitted an <answer> tag at all
-    // (MiniMax M3 sometimes rambles entirely inside <thinking> and never
-    // opens <answer>, especially on long or truncated streams), `answer`
-    // stayed '' forever - including in the final 'done' event. That
-    // silently produced a genuinely empty response every time this
-    // happened. Now we fall back instead of dropping the content:
     if (!answer) {
         if (thinkClosed) {
-            // There IS a closed <thinking> block - anything after it is
-            // the real answer, even if it wasn't wrapped in <answer>.
             const afterThinking = rawText.slice(rawText.indexOf(thinkClosed[0]) + thinkClosed[0].length).trim();
             if (afterThinking) answer = afterThinking;
         }
         if (!answer && rawText.trim()) {
-            // No usable <answer> tag ever appeared (open or closed), and/or
-            // <thinking> never closed. Rather than show a blank bubble,
-            // surface the raw content with tag markers stripped out.
             answer = rawText.replace(/<\/?thinking>/gi, '').replace(/<\/?answer>/gi, '').trim();
         }
     }
@@ -234,35 +215,49 @@ function parseThinkingAndAnswer(rawText) {
 }
 
 // ============================================================
-//  SMART FAILOVER: Now uses 9Router (with built‑in failover)
+//  ORIGINAL WORKING FAILOVER (OpenRouter with fallback chain)
 // ============================================================
-async function fetchAIResponseWithFailover(messages) {
-    // 9Router handles provider failover automatically – just call it once
-    console.log('🔄 Calling 9Router...');
-    const response = await fetch(`${ROUTER_BASE_URL}/chat/completions`, {
-        method: 'POST',
-        headers: {
-            'Authorization': `Bearer ${ROUTER_API_KEY}`,
-            'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-            model: 'auto',        // 9Router picks the best free model
-            messages: messages,
-            temperature: 0.7,
-            stream: true
-        })
-    });
+async function fetchAIResponseWithFailover(messages, userSelectedModel) {
+    const fallbackModels = [
+        'minimax/minimax-m3-preview',
+        'zai-org/glm-5.2',
+        'nvidia/nemotron-3-ultra',
+        'nvidia/nemotron-3-super',
+        'groq/llama-3.3-70b-versatile',
+        'anthropic/claude-haiku-4.5'
+    ];
 
-    if (!response.ok) {
-        let errorText = await response.text();
-        // If 9Router returns an error page (HTML), extract the relevant info
-        if (errorText.startsWith('<') || errorText.startsWith('<!DOCTYPE')) {
-            errorText = `9Router error (${response.status}) – please check your 9Router server is running.`;
+    const modelsToTry = [userSelectedModel, ...fallbackModels.filter(m => m !== userSelectedModel)];
+
+    for (const model of modelsToTry) {
+        try {
+            console.log(`🔄 Attempting OpenRouter (${model})...`);
+            const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
+                    'Content-Type': 'application/json',
+                    'HTTP-Referer': 'https://technovaphy.ai'
+                },
+                body: JSON.stringify({
+                    model: model,
+                    messages: messages,
+                    temperature: 0.7,
+                    top_p: 0.9,
+                    stream: true
+                })
+            });
+
+            if (response.ok) {
+                console.log(`✅ OpenRouter succeeded with ${model}`);
+                return { response, source: model };
+            }
+            console.warn(`⚠️ ${model} failed (${response.status}) – trying next...`);
+        } catch (err) {
+            console.warn(`⚠️ ${model} error: ${err.message}`);
         }
-        throw new Error(`9Router error: ${response.status} - ${errorText}`);
     }
-
-    return { response, source: '9Router' };
+    throw new Error('All AI models failed. Please try again later.');
 }
 
 // ============================================================
@@ -615,7 +610,7 @@ app.delete('/api/projects/:id', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CHAT STREAM
+//  CHAT STREAM (ORIGINAL WORKING VERSION)
 // ============================================================
 app.post('/api/chat/stream', auth, async (req, res) => {
     try {
@@ -668,6 +663,8 @@ app.post('/api/chat/stream', auth, async (req, res) => {
 
         const groqMessages = [{ role: 'system', content: systemPrompt }, ...conversation];
 
+        const userModel = req.body.model || 'minimax/minimax-m3-preview';
+
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
@@ -678,8 +675,11 @@ app.post('/api/chat/stream', auth, async (req, res) => {
             originalEnd.apply(res, args);
         };
 
-        // Call 9Router (with built‑in failover)
-        const { response: aiResponse, source } = await fetchAIResponseWithFailover(groqMessages);
+        const { response: aiResponse, source } = await fetchAIResponseWithFailover(groqMessages, userModel);
+
+        if (!aiResponse.ok) {
+            throw new Error(`AI error ${aiResponse.status}`);
+        }
 
         const reader = aiResponse.body.getReader();
         const decoder = new TextDecoder();
@@ -734,7 +734,7 @@ app.post('/api/chat/stream', auth, async (req, res) => {
 });
 
 // ============================================================
-//  EXCHANGE RATES (shared by pricing + checkout)
+//  EXCHANGE RATES
 // ============================================================
 let exchangeRates = { KES: 1 };
 let ratesLastFetched = 0;
@@ -755,7 +755,7 @@ async function fetchExchangeRates() {
 }
 
 // ============================================================
-//  PRICING – powers the frontend's Upgrade / Pricing screen
+//  PRICING
 // ============================================================
 app.get('/api/pricing', auth, async (req, res) => {
     try {
@@ -796,8 +796,7 @@ app.get('/api/pricing', auth, async (req, res) => {
 });
 
 // ============================================================
-//  PAYMENT STATUS – lets the frontend safely poll after redirect
-//  back from Paystack, instead of ever trusting the client.
+//  PAYMENT STATUS
 // ============================================================
 app.get('/api/payment-status/:key', auth, async (req, res) => {
     try {
@@ -813,7 +812,7 @@ app.get('/api/payment-status/:key', auth, async (req, res) => {
         if (!data) return res.status(404).json({ error: 'Payment not found' });
 
         res.json({
-            status: data.status, // 'pending' | 'completed'
+            status: data.status,
             tier: data.tier,
             currency: data.currency,
             amount: data.amount
@@ -888,19 +887,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CODE RUNNER SUBSCRIPTION (fixed price/month)
-//
-//  FIX: this used to call Paystack's raw /subscription endpoint (which
-//  requires the customer to already have a saved card) and, on ANY
-//  Paystack error mentioning "already subscribed", it unlocked the
-//  feature with no payment check at all. That is the bug that let
-//  people get access just by tapping the button.
-//
-//  Now it follows the exact same pattern as /api/create-checkout:
-//  we initialize a real Paystack transaction with the plan attached.
-//  Paystack handles first payment + auto-creates the recurring
-//  subscription on success. The ONLY place access is ever granted is
-//  the signature-verified webhook above, after a real charge.success.
+//  CODE RUNNER SUBSCRIPTION
 // ============================================================
 app.post('/api/subscribe-code', auth, async (req, res) => {
     try {
@@ -966,10 +953,6 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
             }
         }
 
-        // FIX: initialize a real transaction with the plan attached.
-        // This requires an actual successful payment before Paystack (and
-        // therefore our webhook) will ever fire. No card-on-file assumption,
-        // no silent "already subscribed" bypass.
         const response = await fetch('https://api.paystack.co/transaction/initialize', {
             method: 'POST',
             headers: {
@@ -1016,7 +999,7 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CODE EXECUTION – now uses 9Router instead of OpenRouter
+//  CODE EXECUTION (ORIGINAL WORKING VERSION)
 // ============================================================
 app.post('/api/run-code', auth, async (req, res) => {
     try {
@@ -1041,7 +1024,7 @@ app.post('/api/run-code', auth, async (req, res) => {
             return res.status(400).json({ error: 'No code provided' });
         }
 
-        const systemPrompt = `You are an expert coding assistant with strong reasoning and critical thinking skills.
+        const systemPrompt = `You are MiniMax M3, an expert coding assistant with strong reasoning and critical thinking skills.
 
 You are helping a developer understand and improve their code.
 
@@ -1063,19 +1046,15 @@ ${code}
 
         const messages = [{ role: 'system', content: systemPrompt }];
 
-        res.setHeader('Content-Type', 'text/event-stream');
-        res.setHeader('Cache-Control', 'no-cache');
-        res.setHeader('Connection', 'keep-alive');
-
-        // Call 9Router
-        const response = await fetch(`${ROUTER_BASE_URL}/chat/completions`, {
+        const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
             method: 'POST',
             headers: {
-                'Authorization': `Bearer ${ROUTER_API_KEY}`,
-                'Content-Type': 'application/json'
+                'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
+                'Content-Type': 'application/json',
+                'HTTP-Referer': 'https://technovaphy.ai'
             },
             body: JSON.stringify({
-                model: 'auto',
+                model: 'minimax/minimax-m3-preview',
                 messages: messages,
                 temperature: 0.7,
                 stream: true,
@@ -1084,12 +1063,13 @@ ${code}
         });
 
         if (!response.ok) {
-            let errorText = await response.text();
-            if (errorText.startsWith('<') || errorText.startsWith('<!DOCTYPE')) {
-                errorText = `9Router error (${response.status}) – please check your 9Router server.`;
-            }
-            throw new Error(`9Router error: ${response.status} - ${errorText}`);
+            const errText = await response.text();
+            throw new Error(`MiniMax error: ${errText}`);
         }
+
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
 
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
