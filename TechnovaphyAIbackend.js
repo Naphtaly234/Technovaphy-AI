@@ -1,5 +1,3 @@
-
-
 // Load environment variables
 require('dotenv').config();
 
@@ -49,7 +47,8 @@ app.use(cors({
 }));
 
 // ---- Environment checks ----
-const required = ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'JWT_SECRET', 'OPENROUTER_API_KEY', 'PAYSTACK_SECRET_KEY'];
+// We now use 9Router instead of OpenRouter, so OPENROUTER_API_KEY is no longer required.
+const required = ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'JWT_SECRET', 'PAYSTACK_SECRET_KEY'];
 const missing = required.filter(key => !process.env[key]);
 if (missing.length) {
     console.error('❌ Missing env variables:', missing.join(', '));
@@ -60,7 +59,9 @@ const PORT = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
+// 9Router configuration – we use environment variables with fallback to the values you've been using
+const ROUTER_BASE_URL = process.env.ROUTER_BASE_URL || 'http://localhost:20128/v1';
+const ROUTER_API_KEY = process.env.ROUTER_API_KEY || 'sk-1bae670c185e8923-jq5k45-2b933d0a';
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://your-frontend.netlify.app';
 const OWNER_EMAIL = process.env.OWNER_EMAIL || null;
@@ -233,49 +234,35 @@ function parseThinkingAndAnswer(rawText) {
 }
 
 // ============================================================
-//  SMART FAILOVER: OpenRouter models chain
+//  SMART FAILOVER: Now uses 9Router (with built‑in failover)
 // ============================================================
-async function fetchAIResponseWithFailover(messages, userSelectedModel) {
-    const fallbackModels = [
-        'minimax/minimax-m3-preview',
-        'zai-org/glm-5.2',
-        'nvidia/nemotron-3-ultra',
-        'nvidia/nemotron-3-super',
-        'groq/llama-3.3-70b-versatile',
-        'anthropic/claude-haiku-4.5'
-    ];
+async function fetchAIResponseWithFailover(messages) {
+    // 9Router handles provider failover automatically – just call it once
+    console.log('🔄 Calling 9Router...');
+    const response = await fetch(`${ROUTER_BASE_URL}/chat/completions`, {
+        method: 'POST',
+        headers: {
+            'Authorization': `Bearer ${ROUTER_API_KEY}`,
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+            model: 'auto',        // 9Router picks the best free model
+            messages: messages,
+            temperature: 0.7,
+            stream: true
+        })
+    });
 
-    const modelsToTry = [userSelectedModel, ...fallbackModels.filter(m => m !== userSelectedModel)];
-
-    for (const model of modelsToTry) {
-        try {
-            console.log(`🔄 Attempting OpenRouter (${model})...`);
-            const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-                method: 'POST',
-                headers: {
-                    'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
-                    'Content-Type': 'application/json',
-                    'HTTP-Referer': 'https://technovaphy.ai'
-                },
-                body: JSON.stringify({
-                    model: model,
-                    messages: messages,
-                    temperature: 0.7,
-                    top_p: 0.9,
-                    stream: true
-                })
-            });
-
-            if (response.ok) {
-                console.log(`✅ OpenRouter succeeded with ${model}`);
-                return { response, source: model };
-            }
-            console.warn(`⚠️ ${model} failed (${response.status}) – trying next...`);
-        } catch (err) {
-            console.warn(`⚠️ ${model} error: ${err.message}`);
+    if (!response.ok) {
+        let errorText = await response.text();
+        // If 9Router returns an error page (HTML), extract the relevant info
+        if (errorText.startsWith('<') || errorText.startsWith('<!DOCTYPE')) {
+            errorText = `9Router error (${response.status}) – please check your 9Router server is running.`;
         }
+        throw new Error(`9Router error: ${response.status} - ${errorText}`);
     }
-    throw new Error('All AI models failed. Please try again later.');
+
+    return { response, source: '9Router' };
 }
 
 // ============================================================
@@ -681,8 +668,6 @@ app.post('/api/chat/stream', auth, async (req, res) => {
 
         const groqMessages = [{ role: 'system', content: systemPrompt }, ...conversation];
 
-        const userModel = req.body.model || 'minimax/minimax-m3-preview';
-
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
@@ -693,11 +678,8 @@ app.post('/api/chat/stream', auth, async (req, res) => {
             originalEnd.apply(res, args);
         };
 
-        const { response: aiResponse, source } = await fetchAIResponseWithFailover(groqMessages, userModel);
-
-        if (!aiResponse.ok) {
-            throw new Error(`AI error ${aiResponse.status}`);
-        }
+        // Call 9Router (with built‑in failover)
+        const { response: aiResponse, source } = await fetchAIResponseWithFailover(groqMessages);
 
         const reader = aiResponse.body.getReader();
         const decoder = new TextDecoder();
@@ -1034,7 +1016,7 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CODE EXECUTION – powered by MiniMax M3
+//  CODE EXECUTION – now uses 9Router instead of OpenRouter
 // ============================================================
 app.post('/api/run-code', auth, async (req, res) => {
     try {
@@ -1059,7 +1041,7 @@ app.post('/api/run-code', auth, async (req, res) => {
             return res.status(400).json({ error: 'No code provided' });
         }
 
-        const systemPrompt = `You are MiniMax M3, an expert coding assistant with strong reasoning and critical thinking skills.
+        const systemPrompt = `You are an expert coding assistant with strong reasoning and critical thinking skills.
 
 You are helping a developer understand and improve their code.
 
@@ -1081,15 +1063,19 @@ ${code}
 
         const messages = [{ role: 'system', content: systemPrompt }];
 
-        const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+
+        // Call 9Router
+        const response = await fetch(`${ROUTER_BASE_URL}/chat/completions`, {
             method: 'POST',
             headers: {
-                'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
-                'Content-Type': 'application/json',
-                'HTTP-Referer': 'https://technovaphy.ai'
+                'Authorization': `Bearer ${ROUTER_API_KEY}`,
+                'Content-Type': 'application/json'
             },
             body: JSON.stringify({
-                model: 'minimax/minimax-m3-preview',
+                model: 'auto',
                 messages: messages,
                 temperature: 0.7,
                 stream: true,
@@ -1098,13 +1084,12 @@ ${code}
         });
 
         if (!response.ok) {
-            const errText = await response.text();
-            throw new Error(`MiniMax error: ${errText}`);
+            let errorText = await response.text();
+            if (errorText.startsWith('<') || errorText.startsWith('<!DOCTYPE')) {
+                errorText = `9Router error (${response.status}) – please check your 9Router server.`;
+            }
+            throw new Error(`9Router error: ${response.status} - ${errorText}`);
         }
-
-        res.setHeader('Content-Type', 'text/event-stream');
-        res.setHeader('Cache-Control', 'no-cache');
-        res.setHeader('Connection', 'keep-alive');
 
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
