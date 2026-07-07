@@ -2,6 +2,7 @@
 //  TECHNOVAPHY AI – COMPLETE BACKEND
 //  Direct API calls: MiniMax M3 (primary), Groq Llama 3.3 (fallback)
 //  No OpenRouter – uses your own keys.
+//  BANK TRANSFER channels forced for all countries.
 // ============================================================
 
 require('dotenv').config();
@@ -144,11 +145,12 @@ const TIER_FEATURES = {
 const CODE_RUNNER_PRICE_KES = 1000;
 const MAX_CONVERSATION_HISTORY = 20;
 
+// ---- Payment channels: we force bank_transfer for all countries ----
 const PAYMENT_CHANNELS = {
     KE: {
         country: 'Kenya',
         currency: 'KES',
-        channels: ['mpesa', 'mobile_money', 'bank_transfer'],
+        // We will override channels in the checkout route to always include bank_transfer
         displayNames: {
             'mpesa': '📱 M-Pesa',
             'mobile_money': '📱 Airtel Money',
@@ -158,25 +160,21 @@ const PAYMENT_CHANNELS = {
     NG: {
         country: 'Nigeria',
         currency: 'NGN',
-        channels: ['bank_transfer'],
         displayNames: { 'bank_transfer': '🏦 Bank Transfer' }
     },
     GH: {
         country: 'Ghana',
         currency: 'GHS',
-        channels: ['bank_transfer'],
         displayNames: { 'bank_transfer': '🏦 Bank Transfer' }
     },
     UG: {
         country: 'Uganda',
         currency: 'UGX',
-        channels: ['bank_transfer'],
         displayNames: { 'bank_transfer': '🏦 Bank Transfer' }
     },
     TZ: {
         country: 'Tanzania',
         currency: 'TZS',
-        channels: ['bank_transfer'],
         displayNames: { 'bank_transfer': '🏦 Bank Transfer' }
     }
 };
@@ -306,7 +304,6 @@ async function fetchAIResponseWithFailover(messages, userSelectedModel) {
 
 // ---- Code Runner – uses MiniMax directly ----
 async function callMiniMaxForCode(messages) {
-    // Same as callMiniMax, but we can reuse it.
     return callMiniMax(messages);
 }
 
@@ -616,6 +613,45 @@ app.delete('/api/conversations/:conversationId', auth, async (req, res) => {
 });
 
 // ============================================================
+//  CLEAR CONVERSATION (for New Chat)
+// ============================================================
+app.post('/api/conversations/clear', auth, async (req, res) => {
+    try {
+        const { data: existing, error: findError } = await supabase
+            .from('conversations')
+            .select('*')
+            .eq('user_id', req.user.id)
+            .maybeSingle();
+
+        if (findError && findError.code !== 'PGRST116') throw findError;
+
+        if (!existing) {
+            const { data, error } = await supabase.from('conversations').insert({
+                user_id: req.user.id,
+                messages: [],
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString()
+            }).select().single();
+            if (error) throw error;
+            return res.status(201).json({ conversation: data });
+        }
+
+        const { data, error } = await supabase
+            .from('conversations')
+            .update({ messages: [], updated_at: new Date().toISOString() })
+            .eq('id', existing.id)
+            .select()
+            .single();
+
+        if (error) throw error;
+        res.json({ conversation: data });
+    } catch (err) {
+        console.error('Clear conversation error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ============================================================
 //  PROJECTS (CRUD)
 // ============================================================
 app.get('/api/projects', auth, async (req, res) => {
@@ -858,7 +894,7 @@ app.get('/api/pricing', auth, async (req, res) => {
             codeRunnerUnlocked: user.code_runner_unlocked || false,
             tiers,
             codeRunner,
-            channels: countryInfo.channels,
+            channels: countryInfo.channels || ['bank_transfer'],
             country: countryCode
         });
     } catch (err) {
@@ -895,7 +931,7 @@ app.get('/api/payment-status/:key', auth, async (req, res) => {
 });
 
 // ============================================================
-//  TIER UPGRADE CHECKOUT
+//  TIER UPGRADE CHECKOUT – WITH BANK FORCED
 // ============================================================
 app.post('/api/create-checkout', auth, async (req, res) => {
     try {
@@ -926,6 +962,22 @@ app.post('/api/create-checkout', auth, async (req, res) => {
 
         if (!PAYSTACK_SECRET_KEY) return res.status(503).json({ error: 'Payment service not configured' });
 
+        // ---- FORCE bank_transfer for all countries ----
+        let channels = ['bank_transfer'];
+        // Add country-specific channels if available
+        if (countryInfo.channels) {
+            for (const ch of countryInfo.channels) {
+                if (!channels.includes(ch)) channels.push(ch);
+            }
+        }
+        // For Kenya, ensure mpesa and mobile_money are included (if not already)
+        if (countryCode === 'KE') {
+            if (!channels.includes('mpesa')) channels.push('mpesa');
+            if (!channels.includes('mobile_money')) channels.push('mobile_money');
+        }
+
+        console.log('🔗 Sending channels:', channels); // Log for debugging
+
         const response = await fetch('https://api.paystack.co/transaction/initialize', {
             method: 'POST',
             headers: { 'Authorization': `Bearer ${PAYSTACK_SECRET_KEY}`, 'Content-Type': 'application/json' },
@@ -933,7 +985,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
                 email: user.email,
                 amount: amount,
                 currency: finalCurrency,
-                channels: countryInfo.channels,
+                channels: channels,
                 metadata: { idempotencyKey, tier, userId: user.id, country: countryCode },
                 callback_url: `${FRONTEND_URL}/?success=true&key=${idempotencyKey}`
             })
@@ -1025,6 +1077,18 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
             }
         }
 
+        // ---- Also force bank for code runner subscription ----
+        let channels = ['bank_transfer'];
+        if (countryInfo.channels) {
+            for (const ch of countryInfo.channels) {
+                if (!channels.includes(ch)) channels.push(ch);
+            }
+        }
+        if (countryCode === 'KE') {
+            if (!channels.includes('mpesa')) channels.push('mpesa');
+            if (!channels.includes('mobile_money')) channels.push('mobile_money');
+        }
+
         const response = await fetch('https://api.paystack.co/transaction/initialize', {
             method: 'POST',
             headers: {
@@ -1035,7 +1099,7 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
                 email: user.email,
                 amount: amountInMinor,
                 currency: currency,
-                channels: countryInfo.channels,
+                channels: channels,
                 plan: planCode,
                 metadata: {
                     userId: user.id,
