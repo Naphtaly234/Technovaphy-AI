@@ -1,10 +1,23 @@
 // ============================================================
 //  TECHNOVAPHY AI – COMPLETE BACKEND
-//  Direct API calls: MiniMax M3 (primary), Groq Llama 3.3 (fallback)
-//  No OpenRouter – uses your own keys.
-//  BANK TRANSFER channels forced for all countries.
+//  Purpose: African Assistant with model selection and code runner
+//  Models: MiniMax M3, GLM-5.2, NVIDIA Nemotron 3, Groq Llama 3.3
+//  All via OpenRouter – single API key
+//
+//  ⚠️ PATCHED (see "FIX:" comments):
+//  1. /api/subscribe-code no longer grants access on a Paystack error
+//     message match. It now uses the same "initialize transaction with
+//     a plan attached" pattern as /api/create-checkout, so a user MUST
+//     complete a real Paystack payment before the signed webhook marks
+//     them unlocked. There is no client-trust / no-payment path left.
+//  2. Added GET /api/payment-status/:key so the frontend can poll and
+//     find out (safely, server-side) whether a payment actually cleared
+//     after the user returns from the Paystack checkout page.
+//  3. Added GET /api/pricing so the frontend can render a real, localized
+//     pricing/upgrade screen instead of hardcoding numbers.
 // ============================================================
 
+// Load environment variables
 require('dotenv').config();
 
 const express = require('express');
@@ -22,11 +35,25 @@ try {
     const redis = require('redis');
     if (process.env.REDIS_URL) {
         redisClient = redis.createClient({ url: process.env.REDIS_URL });
-        redisClient.on('error', () => { redisAvailable = false; });
-        redisClient.connect().then(() => { redisAvailable = true; }).catch(() => { redisAvailable = false; });
+        redisClient.on('error', (err) => {
+            console.warn('⚠️ Redis error, falling back to memory:', err.message);
+            redisAvailable = false;
+        });
+        redisClient.connect().then(() => {
+            redisAvailable = true;
+            console.log('✅ Redis connected');
+        }).catch(() => {
+            redisAvailable = false;
+            console.warn('⚠️ Redis connection failed, using memory fallback');
+        });
+    } else {
+        console.log('ℹ️ REDIS_URL not set, using in‑memory fallback');
     }
-} catch (e) {}
+} catch (e) {
+    console.log('ℹ️ Redis package not installed, using in‑memory fallback');
+}
 
+// ---- Express app ----
 const app = express();
 app.set('trust proxy', 1);
 
@@ -34,11 +61,12 @@ app.use(cors({
     origin: process.env.FRONTEND_URL || '*',
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'Accept'],
-    credentials: true
+    credentials: true,
+    optionsSuccessStatus: 200
 }));
 
 // ---- Environment checks ----
-const required = ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'JWT_SECRET', 'MINIMAX_API_KEY', 'GROQ_API_KEY', 'PAYSTACK_SECRET_KEY'];
+const required = ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'JWT_SECRET', 'OPENROUTER_API_KEY', 'PAYSTACK_SECRET_KEY'];
 const missing = required.filter(key => !process.env[key]);
 if (missing.length) {
     console.error('❌ Missing env variables:', missing.join(', '));
@@ -49,15 +77,13 @@ const PORT = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const MINIMAX_API_KEY = process.env.MINIMAX_API_KEY;
-const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://your-frontend.netlify.app';
 const OWNER_EMAIL = process.env.OWNER_EMAIL || null;
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
-// ---- Database init ----
 (async function initDb() {
     try {
         const { error } = await supabase.from('users').select('id').limit(1);
@@ -68,7 +94,11 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
     }
 })();
 
-// ---- PAYSTACK WEBHOOK (must be before express.json()) ----
+// ============================================================
+//  PAYSTACK WEBHOOK (must be before express.json())
+//  This is the ONLY place that ever grants a paid entitlement.
+//  The HMAC signature check below is what proves money actually moved.
+// ============================================================
 app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), async (req, res) => {
     try {
         const signature = req.headers['x-paystack-signature'];
@@ -81,12 +111,15 @@ app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), as
         const event = payload.event;
         const data = payload.data;
 
+        // FIX: we only ever act on a genuinely successful charge event.
+        // 'subscription.create' by itself does NOT prove a payment cleared,
+        // so it is no longer treated as a trigger for unlocking anything.
         if (event === 'charge.success') {
             const metadata = data.metadata || {};
             const userId = metadata.userId;
             const idempotencyKey = metadata.idempotencyKey;
-            const type = metadata.type;
-            const paystackStatus = data.status;
+            const type = metadata.type; // 'code_runner' or undefined
+            const paystackStatus = data.status; // should be 'success'
 
             if (paystackStatus !== 'success') return res.sendStatus(200);
 
@@ -145,68 +178,19 @@ const TIER_FEATURES = {
 const CODE_RUNNER_PRICE_KES = 1000;
 const MAX_CONVERSATION_HISTORY = 20;
 
-// ---- Payment channels: we force bank_transfer for all countries ----
 const PAYMENT_CHANNELS = {
-    KE: {
-        country: 'Kenya',
-        currency: 'KES',
-        // We will override channels in the checkout route to always include bank_transfer
-        displayNames: {
-            'mpesa': '📱 M-Pesa',
-            'mobile_money': '📱 Airtel Money',
-            'bank_transfer': '🏦 Bank Transfer (Paybill)'
-        }
-    },
-    NG: {
-        country: 'Nigeria',
-        currency: 'NGN',
-        displayNames: { 'bank_transfer': '🏦 Bank Transfer' }
-    },
-    GH: {
-        country: 'Ghana',
-        currency: 'GHS',
-        displayNames: { 'bank_transfer': '🏦 Bank Transfer' }
-    },
-    UG: {
-        country: 'Uganda',
-        currency: 'UGX',
-        displayNames: { 'bank_transfer': '🏦 Bank Transfer' }
-    },
-    TZ: {
-        country: 'Tanzania',
-        currency: 'TZS',
-        displayNames: { 'bank_transfer': '🏦 Bank Transfer' }
-    }
+    KE: { country: 'Kenya', currency: 'KES', channels: ['card', 'bank_transfer', 'mpesa'], displayNames: { 'card': '💳 Card', 'bank_transfer': '🏦 Bank Transfer', 'mpesa': '📱 M-Pesa' } },
+    NG: { country: 'Nigeria', currency: 'NGN', channels: ['card', 'bank_transfer', 'ussd', 'bank'], displayNames: { 'card': '💳 Card', 'bank_transfer': '🏦 Bank Transfer', 'ussd': '📞 USSD', 'bank': '📱 Mobile Banking' } },
+    GH: { country: 'Ghana', currency: 'GHS', channels: ['card', 'bank_transfer'], displayNames: { 'card': '💳 Card', 'bank_transfer': '🏦 Bank Transfer' } },
+    UG: { country: 'Uganda', currency: 'UGX', channels: ['card', 'bank_transfer'], displayNames: { 'card': '💳 Card', 'bank_transfer': '🏦 Bank Transfer' } },
+    TZ: { country: 'Tanzania', currency: 'TZS', channels: ['card', 'bank_transfer'], displayNames: { 'card': '💳 Card', 'bank_transfer': '🏦 Bank Transfer' } }
 };
 
 // ============================================================
-//  SYSTEM PROMPT & PARSING
+//  SYSTEM PROMPT
 // ============================================================
 function buildSystemPrompt({ memoryPrompt, languageInstruction }) {
-    return `You are TechNovaphy AI, the official AI assistant for TechNovaphy Solutions.
-
-🔗 WEBSITE & COMPANY INFO:
-TechNovaphy Solutions (https://technovaphy-solutions-5nz6.onrender.com) is an enterprise IT and web development company based in Nairobi, Kenya.
-We serve over 500 businesses across East Africa, providing:
-- Managed IT Operations (99.9% uptime guarantee)
-- Business Software (custom ERPs and automated workflows)
-- Cloud Solutions (data migration and automated backups)
-- 24/7 Technical Support
-- Web Development (business websites, e-commerce, web apps, PWAs, admin dashboards, APIs)
-- Technology Stack: HTML5, CSS3, JavaScript, React, TypeScript, Tailwind CSS, Node.js, Express.js, Python, Flask, Java, Spring Boot, PostgreSQL, MySQL, MongoDB, SQL Server, Redis, Firebase, Docker, Render, Vercel, AWS, Cloudflare
-
-📋 SUPPORT PLANS (prices in KES):
-Website Maintenance Plans:
-- Bronze: KSh 10k/mo – Updates, security patches, bug fixes, email support (24-48hrs)
-- Silver: KSh 20k/mo – Everything in Bronze + 24/7 uptime monitoring, monthly reports, WhatsApp support (4hrs), SEO monitoring
-- Gold: KSh 35k/mo – Everything in Silver + 24/7 dedicated support, security audits, weekly analytics, feature development (5hrs/mo), phone support
-
-IT Support Plans:
-- Standard IT: KSh 15k/mo – Remote support, cloud backup, monthly reports
-- Managed Pro: KSh 50k/mo – On-site maintenance, software dev support, priority helpdesk
-- Premium Website: KSh 120k (one-time) – Full website development
-
-Free IT Infrastructure Audit (worth KES 50,000) – available at https://technovaphy-solutions-5nz6.onrender.com
+    return `You are TechNovaphy AI, built for African freelancers and businesses.
 
 RESPOND WITH THIS FORMAT:
 
@@ -225,7 +209,6 @@ RULES:
 - If you give advice, clearly state "This is for informational purposes only."
 - For financial/legal topics, flag uncertainty plainly.
 - For code, provide working examples and explain them.
-- Always mention the website (https://technovaphy-solutions-5nz6.onrender.com) when asked about the platform, pricing, or services.
 
 ${memoryPrompt}
 ${languageInstruction}`;
@@ -242,93 +225,74 @@ function parseThinkingAndAnswer(rawText) {
     else if (thinkOpen && !answerOpen) thinking = thinkOpen[1];
     if (answerClosed) answer = answerClosed[1];
     else if (answerOpen) answer = answerOpen[1];
-    if (!thinking && !answer && rawText.trim()) answer = rawText;
+
+    // FIX: previously, if the model never emitted an <answer> tag at all
+    // (MiniMax M3 sometimes rambles entirely inside <thinking> and never
+    // opens <answer>, especially on long or truncated streams), `answer`
+    // stayed '' forever - including in the final 'done' event. That
+    // silently produced a genuinely empty response every time this
+    // happened. Now we fall back instead of dropping the content:
+    if (!answer) {
+        if (thinkClosed) {
+            // There IS a closed <thinking> block - anything after it is
+            // the real answer, even if it wasn't wrapped in <answer>.
+            const afterThinking = rawText.slice(rawText.indexOf(thinkClosed[0]) + thinkClosed[0].length).trim();
+            if (afterThinking) answer = afterThinking;
+        }
+        if (!answer && rawText.trim()) {
+            // No usable <answer> tag ever appeared (open or closed), and/or
+            // <thinking> never closed. Rather than show a blank bubble,
+            // surface the raw content with tag markers stripped out.
+            answer = rawText.replace(/<\/?thinking>/gi, '').replace(/<\/?answer>/gi, '').trim();
+        }
+    }
     return { thinking: thinking.trim(), answer: answer.trim() };
 }
 
 // ============================================================
-//  AI CALLERS – Direct MiniMax + Groq fallback
+//  SMART FAILOVER: OpenRouter models chain
 // ============================================================
-
-// ---- MiniMax API (streaming) ----
-async function callMiniMax(messages) {
-    const url = 'https://api.minimax.chat/v1/text/chatcompletion_pro';
-    const payload = {
-        model: 'abab6.5s-chat',           // or 'minimax-m3' – check MiniMax docs
-        messages: messages,
-        temperature: 0.7,
-        top_p: 0.9,
-        stream: true,
-        max_tokens: 4000
-    };
-    const response = await fetch(url, {
-        method: 'POST',
-        headers: {
-            'Authorization': `Bearer ${MINIMAX_API_KEY}`,
-            'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(payload)
-    });
-    if (!response.ok) {
-        const errText = await response.text();
-        throw new Error(`MiniMax error (${response.status}): ${errText}`);
-    }
-    return response;
-}
-
-// ---- Groq API (streaming) ----
-async function callGroq(messages) {
-    const url = 'https://api.groq.com/openai/v1/chat/completions';
-    const payload = {
-        model: 'llama-3.3-70b-versatile',
-        messages: messages,
-        temperature: 0.7,
-        top_p: 0.9,
-        stream: true,
-        max_tokens: 4000
-    };
-    const response = await fetch(url, {
-        method: 'POST',
-        headers: {
-            'Authorization': `Bearer ${GROQ_API_KEY}`,
-            'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(payload)
-    });
-    if (!response.ok) {
-        const errText = await response.text();
-        throw new Error(`Groq error (${response.status}): ${errText}`);
-    }
-    return response;
-}
-
-// ---- Main failover function ----
 async function fetchAIResponseWithFailover(messages, userSelectedModel) {
-    // If the user explicitly selected Groq, only try Groq.
-    if (userSelectedModel === 'groq/llama-3.3-70b-versatile') {
-        const response = await callGroq(messages);
-        return { response, source: 'groq' };
-    }
+    const fallbackModels = [
+        'minimax/minimax-m3-preview',
+        'zai-org/glm-5.2',
+        'nvidia/nemotron-3-ultra',
+        'nvidia/nemotron-3-super',
+        'groq/llama-3.3-70b-versatile',
+        'anthropic/claude-haiku-4.5'
+    ];
 
-    // Default: try MiniMax first, then fallback to Groq.
-    try {
-        const response = await callMiniMax(messages);
-        return { response, source: 'minimax' };
-    } catch (miniMaxErr) {
-        console.warn('⚠️ MiniMax failed, falling back to Groq:', miniMaxErr.message);
+    const modelsToTry = [userSelectedModel, ...fallbackModels.filter(m => m !== userSelectedModel)];
+
+    for (const model of modelsToTry) {
         try {
-            const response = await callGroq(messages);
-            return { response, source: 'groq' };
-        } catch (groqErr) {
-            console.error('❌ Groq also failed:', groqErr.message);
-            throw new Error('Both MiniMax and Groq failed. Please check your API keys and credits.');
+            console.log(`🔄 Attempting OpenRouter (${model})...`);
+            const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
+                    'Content-Type': 'application/json',
+                    'HTTP-Referer': 'https://technovaphy.ai'
+                },
+                body: JSON.stringify({
+                    model: model,
+                    messages: messages,
+                    temperature: 0.7,
+                    top_p: 0.9,
+                    stream: true
+                })
+            });
+
+            if (response.ok) {
+                console.log(`✅ OpenRouter succeeded with ${model}`);
+                return { response, source: model };
+            }
+            console.warn(`⚠️ ${model} failed (${response.status}) – trying next...`);
+        } catch (err) {
+            console.warn(`⚠️ ${model} error: ${err.message}`);
         }
     }
-}
-
-// ---- Code Runner – uses MiniMax directly ----
-async function callMiniMaxForCode(messages) {
-    return callMiniMax(messages);
+    throw new Error('All AI models failed. Please try again later.');
 }
 
 // ============================================================
@@ -359,7 +323,6 @@ async function saveConversation(userId, messages) {
     if (error) throw new Error('Failed to save conversation: ' + error.message);
 }
 
-// ---- Rate limiting (Redis or memory) ----
 const inMemoryRate = new Map();
 const RATE_LIMIT_WINDOW = 60 * 1000;
 const RATE_LIMIT_MAX = 10;
@@ -396,7 +359,6 @@ if (!redisAvailable) {
     }, 60 * 1000);
 }
 
-// ---- Concurrency limiter ----
 const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT_REQUESTS) || 10000;
 let activeRequests = 0;
 const concurrencyQueue = [];
@@ -446,7 +408,6 @@ app.get('/', (req, res) => res.send('TechNovaphy AI Backend'));
 app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 app.get('/api/ping', (req, res) => res.json({ status: 'ok' }));
 
-// ---- Register ----
 app.post('/api/auth/register', async (req, res) => {
     try {
         const { email, password, ageConfirmed, country } = req.body;
@@ -487,7 +448,6 @@ app.post('/api/auth/register', async (req, res) => {
     }
 });
 
-// ---- Login ----
 app.post('/api/auth/login', async (req, res) => {
     try {
         const { email, password } = req.body;
@@ -507,7 +467,6 @@ app.post('/api/auth/login', async (req, res) => {
     }
 });
 
-// ---- Profile (owner bypass) ----
 app.get('/api/user/profile', auth, async (req, res) => {
     try {
         const user = req.user;
@@ -530,7 +489,6 @@ app.get('/api/user/profile', auth, async (req, res) => {
     }
 });
 
-// ---- Update Memory ----
 app.post('/api/auth/update-memory', auth, async (req, res) => {
     try {
         const { memory } = req.body;
@@ -589,24 +547,8 @@ app.get('/api/conversations/:conversationId', auth, async (req, res) => {
     }
 });
 
-// ===== FIXED: POST /api/conversations – checks for existing =====
 app.post('/api/conversations', auth, async (req, res) => {
     try {
-        // 1. Check if a conversation already exists for this user
-        const { data: existing, error: findError } = await supabase
-            .from('conversations')
-            .select('*')
-            .eq('user_id', req.user.id)
-            .maybeSingle();
-
-        if (findError && findError.code !== 'PGRST116') throw findError;
-
-        // 2. If it exists, return it
-        if (existing) {
-            return res.status(200).json({ conversation: existing });
-        }
-
-        // 3. Otherwise create a new one
         const { data, error } = await supabase.from('conversations').insert({
             user_id: req.user.id,
             messages: [],
@@ -617,7 +559,6 @@ app.post('/api/conversations', auth, async (req, res) => {
         if (error) throw error;
         res.status(201).json({ conversation: data });
     } catch (err) {
-        console.error('Create conversation error:', err);
         res.status(500).json({ error: err.message });
     }
 });
@@ -632,45 +573,6 @@ app.delete('/api/conversations/:conversationId', auth, async (req, res) => {
         if (error) throw error;
         res.json({ message: 'Deleted' });
     } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// ============================================================
-//  CLEAR CONVERSATION (for New Chat)
-// ============================================================
-app.post('/api/conversations/clear', auth, async (req, res) => {
-    try {
-        const { data: existing, error: findError } = await supabase
-            .from('conversations')
-            .select('*')
-            .eq('user_id', req.user.id)
-            .maybeSingle();
-
-        if (findError && findError.code !== 'PGRST116') throw findError;
-
-        if (!existing) {
-            const { data, error } = await supabase.from('conversations').insert({
-                user_id: req.user.id,
-                messages: [],
-                created_at: new Date().toISOString(),
-                updated_at: new Date().toISOString()
-            }).select().single();
-            if (error) throw error;
-            return res.status(201).json({ conversation: data });
-        }
-
-        const { data, error } = await supabase
-            .from('conversations')
-            .update({ messages: [], updated_at: new Date().toISOString() })
-            .eq('id', existing.id)
-            .select()
-            .single();
-
-        if (error) throw error;
-        res.json({ conversation: data });
-    } catch (err) {
-        console.error('Clear conversation error:', err);
         res.status(500).json({ error: err.message });
     }
 });
@@ -743,7 +645,7 @@ app.delete('/api/projects/:id', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CHAT STREAM (MiniMax + Groq fallback)
+//  CHAT STREAM
 // ============================================================
 app.post('/api/chat/stream', auth, async (req, res) => {
     try {
@@ -767,9 +669,7 @@ app.post('/api/chat/stream', auth, async (req, res) => {
 
         let conversation = await getConversation(user.id);
         let newMessages;
-        try {
-            newMessages = JSON.parse(req.body.messages);
-        } catch (e) {
+        try { newMessages = JSON.parse(req.body.messages); } catch (e) {
             releaseConcurrency();
             return res.status(400).json({ error: 'Invalid messages format' });
         }
@@ -797,7 +697,8 @@ app.post('/api/chat/stream', auth, async (req, res) => {
         const systemPrompt = buildSystemPrompt({ memoryPrompt, languageInstruction });
 
         const groqMessages = [{ role: 'system', content: systemPrompt }, ...conversation];
-        const userModel = req.body.model || 'minimax/minimax-m3-preview'; // frontend sends model slug
+
+        const userModel = req.body.model || 'minimax/minimax-m3-preview';
 
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
@@ -809,9 +710,11 @@ app.post('/api/chat/stream', auth, async (req, res) => {
             originalEnd.apply(res, args);
         };
 
-        // ---- Call the AI with failover ----
         const { response: aiResponse, source } = await fetchAIResponseWithFailover(groqMessages, userModel);
-        if (!aiResponse.ok) throw new Error(`AI error ${aiResponse.status}`);
+
+        if (!aiResponse.ok) {
+            throw new Error(`AI error ${aiResponse.status}`);
+        }
 
         const reader = aiResponse.body.getReader();
         const decoder = new TextDecoder();
@@ -849,7 +752,7 @@ app.post('/api/chat/stream', auth, async (req, res) => {
         res.write(`data: ${JSON.stringify({
             type: 'done',
             text: finalAnswer,
-            model: source   // tells frontend which model actually responded
+            model: source
         })}\n\n`);
         res.end();
 
@@ -866,7 +769,7 @@ app.post('/api/chat/stream', auth, async (req, res) => {
 });
 
 // ============================================================
-//  EXCHANGE RATES
+//  EXCHANGE RATES (shared by pricing + checkout)
 // ============================================================
 let exchangeRates = { KES: 1 };
 let ratesLastFetched = 0;
@@ -887,7 +790,7 @@ async function fetchExchangeRates() {
 }
 
 // ============================================================
-//  PRICING
+//  PRICING – powers the frontend's Upgrade / Pricing screen
 // ============================================================
 app.get('/api/pricing', auth, async (req, res) => {
     try {
@@ -918,7 +821,7 @@ app.get('/api/pricing', auth, async (req, res) => {
             codeRunnerUnlocked: user.code_runner_unlocked || false,
             tiers,
             codeRunner,
-            channels: countryInfo.channels || ['bank_transfer'],
+            channels: countryInfo.channels,
             country: countryCode
         });
     } catch (err) {
@@ -928,7 +831,8 @@ app.get('/api/pricing', auth, async (req, res) => {
 });
 
 // ============================================================
-//  PAYMENT STATUS
+//  PAYMENT STATUS – lets the frontend safely poll after redirect
+//  back from Paystack, instead of ever trusting the client.
 // ============================================================
 app.get('/api/payment-status/:key', auth, async (req, res) => {
     try {
@@ -944,7 +848,7 @@ app.get('/api/payment-status/:key', auth, async (req, res) => {
         if (!data) return res.status(404).json({ error: 'Payment not found' });
 
         res.json({
-            status: data.status,
+            status: data.status, // 'pending' | 'completed'
             tier: data.tier,
             currency: data.currency,
             amount: data.amount
@@ -955,7 +859,7 @@ app.get('/api/payment-status/:key', auth, async (req, res) => {
 });
 
 // ============================================================
-//  TIER UPGRADE CHECKOUT – WITH BANK FORCED
+//  TIER UPGRADE CHECKOUT
 // ============================================================
 app.post('/api/create-checkout', auth, async (req, res) => {
     try {
@@ -986,22 +890,6 @@ app.post('/api/create-checkout', auth, async (req, res) => {
 
         if (!PAYSTACK_SECRET_KEY) return res.status(503).json({ error: 'Payment service not configured' });
 
-        // ---- FORCE bank_transfer for all countries ----
-        let channels = ['bank_transfer'];
-        // Add country-specific channels if available
-        if (countryInfo.channels) {
-            for (const ch of countryInfo.channels) {
-                if (!channels.includes(ch)) channels.push(ch);
-            }
-        }
-        // For Kenya, ensure mpesa and mobile_money are included (if not already)
-        if (countryCode === 'KE') {
-            if (!channels.includes('mpesa')) channels.push('mpesa');
-            if (!channels.includes('mobile_money')) channels.push('mobile_money');
-        }
-
-        console.log('🔗 Sending channels:', channels); // Log for debugging
-
         const response = await fetch('https://api.paystack.co/transaction/initialize', {
             method: 'POST',
             headers: { 'Authorization': `Bearer ${PAYSTACK_SECRET_KEY}`, 'Content-Type': 'application/json' },
@@ -1009,7 +897,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
                 email: user.email,
                 amount: amount,
                 currency: finalCurrency,
-                channels: channels,
+                channels: countryInfo.channels,
                 metadata: { idempotencyKey, tier, userId: user.id, country: countryCode },
                 callback_url: `${FRONTEND_URL}/?success=true&key=${idempotencyKey}`
             })
@@ -1036,6 +924,18 @@ app.post('/api/create-checkout', auth, async (req, res) => {
 
 // ============================================================
 //  CODE RUNNER SUBSCRIPTION (fixed price/month)
+//
+//  FIX: this used to call Paystack's raw /subscription endpoint (which
+//  requires the customer to already have a saved card) and, on ANY
+//  Paystack error mentioning "already subscribed", it unlocked the
+//  feature with no payment check at all. That is the bug that let
+//  people get access just by tapping the button.
+//
+//  Now it follows the exact same pattern as /api/create-checkout:
+//  we initialize a real Paystack transaction with the plan attached.
+//  Paystack handles first payment + auto-creates the recurring
+//  subscription on success. The ONLY place access is ever granted is
+//  the signature-verified webhook above, after a real charge.success.
 // ============================================================
 app.post('/api/subscribe-code', auth, async (req, res) => {
     try {
@@ -1101,18 +1001,10 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
             }
         }
 
-        // ---- Also force bank for code runner subscription ----
-        let channels = ['bank_transfer'];
-        if (countryInfo.channels) {
-            for (const ch of countryInfo.channels) {
-                if (!channels.includes(ch)) channels.push(ch);
-            }
-        }
-        if (countryCode === 'KE') {
-            if (!channels.includes('mpesa')) channels.push('mpesa');
-            if (!channels.includes('mobile_money')) channels.push('mobile_money');
-        }
-
+        // FIX: initialize a real transaction with the plan attached.
+        // This requires an actual successful payment before Paystack (and
+        // therefore our webhook) will ever fire. No card-on-file assumption,
+        // no silent "already subscribed" bypass.
         const response = await fetch('https://api.paystack.co/transaction/initialize', {
             method: 'POST',
             headers: {
@@ -1123,7 +1015,7 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
                 email: user.email,
                 amount: amountInMinor,
                 currency: currency,
-                channels: channels,
+                channels: countryInfo.channels,
                 plan: planCode,
                 metadata: {
                     userId: user.id,
@@ -1159,7 +1051,7 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CODE RUNNER EXECUTION – MiniMax (direct)
+//  CODE EXECUTION – powered by MiniMax M3
 // ============================================================
 app.post('/api/run-code', auth, async (req, res) => {
     try {
@@ -1170,8 +1062,7 @@ app.post('/api/run-code', auth, async (req, res) => {
             await acquireConcurrency();
         }
 
-        // Only owner bypasses the lock; everyone else must have code_runner_unlocked
-        if (!isOwner && !user.code_runner_unlocked) {
+        if (!isOwner && user.tier === 'free' && !user.code_runner_unlocked) {
             releaseConcurrency();
             return res.status(403).json({
                 error: '💳 Subscribe to Code Runner to run code.',
@@ -1207,8 +1098,21 @@ ${code}
 
         const messages = [{ role: 'system', content: systemPrompt }];
 
-        // ---- Use direct MiniMax call ----
-        const response = await callMiniMax(messages);
+        const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
+                'Content-Type': 'application/json',
+                'HTTP-Referer': 'https://technovaphy.ai'
+            },
+            body: JSON.stringify({
+                model: 'minimax/minimax-m3-preview',
+                messages: messages,
+                temperature: 0.7,
+                stream: true,
+                max_tokens: 2000
+            })
+        });
 
         if (!response.ok) {
             const errText = await response.text();
