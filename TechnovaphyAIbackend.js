@@ -1,6 +1,6 @@
 // ============================================================
-//  TECHNOVAPHY AI – COMPLETE BACKEND (with Vision support)
-//  Direct MiniMax + Groq | Images → Groq Vision
+//  TECHNOVAPHY AI – BACKEND (OpenRouter Primary)
+//  OpenRouter (MiniMax M3, Claude Haiku) + Groq Vision
 //  Admin dashboard | last_active tracking | Multer
 // ============================================================
 
@@ -38,7 +38,7 @@ app.use(cors({
 }));
 
 // ---- Environment checks ----
-const required = ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'JWT_SECRET', 'MINIMAX_API_KEY', 'GROQ_API_KEY', 'PAYSTACK_SECRET_KEY'];
+const required = ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'JWT_SECRET', 'OPENROUTER_API_KEY', 'GROQ_API_KEY', 'PAYSTACK_SECRET_KEY'];
 const missing = required.filter(key => !process.env[key]);
 if (missing.length) {
     console.error('❌ Missing env variables:', missing.join(', '));
@@ -49,7 +49,7 @@ const PORT = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const MINIMAX_API_KEY = process.env.MINIMAX_API_KEY;
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://your-frontend.netlify.app';
@@ -271,69 +271,46 @@ function parseThinkingAndAnswer(rawText) {
 }
 
 // ============================================================
-//  AI CALLERS
+//  AI CALLERS – OpenRouter (primary) + Groq Vision (images)
 // ============================================================
-async function callMiniMax(messages, hasImage = false) {
-    const model = hasImage ? 'minimax-m3' : 'abab6.5s-chat';
-    const url = 'https://api.minimax.chat/v1/text/chatcompletion_pro';
+
+// ---- OpenRouter call (supports MiniMax, Claude, Groq, etc.) ----
+async function callOpenRouter(messages, model = 'minimax/minimax-m3-preview') {
+    const url = 'https://openrouter.ai/api/v1/chat/completions';
     const payload = {
         model: model,
         messages: messages,
         temperature: 0.7,
         top_p: 0.9,
         stream: true,
-        max_tokens: 4000
+        max_tokens: 2000
     };
     const response = await fetch(url, {
         method: 'POST',
         headers: {
-            'Authorization': `Bearer ${MINIMAX_API_KEY}`,
-            'Content-Type': 'application/json'
+            'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
+            'Content-Type': 'application/json',
+            'HTTP-Referer': 'https://technovaphy-solutions-5nz6.onrender.com'
         },
         body: JSON.stringify(payload)
     });
     if (!response.ok) {
         const errText = await response.text();
-        throw new Error(`MiniMax error (${response.status}): ${errText}`);
+        throw new Error(`OpenRouter error (${response.status}): ${errText}`);
     }
     return response;
 }
 
-async function callGroq(messages) {
-    const url = 'https://api.groq.com/openai/v1/chat/completions';
-    const payload = {
-        model: 'llama-3.3-70b-versatile',
-        messages: messages,
-        temperature: 0.7,
-        top_p: 0.9,
-        stream: true,
-        max_tokens: 4000
-    };
-    const response = await fetch(url, {
-        method: 'POST',
-        headers: {
-            'Authorization': `Bearer ${GROQ_API_KEY}`,
-            'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(payload)
-    });
-    if (!response.ok) {
-        const errText = await response.text();
-        throw new Error(`Groq error (${response.status}): ${errText}`);
-    }
-    return response;
-}
-
-// ---- NEW: Groq Vision ----
+// ---- Groq Vision (for images) ----
 async function callGroqVision(messages) {
     const url = 'https://api.groq.com/openai/v1/chat/completions';
     const payload = {
-        model: 'llama-3.2-11b-vision-preview',  // Free, supports images
+        model: 'llama-3.2-11b-vision-preview',
         messages: messages,
         temperature: 0.7,
         top_p: 0.9,
         stream: true,
-        max_tokens: 4000
+        max_tokens: 2000
     };
     const response = await fetch(url, {
         method: 'POST',
@@ -350,32 +327,39 @@ async function callGroqVision(messages) {
     return response;
 }
 
-// ---- Main failover (with vision support) ----
+// ---- Main failover: OpenRouter → Groq Vision → fallback ----
 async function fetchAIResponseWithFailover(messages, userSelectedModel, hasImage = false) {
-    // If there are images, force Groq Vision (reliable)
+    // If there are images, use Groq Vision
     if (hasImage) {
         const response = await callGroqVision(messages);
         return { response, source: 'groq-vision' };
     }
 
-    // Otherwise, use the user's model choice
-    if (userSelectedModel === 'groq/llama-3.3-70b-versatile') {
-        const response = await callGroq(messages);
-        return { response, source: 'groq' };
-    }
+    // Map frontend model names to OpenRouter model slugs
+    const modelMap = {
+        'minimax/minimax-m3-preview': 'minimax/minimax-m3-preview',
+        'groq/llama-3.3-70b-versatile': 'groq/llama-3.3-70b-versatile'
+    };
+    const primaryModel = modelMap[userSelectedModel] || 'minimax/minimax-m3-preview';
+    const fallbackModels = ['anthropic/claude-haiku-4.5', 'google/gemini-2-flash-lite-preview-02-05'];
 
+    // Try the user's chosen model first
     try {
-        const response = await callMiniMax(messages);
-        return { response, source: 'minimax' };
-    } catch (miniMaxErr) {
-        console.warn('⚠️ MiniMax failed, falling back to Groq:', miniMaxErr.message);
-        try {
-            const response = await callGroq(messages);
-            return { response, source: 'groq' };
-        } catch (groqErr) {
-            console.error('❌ Groq also failed:', groqErr.message);
-            throw new Error('Both MiniMax and Groq failed. Check your API keys and credits.');
+        const response = await callOpenRouter(messages, primaryModel);
+        return { response, source: primaryModel };
+    } catch (primaryErr) {
+        console.warn(`⚠️ ${primaryModel} failed, trying fallbacks:`, primaryErr.message);
+        // Try fallback models
+        for (const fallbackModel of fallbackModels) {
+            try {
+                const response = await callOpenRouter(messages, fallbackModel);
+                console.log(`✅ Fallback succeeded with ${fallbackModel}`);
+                return { response, source: fallbackModel };
+            } catch (fallbackErr) {
+                console.warn(`⚠️ ${fallbackModel} failed:`, fallbackErr.message);
+            }
         }
+        throw new Error('All AI models failed. Please try again later.');
     }
 }
 
@@ -470,7 +454,7 @@ function releaseConcurrency() {
 }
 
 // ============================================================
-//  AUTH MIDDLEWARE (updates last_active)
+//  AUTH MIDDLEWARE
 // ============================================================
 const auth = async (req, res, next) => {
     const authHeader = req.headers.authorization;
@@ -589,7 +573,7 @@ app.post('/api/auth/update-memory', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CONVERSATIONS
+//  CONVERSATIONS (CRUD)
 // ============================================================
 app.get('/api/conversations', auth, async (req, res) => {
     try {
@@ -783,7 +767,7 @@ app.delete('/api/projects/:id', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CHAT STREAM WITH FILE UPLOAD (multer) – FORCES GROQ VISION FOR IMAGES
+//  CHAT STREAM (with OpenRouter)
 // ============================================================
 app.post('/api/chat/stream', auth, upload.array('files', 5), async (req, res) => {
     try {
@@ -869,7 +853,6 @@ app.post('/api/chat/stream', auth, upload.array('files', 5), async (req, res) =>
         const memoryPrompt = user.memory ? `\n\nUser context: ${user.memory}` : '';
         const systemPrompt = buildSystemPrompt({ memoryPrompt, languageInstruction });
 
-        // ---- If there are images, force Groq Vision (we don't use user model) ----
         const userModel = req.body.model || 'minimax/minimax-m3-preview';
         const groqMessages = [{ role: 'system', content: systemPrompt }, ...conversation];
 
@@ -889,7 +872,6 @@ app.post('/api/chat/stream', auth, upload.array('files', 5), async (req, res) =>
             originalEnd.apply(res, args);
         };
 
-        // ---- Call the AI (vision will be handled automatically) ----
         const { response: aiResponse, source } = await fetchAIResponseWithFailover(groqMessages, userModel, hasImage);
         if (!aiResponse.ok) throw new Error(`AI error ${aiResponse.status}`);
 
@@ -1268,20 +1250,21 @@ ${code}
 
         const messages = [{ role: 'system', content: systemPrompt }];
 
+        // ---- Try OpenRouter (MiniMax M3) first, then fallback to Claude Haiku ----
         let response;
         let source;
         try {
-            response = await callMiniMax(messages);
-            source = 'minimax';
-        } catch (miniMaxErr) {
-            console.warn('⚠️ MiniMax failed for code, falling back to Groq:', miniMaxErr.message);
+            response = await callOpenRouter(messages, 'minimax/minimax-m3-preview');
+            source = 'minimax (via OpenRouter)';
+        } catch (err) {
+            console.warn('⚠️ MiniMax failed for code, falling back to Claude Haiku:', err.message);
             try {
-                response = await callGroq(messages);
-                source = 'groq';
-            } catch (groqErr) {
-                console.error('❌ Groq also failed for code:', groqErr.message);
+                response = await callOpenRouter(messages, 'anthropic/claude-haiku-4.5');
+                source = 'claude-haiku (via OpenRouter)';
+            } catch (fallbackErr) {
+                console.error('❌ All models failed for code:', fallbackErr.message);
                 releaseConcurrency();
-                return res.status(500).json({ error: 'Both AI models failed. Please try again later.' });
+                return res.status(500).json({ error: 'All AI models failed. Please try again later.' });
             }
         }
 
@@ -1334,10 +1317,8 @@ ${code}
 });
 
 // ============================================================
-//  ADMIN DASHBOARD ROUTES (owner only)
+//  ADMIN DASHBOARD ROUTES
 // ============================================================
-
-// ---- Admin stats ----
 app.get('/api/admin/stats', auth, async (req, res) => {
     try {
         const user = req.user;
@@ -1346,13 +1327,11 @@ app.get('/api/admin/stats', auth, async (req, res) => {
             return res.status(403).json({ error: 'Admin access only' });
         }
 
-        // 1. Total users
         const { count: totalUsers, error: usersErr } = await supabase
             .from('users')
             .select('*', { count: 'exact', head: true });
         if (usersErr) throw usersErr;
 
-        // 2. Active users (last 24 hours)
         const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
         const { count: activeUsers, error: activeErr } = await supabase
             .from('users')
@@ -1360,7 +1339,6 @@ app.get('/api/admin/stats', auth, async (req, res) => {
             .gte('last_active', twentyFourHoursAgo);
         if (activeErr) throw activeErr;
 
-        // 3. Users active in last 15 minutes (approx "logged in")
         const fifteenMinutesAgo = new Date(Date.now() - 15 * 60 * 1000).toISOString();
         const { count: loggedInUsers, error: loggedErr } = await supabase
             .from('users')
@@ -1368,7 +1346,6 @@ app.get('/api/admin/stats', auth, async (req, res) => {
             .gte('last_active', fifteenMinutesAgo);
         if (loggedErr) throw loggedErr;
 
-        // 4. Payments summary
         const { data: payments, error: payErr } = await supabase
             .from('payments')
             .select('amount, currency, tier, status, created_at')
@@ -1381,7 +1358,6 @@ app.get('/api/admin/stats', auth, async (req, res) => {
             revenueByTier[p.tier] = (revenueByTier[p.tier] || 0) + p.amount;
         });
 
-        // 5. Recent payments (last 5)
         const { data: recentPayments, error: recentErr } = await supabase
             .from('payments')
             .select('amount, currency, tier, status, created_at, user_id')
@@ -1390,7 +1366,6 @@ app.get('/api/admin/stats', auth, async (req, res) => {
             .limit(5);
         if (recentErr) throw recentErr;
 
-        // 6. Total code runner unlocks
         const { count: codeRunnerCount, error: codeErr } = await supabase
             .from('users')
             .select('*', { count: 'exact', head: true })
@@ -1413,7 +1388,6 @@ app.get('/api/admin/stats', auth, async (req, res) => {
     }
 });
 
-// ---- Admin – list all users (with pagination) ----
 app.get('/api/admin/users', auth, async (req, res) => {
     try {
         const user = req.user;
