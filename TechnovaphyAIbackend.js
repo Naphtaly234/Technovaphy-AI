@@ -1,21 +1,4 @@
-// ============================================================
-//  TECHNOVAPHY AI – COMPLETE BACKEND
-//  Purpose: African Assistant with model selection and code runner
-//  Models: MiniMax M3, GLM-5.2, NVIDIA Nemotron 3, Groq Llama 3.3
-//  All via OpenRouter – single API key
-//
-//  ⚠️ PATCHED (see "FIX:" comments):
-//  1. /api/subscribe-code no longer grants access on a Paystack error
-//     message match. It now uses the same "initialize transaction with
-//     a plan attached" pattern as /api/create-checkout, so a user MUST
-//     complete a real Paystack payment before the signed webhook marks
-//     them unlocked. There is no client-trust / no-payment path left.
-//  2. Added GET /api/payment-status/:key so the frontend can poll and
-//     find out (safely, server-side) whether a payment actually cleared
-//     after the user returns from the Paystack checkout page.
-//  3. Added GET /api/pricing so the frontend can render a real, localized
-//     pricing/upgrade screen instead of hardcoding numbers.
-// ============================================================
+
 
 // Load environment variables
 require('dotenv').config();
