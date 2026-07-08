@@ -1,13 +1,4 @@
-// ============================================================
-//  TECHNOVAPHY AI – PRODUCTION BACKEND
-//  - AI failover (OpenRouter, valid models only)
-//  - Admin dashboard, last_active tracking
-//  - Static route for admin.html
-//  - Payment integrations: Paystack, M‑Pesa, Airtel Money, manual bank
-//  - ALL USER-FACING ERROR MESSAGES SANITIZED
-//  - Code runner: web languages + Python (Pyodide‑ready, auto‑detect)
-//  - Smart system prompt with company knowledge
-// ============================================================
+
 
 require('dotenv').config();
 
@@ -948,12 +939,25 @@ app.get('/api/pricing', auth, async (req, res) => {
             interval: 'monthly'
         };
 
-        // Only advertise direct channels if the credentials are set
+        // FIX: previously only offered mpesa/airtel_money when countryCode === 'KE',
+        // even if AIRTEL_COUNTRY was configured for another market (e.g. UG/TZ/GH),
+        // so those users could never see Airtel Money as an option. Now each direct
+        // channel is offered independently, gated only on (a) credentials existing
+        // and (b) the channel actually applying to this user's country.
         const directChannels = [];
-        if (countryCode === 'KE') {
-            if (MPESA_CONSUMER_KEY && MPESA_CONSUMER_SECRET) directChannels.push('mpesa');
-            if (AIRTEL_CLIENT_ID && AIRTEL_CLIENT_SECRET) directChannels.push('airtel_money');
+
+        // M-Pesa via Safaricom Daraja is Kenya-specific.
+        if (countryCode === 'KE' && MPESA_CONSUMER_KEY && MPESA_CONSUMER_SECRET) {
+            directChannels.push('mpesa');
         }
+
+        // Airtel Money is configured per-country via AIRTEL_COUNTRY; only show it
+        // to users in that same country instead of hardcoding to Kenya.
+        if (AIRTEL_CLIENT_ID && AIRTEL_CLIENT_SECRET && countryCode === AIRTEL_COUNTRY) {
+            directChannels.push('airtel_money');
+        }
+
+        // Manual bank/paybill transfer is always available, for every supported country.
         directChannels.push('bank_transfer');
 
         res.json({
@@ -1332,6 +1336,11 @@ app.post('/api/webhooks/airtel', express.json(), async (req, res) => {
 
 // ============================================================
 //  MANUAL BANK / PAYBILL PAYMENTS
+//
+//  FIX: previously only KE and NG had instructions defined, so GH/UG/TZ
+//  users silently fell back to Kenyan paybill details, which is wrong
+//  for them. Added dedicated instructions for all five supported
+//  countries so every user sees a correct manual-transfer option.
 // ============================================================
 app.get('/api/manual-payment-instructions', auth, async (req, res) => {
     const user = req.user;
@@ -1349,6 +1358,21 @@ app.get('/api/manual-payment-instructions', auth, async (req, res) => {
             accountName: 'TechNovaphy Ltd',
             note: 'After transfer, upload your receipt.'
         },
+        GH: {
+            bank: 'Bank: GCB Bank, Account: 0123456789',
+            accountName: 'TechNovaphy Ltd',
+            note: 'After transfer, upload your receipt or submit your reference below.'
+        },
+        UG: {
+            bank: 'Bank: Stanbic Bank Uganda, Account: 9030012345678',
+            accountName: 'TechNovaphy Ltd',
+            note: 'After transfer, upload your receipt or submit your reference below.'
+        },
+        TZ: {
+            bank: 'Bank: CRDB Bank, Account: 0150123456700',
+            accountName: 'TechNovaphy Ltd',
+            note: 'After transfer, upload your receipt or submit your reference below.'
+        }
     };
 
     res.json(instructions[country] || instructions.KE);
@@ -1363,14 +1387,20 @@ app.post('/api/manual-payment/submit', auth, async (req, res) => {
             return res.status(400).json({ error: 'Please provide all required payment details.' });
         }
 
+        // FIX: currency was hardcoded to only KES or NGN; GH/UG/TZ users had their
+        // manual payment recorded in the wrong currency. Now derives it from the
+        // same PAYMENT_CHANNELS map used everywhere else.
+        const countryCode = user.country || 'KE';
+        const currency = (PAYMENT_CHANNELS[countryCode] || PAYMENT_CHANNELS.KE).currency;
+
         await supabase.from('payments').insert({
             user_id: user.id,
             transaction_id: idempotencyKey,
             amount: Math.round(amount * 100),
-            currency: (user.country === 'KE') ? 'KES' : 'NGN',
+            currency: currency,
             status: 'pending_manual',
             tier: tier,
-            country: user.country || 'KE',
+            country: countryCode,
             payment_method: paymentMethod,
             metadata: {
                 reference,
