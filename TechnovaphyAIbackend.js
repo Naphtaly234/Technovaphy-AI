@@ -4,6 +4,7 @@
 //  - Admin dashboard, last_active tracking
 //  - Static route for admin.html
 //  - Payment integrations: Paystack, M‑Pesa, Airtel Money, manual bank
+//  - ALL USER-FACING ERROR MESSAGES SANITIZED
 // ============================================================
 
 require('dotenv').config();
@@ -91,7 +92,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
     }
 })();
 
-// ---- PAYSTACK WEBHOOK ----
+// ---- PAYSTACK WEBHOOK (no changes needed – webhook doesn't talk to user) ----
 app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), async (req, res) => {
     try {
         const signature = req.headers['x-paystack-signature'];
@@ -147,7 +148,7 @@ app.use(express.urlencoded({ limit: '20mb', extended: true }));
 const authLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 10,
-    handler: (req, res) => res.status(429).json({ error: 'Too many attempts' })
+    handler: (req, res) => res.status(429).json({ error: 'Too many attempts. Please try again later.' })
 });
 app.use('/api/auth/login', authLimiter);
 app.use('/api/auth/register', authLimiter);
@@ -216,7 +217,6 @@ function parseThinkingAndAnswer(rawText) {
     if (answerClosed) answer = answerClosed[1];
     else if (answerOpen) answer = answerOpen[1];
 
-    // Fallback: if no <answer> tag, extract everything after the thinking block
     if (!answer) {
         if (thinkClosed) {
             const afterThinking = rawText.slice(rawText.indexOf(thinkClosed[0]) + thinkClosed[0].length).trim();
@@ -230,14 +230,15 @@ function parseThinkingAndAnswer(rawText) {
 }
 
 // ============================================================
-//  AI FAILOVER CHAIN (OpenRouter) – preserves conversation
+//  AI FAILOVER CHAIN (OpenRouter) – now with safe error
 // ============================================================
 async function fetchAIResponseWithFailover(messages, userSelectedModel) {
     if (!OPENROUTER_API_KEY) {
-        throw new Error('OpenRouter API key is not set.');
+        const err = new Error('AI service unavailable.');
+        err.safeMessage = 'AI service is not configured. Please contact support.';
+        throw err;
     }
 
-    // Map frontend model names to OpenRouter model IDs
     const modelMap = {
         'minimax/minimax-m3-preview': 'minimax/minimax-m3-preview',
         'zai-org/glm-5.2': 'zai-org/glm-5.2',
@@ -247,7 +248,6 @@ async function fetchAIResponseWithFailover(messages, userSelectedModel) {
         'anthropic/claude-haiku-4.5': 'anthropic/claude-haiku-4.5'
     };
 
-    // Build order: user's choice first, then fallbacks (ensuring no duplicates)
     const primary = modelMap[userSelectedModel] || 'minimax/minimax-m3-preview';
     const fallbacks = [
         'minimax/minimax-m3-preview',
@@ -304,27 +304,37 @@ async function fetchAIResponseWithFailover(messages, userSelectedModel) {
         }
     }
 
-    // All models failed – throw the last error (the frontend will show it)
-    throw new Error(`All AI models failed. ${lastError ? lastError.message : 'Unknown error'}`);
+    const safeErr = new Error('All AI models are currently unavailable.');
+    safeErr.internal = lastError?.message;
+    throw safeErr;
 }
 
 // ============================================================
-//  HELPERS
+//  HELPERS (sanitized)
 // ============================================================
 async function findUser(email) {
     const { data, error } = await supabase.from('users').select('*').eq('email', email).maybeSingle();
-    if (error) throw new Error('DB: ' + error.message);
+    if (error) {
+        console.error('DB findUser error:', error);
+        throw new Error('A temporary issue occurred. Please try again.');
+    }
     return data;
 }
 async function findUserById(id) {
     const { data, error } = await supabase.from('users').select('*').eq('id', id).maybeSingle();
-    if (error) throw new Error('DB: ' + error.message);
+    if (error) {
+        console.error('DB findUserById error:', error);
+        throw new Error('A temporary issue occurred. Please try again.');
+    }
     return data;
 }
 function getLimit(tier) { return TIER_LIMITS[tier] || 200; }
 async function getConversation(userId) {
     const { data, error } = await supabase.from('conversations').select('messages').eq('user_id', userId).maybeSingle();
-    if (error && error.code !== 'PGRST116') throw error;
+    if (error && error.code !== 'PGRST116') {
+        console.error('DB getConversation error:', error);
+        throw new Error('Unable to load conversation history.');
+    }
     return data ? data.messages : [];
 }
 async function saveConversation(userId, messages) {
@@ -333,7 +343,10 @@ async function saveConversation(userId, messages) {
         messages: messages,
         updated_at: new Date().toISOString()
     }, { onConflict: 'user_id' });
-    if (error) throw new Error('Failed to save conversation: ' + error.message);
+    if (error) {
+        console.error('DB saveConversation error:', error);
+        throw new Error('Failed to save conversation.');
+    }
 }
 
 // ---- Rate limiting (Redis or memory) ----
@@ -403,18 +416,18 @@ function releaseConcurrency() {
 // ============================================================
 const auth = async (req, res, next) => {
     const authHeader = req.headers.authorization;
-    if (!authHeader) return res.status(401).json({ error: 'No token provided' });
+    if (!authHeader) return res.status(401).json({ error: 'Authentication required. Please log in.' });
     const token = authHeader.split(' ')[1];
     try {
         const decoded = jwt.verify(token, JWT_SECRET);
         const user = await findUserById(decoded.userId);
-        if (!user) return res.status(401).json({ error: 'User not found' });
+        if (!user) return res.status(401).json({ error: 'Account not found.' });
         req.user = user;
-        // Update last_active for tracking
         await supabase.from('users').update({ last_active: new Date().toISOString() }).eq('id', user.id);
         next();
     } catch (e) {
-        res.status(401).json({ error: 'Invalid or expired token' });
+        console.error('Auth error:', e);
+        res.status(401).json({ error: 'Session expired. Please log in again.' });
     }
 };
 
@@ -425,16 +438,15 @@ app.get('/', (req, res) => res.send('TechNovaphy AI Backend'));
 app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 app.get('/api/ping', (req, res) => res.json({ status: 'ok' }));
 
-// ---- Serve admin dashboard (if admin.html exists) ----
 app.get('/admin', (req, res) => {
     res.sendFile(path.join(__dirname, 'admin.html'));
 });
 
-// ---- Test OpenRouter key (for debugging) ----
+// Test key (admin only – keep safe message)
 app.get('/api/test-key', async (req, res) => {
     try {
         if (!OPENROUTER_API_KEY) {
-            return res.status(400).json({ error: 'OPENROUTER_API_KEY not set' });
+            return res.status(400).json({ error: 'API key not configured.' });
         }
         const response = await fetch('https://openrouter.ai/api/v1/auth/key', {
             headers: { 'Authorization': `Bearer ${OPENROUTER_API_KEY}` }
@@ -443,10 +455,11 @@ app.get('/api/test-key', async (req, res) => {
         if (response.ok) {
             res.json({ valid: true, credits: data.credits || 'unknown' });
         } else {
-            res.status(response.status).json({ valid: false, error: data.error || 'Invalid key' });
+            res.status(response.status).json({ valid: false, error: 'Key validation failed.' });
         }
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        console.error('Test key error:', err);
+        res.status(500).json({ error: 'Unable to verify API key.' });
     }
 });
 
@@ -454,12 +467,12 @@ app.get('/api/test-key', async (req, res) => {
 app.post('/api/auth/register', async (req, res) => {
     try {
         const { email, password, ageConfirmed, country } = req.body;
-        if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
-        if (!ageConfirmed) return res.status(400).json({ error: 'You must be 18+' });
-        if (!country || !PAYMENT_CHANNELS[country]) return res.status(400).json({ error: 'Invalid country' });
+        if (!email || !password) return res.status(400).json({ error: 'Email and password are required.' });
+        if (!ageConfirmed) return res.status(400).json({ error: 'You must confirm you are 18 years or older.' });
+        if (!country || !PAYMENT_CHANNELS[country]) return res.status(400).json({ error: 'Please select a valid country.' });
 
         const existing = await findUser(email);
-        if (existing) return res.status(400).json({ error: 'Email already exists' });
+        if (existing) return res.status(400).json({ error: 'An account with this email already exists.' });
 
         const hashed = await bcrypt.hash(password, 10);
         const now = new Date();
@@ -481,14 +494,17 @@ app.post('/api/auth/register', async (req, res) => {
             last_active: now.toISOString()
         }).select().single();
 
-        if (error) throw new Error('DB insert: ' + error.message);
+        if (error) {
+            console.error('Registration DB error:', error);
+            return res.status(500).json({ error: 'Account creation failed. Please try again.' });
+        }
         await supabase.from('conversations').insert({ user_id: data.id, messages: [] });
 
         console.log(`✅ User registered from ${country}`);
-        res.status(201).json({ message: 'User created', userId: data.id, country: country });
+        res.status(201).json({ message: 'Account created successfully.', userId: data.id, country: country });
     } catch (err) {
         console.error('Registration error:', err);
-        res.status(500).json({ error: err.message });
+        res.status(500).json({ error: 'Something went wrong during registration.' });
     }
 });
 
@@ -496,20 +512,20 @@ app.post('/api/auth/register', async (req, res) => {
 app.post('/api/auth/login', async (req, res) => {
     try {
         const { email, password } = req.body;
-        if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+        if (!email || !password) return res.status(400).json({ error: 'Email and password are required.' });
 
         const user = await findUser(email);
-        if (!user) return res.status(401).json({ error: 'Invalid credentials' });
+        if (!user) return res.status(401).json({ error: 'Invalid email or password.' });
 
         const valid = await bcrypt.compare(password, user.password_hash);
-        if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
+        if (!valid) return res.status(401).json({ error: 'Invalid email or password.' });
 
         const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '7d' });
         await supabase.from('users').update({ last_active: new Date().toISOString() }).eq('id', user.id);
         res.json({ token, verified: true, country: user.country });
     } catch (err) {
         console.error('Login error:', err);
-        res.status(500).json({ error: err.message });
+        res.status(500).json({ error: 'Unable to log in. Please try again later.' });
     }
 });
 
@@ -532,7 +548,7 @@ app.get('/api/user/profile', auth, async (req, res) => {
         });
     } catch (err) {
         console.error('Profile error:', err);
-        res.status(500).json({ error: err.message });
+        res.status(500).json({ error: 'Could not load profile.' });
     }
 });
 
@@ -541,9 +557,10 @@ app.post('/api/auth/update-memory', auth, async (req, res) => {
     try {
         const { memory } = req.body;
         await supabase.from('users').update({ memory }).eq('id', req.user.id);
-        res.json({ message: 'Memory updated' });
+        res.json({ message: 'Memory updated successfully.' });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        console.error('Update memory error:', err);
+        res.status(500).json({ error: 'Failed to update memory.' });
     }
 });
 
@@ -574,7 +591,8 @@ app.get('/api/conversations', auth, async (req, res) => {
 
         res.json({ conversations: withSummary });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        console.error('Get conversations error:', err);
+        res.status(500).json({ error: 'Failed to load conversations.' });
     }
 });
 
@@ -588,10 +606,11 @@ app.get('/api/conversations/:conversationId', auth, async (req, res) => {
             .eq('user_id', req.user.id)
             .single();
 
-        if (error || !data) return res.status(404).json({ error: 'Not found' });
+        if (error || !data) return res.status(404).json({ error: 'Conversation not found.' });
         res.json({ conversation: data });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        console.error('Get conversation error:', err);
+        res.status(500).json({ error: 'Failed to load conversation.' });
     }
 });
 
@@ -620,7 +639,7 @@ app.post('/api/conversations', auth, async (req, res) => {
         res.status(201).json({ conversation: data });
     } catch (err) {
         console.error('Create conversation error:', err);
-        res.status(500).json({ error: err.message });
+        res.status(500).json({ error: 'Could not create conversation.' });
     }
 });
 
@@ -632,9 +651,10 @@ app.delete('/api/conversations/:conversationId', auth, async (req, res) => {
             .eq('user_id', req.user.id);
 
         if (error) throw error;
-        res.json({ message: 'Deleted' });
+        res.json({ message: 'Conversation deleted.' });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        console.error('Delete conversation error:', err);
+        res.status(500).json({ error: 'Failed to delete conversation.' });
     }
 });
 
@@ -670,7 +690,7 @@ app.post('/api/conversations/clear', auth, async (req, res) => {
         res.json({ conversation: data });
     } catch (err) {
         console.error('Clear conversation error:', err);
-        res.status(500).json({ error: err.message });
+        res.status(500).json({ error: 'Failed to clear conversation.' });
     }
 });
 
@@ -687,14 +707,15 @@ app.get('/api/projects', auth, async (req, res) => {
         if (error) throw error;
         res.json({ projects: data || [] });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        console.error('Get projects error:', err);
+        res.status(500).json({ error: 'Failed to load projects.' });
     }
 });
 
 app.post('/api/projects', auth, async (req, res) => {
     try {
         const { name, description } = req.body;
-        if (!name) return res.status(400).json({ error: 'Project name required' });
+        if (!name) return res.status(400).json({ error: 'Please enter a project name.' });
         const { data, error } = await supabase.from('projects').insert({
             user_id: req.user.id,
             name,
@@ -705,7 +726,8 @@ app.post('/api/projects', auth, async (req, res) => {
         if (error) throw error;
         res.status(201).json({ project: data });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        console.error('Create project error:', err);
+        res.status(500).json({ error: 'Could not create project.' });
     }
 });
 
@@ -713,17 +735,18 @@ app.put('/api/projects/:id', auth, async (req, res) => {
     try {
         const { id } = req.params;
         const { name, description } = req.body;
-        if (!name) return res.status(400).json({ error: 'Project name required' });
+        if (!name) return res.status(400).json({ error: 'Project name is required.' });
         const { data, error } = await supabase.from('projects')
             .update({ name, description, updated_at: new Date().toISOString() })
             .eq('id', id)
             .eq('user_id', req.user.id)
             .select().single();
         if (error) throw error;
-        if (!data) return res.status(404).json({ error: 'Project not found' });
+        if (!data) return res.status(404).json({ error: 'Project not found.' });
         res.json({ project: data });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        console.error('Update project error:', err);
+        res.status(500).json({ error: 'Failed to update project.' });
     }
 });
 
@@ -735,14 +758,15 @@ app.delete('/api/projects/:id', auth, async (req, res) => {
             .eq('id', id)
             .eq('user_id', req.user.id);
         if (error) throw error;
-        res.json({ message: 'Project deleted' });
+        res.json({ message: 'Project deleted.' });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        console.error('Delete project error:', err);
+        res.status(500).json({ error: 'Failed to delete project.' });
     }
 });
 
 // ============================================================
-//  CHAT STREAM (with failover and conversation preservation)
+//  CHAT STREAM (with failover and safe user messages)
 // ============================================================
 app.post('/api/chat/stream', auth, async (req, res) => {
     try {
@@ -752,32 +776,29 @@ app.post('/api/chat/stream', auth, async (req, res) => {
         if (!isOwner) await acquireConcurrency();
         if (!isOwner && !await checkRateLimit(user.id)) {
             releaseConcurrency();
-            return res.status(429).json({ error: 'Too many requests' });
+            return res.status(429).json({ error: 'You are sending messages too quickly. Please wait a moment.' });
         }
         const monthlyLimit = getLimit(user.tier);
         if (!isOwner && user.usage_count >= monthlyLimit) {
             releaseConcurrency();
-            return res.status(403).json({ error: 'Monthly limit reached' });
+            return res.status(403).json({ error: 'You have reached your monthly message limit.' });
         }
 
-        // ---- Parse messages ----
         let conversation = await getConversation(user.id);
         let newMessages;
         try { newMessages = JSON.parse(req.body.messages); } catch (e) {
             releaseConcurrency();
-            return res.status(400).json({ error: 'Invalid messages format' });
+            return res.status(400).json({ error: 'Invalid message format.' });
         }
         conversation = conversation.concat(newMessages);
         if (conversation.length > MAX_CONVERSATION_HISTORY) {
             conversation = conversation.slice(-MAX_CONVERSATION_HISTORY);
         }
 
-        // ---- Increment usage (non‑owners) ----
         if (!isOwner) {
             await supabase.from('users').update({ usage_count: (user.usage_count || 0) + 1 }).eq('id', user.id);
         }
 
-        // ---- Build system prompt ----
         const language = req.body.language || 'auto';
         let languageInstruction = '';
         if (language !== 'auto') {
@@ -809,26 +830,24 @@ app.post('/api/chat/stream', auth, async (req, res) => {
             await saveConversation(user.id, conversation);
             res.write(`data: ${JSON.stringify({
                 type: 'error',
-                message: 'All AI models failed. Please try again later. ' + err.message
+                message: 'AI is temporarily unavailable. Please try again shortly.'
             })}\n\n`);
             res.end();
-            releaseConcurrency();
             return;
         }
 
         if (!aiResponse.ok) {
             const errText = await aiResponse.text();
+            console.error('OpenRouter non‑ok response:', errText);
             await saveConversation(user.id, conversation);
             res.write(`data: ${JSON.stringify({
                 type: 'error',
-                message: `AI error: ${errText}`
+                message: 'AI service encountered an error. Please try again later.'
             })}\n\n`);
             res.end();
-            releaseConcurrency();
             return;
         }
 
-        // ---- Stream the response ----
         const reader = aiResponse.body.getReader();
         const decoder = new TextDecoder();
         let buffer = '', rawContent = '';
@@ -858,7 +877,6 @@ app.post('/api/chat/stream', auth, async (req, res) => {
             }
         }
 
-        // ---- Finalise conversation ----
         const { thinking: finalThinking, answer: finalAnswer } = parseThinkingAndAnswer(rawContent);
         const finalText = finalAnswer || rawContent || 'No response generated.';
         conversation.push({ role: 'assistant', content: finalText });
@@ -872,11 +890,11 @@ app.post('/api/chat/stream', auth, async (req, res) => {
         res.end();
 
     } catch (err) {
-        console.error('Chat error:', err);
+        console.error('Chat stream error:', err);
         if (!res.headersSent) {
-            res.status(500).json({ error: err.message });
+            res.status(500).json({ error: 'An unexpected error occurred while processing your message.' });
         } else {
-            res.write(`data: ${JSON.stringify({ type: 'error', message: err.message })}\n\n`);
+            res.write(`data: ${JSON.stringify({ type: 'error', message: 'An unexpected error occurred.' })}\n\n`);
             res.end();
         }
         releaseConcurrency();
@@ -931,12 +949,10 @@ app.get('/api/pricing', auth, async (req, res) => {
             interval: 'monthly'
         };
 
-        // Add direct payment channels that are supported for this country
         const directChannels = [];
         if (countryCode === 'KE') {
             directChannels.push('mpesa', 'airtel_money');
         }
-        // Add bank transfer for all (manual)
         directChannels.push('bank_transfer');
 
         res.json({
@@ -945,12 +961,12 @@ app.get('/api/pricing', auth, async (req, res) => {
             tiers,
             codeRunner,
             channels: countryInfo.channels,
-            directChannels: directChannels,   // new: tells frontend which direct methods are available
+            directChannels: directChannels,
             country: countryCode
         });
     } catch (err) {
         console.error('Pricing error:', err);
-        res.status(500).json({ error: err.message });
+        res.status(500).json({ error: 'Could not load pricing information.' });
     }
 });
 
@@ -968,7 +984,7 @@ app.get('/api/payment-status/:key', auth, async (req, res) => {
             .maybeSingle();
 
         if (error) throw error;
-        if (!data) return res.status(404).json({ error: 'Payment not found' });
+        if (!data) return res.status(404).json({ error: 'Payment record not found.' });
 
         res.json({
             status: data.status,
@@ -977,7 +993,8 @@ app.get('/api/payment-status/:key', auth, async (req, res) => {
             amount: data.amount
         });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        console.error('Payment status error:', err);
+        res.status(500).json({ error: 'Unable to check payment status.' });
     }
 });
 
@@ -988,9 +1005,9 @@ app.post('/api/create-checkout', auth, async (req, res) => {
     try {
         const { idempotencyKey, tier } = req.body;
         const user = req.user;
-        if (!idempotencyKey) return res.status(400).json({ error: 'idempotencyKey required' });
+        if (!idempotencyKey) return res.status(400).json({ error: 'Missing payment reference.' });
         if (!tier || !['starter', 'pro', 'enterprise', 'ultimate'].includes(tier)) {
-            return res.status(400).json({ error: 'Invalid tier' });
+            return res.status(400).json({ error: 'Invalid subscription tier selected.' });
         }
 
         const countryCode = user.country || 'KE';
@@ -1008,10 +1025,10 @@ app.post('/api/create-checkout', auth, async (req, res) => {
         const { data: existing } = await supabase.from('payments').select('*').eq('transaction_id', idempotencyKey).maybeSingle();
         if (existing) {
             if (existing.status === 'completed') return res.json({ alreadyProcessed: true });
-            return res.status(409).json({ error: 'Payment processing' });
+            return res.status(409).json({ error: 'A payment is already being processed for this transaction.' });
         }
 
-        if (!PAYSTACK_SECRET_KEY) return res.status(503).json({ error: 'Payment service not configured' });
+        if (!PAYSTACK_SECRET_KEY) return res.status(503).json({ error: 'Payment service is not available at the moment.' });
 
         const response = await fetch('https://api.paystack.co/transaction/initialize', {
             method: 'POST',
@@ -1026,7 +1043,10 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             })
         });
         const data = await response.json();
-        if (!data.status) throw new Error(data.message || 'Paystack init failed');
+        if (!data.status) {
+            console.error('Paystack init error:', data);
+            return res.status(502).json({ error: 'Payment initialization failed. Please try again.' });
+        }
 
         await supabase.from('payments').insert({
             user_id: user.id,
@@ -1041,7 +1061,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
         res.json({ url: data.data.authorization_url, amount: humanAmount, currency: finalCurrency });
     } catch (err) {
         console.error('Checkout error:', err);
-        res.status(500).json({ error: err.message });
+        res.status(500).json({ error: 'Unable to start payment process. Please try again later.' });
     }
 });
 
@@ -1054,22 +1074,23 @@ app.post('/api/mpesa/stkpush', auth, async (req, res) => {
         const user = req.user;
 
         if (!idempotencyKey || !phone || !amount || !tier) {
-            return res.status(400).json({ error: 'Missing required fields: idempotencyKey, phone, amount, tier' });
+            return res.status(400).json({ error: 'Please provide all payment details.' });
         }
 
-        // Format phone to 2547XXXXXXXX
         let formattedPhone = phone.replace(/^0/, '254').replace(/^\+/, '');
         if (!/^254\d{9}$/.test(formattedPhone)) {
-            return res.status(400).json({ error: 'Invalid M-Pesa phone number (format: 2547XXXXXXXX)' });
+            return res.status(400).json({ error: 'Please enter a valid M-Pesa phone number (e.g., 2547XXXXXXXX).' });
         }
 
-        // Obtain OAuth token
         const auth = Buffer.from(`${MPESA_CONSUMER_KEY}:${MPESA_CONSUMER_SECRET}`).toString('base64');
         const tokenRes = await fetch('https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials', {
             headers: { Authorization: `Basic ${auth}` }
         });
         const tokenData = await tokenRes.json();
-        if (!tokenData.access_token) throw new Error('Failed to get M-Pesa token: ' + (tokenData.errorMessage || 'Unknown error'));
+        if (!tokenData.access_token) {
+            console.error('M-Pesa token error:', tokenData);
+            return res.status(502).json({ error: 'M-Pesa service is temporarily unavailable.' });
+        }
         const accessToken = tokenData.access_token;
 
         const timestamp = new Date().toISOString().replace(/[-:T.Z]/g, '').slice(0, 14);
@@ -1098,14 +1119,14 @@ app.post('/api/mpesa/stkpush', auth, async (req, res) => {
         const stkData = await stkRes.json();
 
         if (stkData.ResponseCode !== '0') {
-            throw new Error(stkData.errorMessage || 'STK push failed');
+            console.error('STK push failed:', stkData);
+            return res.status(400).json({ error: 'M-Pesa payment request was not successful. Please try again.' });
         }
 
-        // Save payment intent
         await supabase.from('payments').insert({
             user_id: user.id,
             transaction_id: idempotencyKey,
-            amount: Math.round(amount * 100), // store in cents
+            amount: Math.round(amount * 100),
             currency: 'KES',
             status: 'pending',
             tier: tier,
@@ -1117,28 +1138,23 @@ app.post('/api/mpesa/stkpush', auth, async (req, res) => {
         res.json({
             success: true,
             checkoutRequestID: stkData.CheckoutRequestID,
-            message: 'STK push sent. Check your phone to complete payment.'
+            message: 'Check your phone to complete the M-Pesa payment.'
         });
     } catch (err) {
         console.error('M-Pesa STK error:', err);
-        res.status(500).json({ error: err.message });
+        res.status(500).json({ error: 'M-Pesa payment could not be initiated. Please try again later.' });
     }
 });
 
-// ---- M-Pesa Webhook ----
+// ---- M-Pesa Webhook (no user‑facing response needed) ----
 app.post('/api/webhooks/mpesa', express.json(), async (req, res) => {
     try {
         const callback = req.body.Body?.stkCallback;
         if (!callback) return res.sendStatus(400);
 
         const resultCode = callback.ResultCode;
-        const checkoutRequestID = callback.CheckoutRequestID;
         const metadata = callback.CallbackMetadata?.Item || [];
-
-        const amount = metadata.find(i => i.Name === 'Amount')?.Value;
-        const mpesaReceipt = metadata.find(i => i.Name === 'MpesaReceiptNumber')?.Value;
-        const phone = metadata.find(i => i.Name === 'PhoneNumber')?.Value;
-        const idempotencyKey = callback.AccountReference; // we used idempotencyKey as AccountReference
+        const idempotencyKey = callback.AccountReference;
 
         if (idempotencyKey) {
             const { data: payment } = await supabase
@@ -1153,17 +1169,15 @@ app.post('/api/webhooks/mpesa', express.json(), async (req, res) => {
                     await supabase.from('payments').update({
                         status: 'completed',
                         payment_method: 'mpesa_direct',
-                        metadata: { ...payment.metadata, mpesaReceipt, phone }
+                        metadata: { ...payment.metadata, mpesaReceipt: metadata.find(i => i.Name === 'MpesaReceiptNumber')?.Value }
                     }).eq('transaction_id', idempotencyKey);
 
                     const user = await findUserById(payment.user_id);
                     if (user) {
                         if (payment.tier === 'code_runner') {
                             await supabase.from('users').update({ code_runner_unlocked: true }).eq('id', user.id);
-                            console.log(`✅ Code runner unlocked for user ${user.id} via M-Pesa`);
                         } else {
                             await supabase.from('users').update({ tier: payment.tier, usage_count: 0 }).eq('id', user.id);
-                            console.log(`✅ User ${user.id} upgraded to ${payment.tier} via M-Pesa`);
                         }
                     }
                 } else {
@@ -1171,12 +1185,9 @@ app.post('/api/webhooks/mpesa', express.json(), async (req, res) => {
                         status: 'failed',
                         metadata: { ...payment.metadata, failureReason: callback.ResultDesc }
                     }).eq('transaction_id', idempotencyKey);
-                    console.log(`❌ M-Pesa payment failed: ${callback.ResultDesc}`);
                 }
             }
         }
-
-        // Always respond success to Safaricom
         res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
     } catch (err) {
         console.error('M-Pesa callback error:', err);
@@ -1193,10 +1204,9 @@ app.post('/api/airtel/request', auth, async (req, res) => {
         const user = req.user;
 
         if (!idempotencyKey || !phone || !amount || !tier) {
-            return res.status(400).json({ error: 'Missing required fields' });
+            return res.status(400).json({ error: 'Please provide all payment details.' });
         }
 
-        // Airtel OAuth2 token
         const auth = Buffer.from(`${AIRTEL_CLIENT_ID}:${AIRTEL_CLIENT_SECRET}`).toString('base64');
         const tokenRes = await fetch('https://openapi.airtel.africa/auth/oauth2/token', {
             method: 'POST',
@@ -1207,10 +1217,12 @@ app.post('/api/airtel/request', auth, async (req, res) => {
             body: JSON.stringify({ grant_type: 'client_credentials' })
         });
         const tokenJson = await tokenRes.json();
-        if (!tokenJson.access_token) throw new Error('Airtel auth failed: ' + JSON.stringify(tokenJson));
+        if (!tokenJson.access_token) {
+            console.error('Airtel auth error:', tokenJson);
+            return res.status(502).json({ error: 'Airtel Money service is temporarily unavailable.' });
+        }
         const accessToken = tokenJson.access_token;
 
-        // Payment request
         const payload = {
             reference: idempotencyKey,
             subscriber: {
@@ -1225,7 +1237,6 @@ app.post('/api/airtel/request', auth, async (req, res) => {
                 id: idempotencyKey
             }
         };
-        // Optional callback URL (some Airtel APIs support it)
         if (AIRTEL_CALLBACK_URL) {
             payload.transaction.callback_url = AIRTEL_CALLBACK_URL;
         }
@@ -1243,10 +1254,10 @@ app.post('/api/airtel/request', auth, async (req, res) => {
         const paymentData = await paymentRes.json();
 
         if (paymentData.status?.code !== '200') {
-            throw new Error(paymentData.status?.message || 'Airtel payment failed');
+            console.error('Airtel payment error:', paymentData);
+            return res.status(400).json({ error: 'Airtel Money payment request was not successful. Please try again.' });
         }
 
-        // Store payment
         await supabase.from('payments').insert({
             user_id: user.id,
             transaction_id: idempotencyKey,
@@ -1262,19 +1273,18 @@ app.post('/api/airtel/request', auth, async (req, res) => {
         res.json({
             success: true,
             transactionId: paymentData.data?.transaction?.id,
-            message: 'Airtel Money payment request sent. Please complete on your phone.'
+            message: 'Airtel Money request sent. Please complete on your phone.'
         });
     } catch (err) {
         console.error('Airtel payment error:', err);
-        res.status(500).json({ error: err.message });
+        res.status(500).json({ error: 'Airtel Money payment failed. Please try again later.' });
     }
 });
 
-// ---- Airtel Webhook (if Airtel sends push notifications) ----
+// ---- Airtel Webhook ----
 app.post('/api/webhooks/airtel', express.json(), async (req, res) => {
     try {
-        // Airtel webhook payload structure may vary; adapt based on your integration
-        const { reference, transaction, status } = req.body;
+        const { reference, status } = req.body;
         if (!reference) return res.sendStatus(400);
 
         if (status === 'SUCCESS' || status === 'TS') {
@@ -1298,7 +1308,6 @@ app.post('/api/webhooks/airtel', express.json(), async (req, res) => {
                     } else {
                         await supabase.from('users').update({ tier: payment.tier, usage_count: 0 }).eq('id', user.id);
                     }
-                    console.log(`✅ User ${user.id} upgraded via Airtel Money webhook`);
                 }
             }
         } else if (status === 'FAILED') {
@@ -1316,10 +1325,7 @@ app.post('/api/webhooks/airtel', express.json(), async (req, res) => {
 
 // ============================================================
 //  MANUAL BANK / PAYBILL PAYMENTS
-//  - User submits proof (screenshot/reference), admin verifies
 // ============================================================
-
-// Provide payment instructions for the user's country
 app.get('/api/manual-payment-instructions', auth, async (req, res) => {
     const user = req.user;
     const country = user.country || 'KE';
@@ -1336,32 +1342,29 @@ app.get('/api/manual-payment-instructions', auth, async (req, res) => {
             accountName: 'TechNovaphy Ltd',
             note: 'After transfer, upload your receipt.'
         },
-        // add others as needed
     };
 
     res.json(instructions[country] || instructions.KE);
 });
 
-// Submit manual payment proof
 app.post('/api/manual-payment/submit', auth, async (req, res) => {
     try {
         const { idempotencyKey, paymentMethod, reference, amount, tier, receiptImage } = req.body;
         const user = req.user;
 
         if (!idempotencyKey || !paymentMethod || !amount || !tier) {
-            return res.status(400).json({ error: 'Missing required fields' });
+            return res.status(400).json({ error: 'Please provide all required payment details.' });
         }
 
-        // Store as pending + requires admin verification
         await supabase.from('payments').insert({
             user_id: user.id,
             transaction_id: idempotencyKey,
             amount: Math.round(amount * 100),
-            currency: (user.country === 'KE') ? 'KES' : 'NGN', // simplistic
+            currency: (user.country === 'KE') ? 'KES' : 'NGN',
             status: 'pending_manual',
             tier: tier,
             country: user.country || 'KE',
-            payment_method: paymentMethod, // 'bank_transfer', 'paybill', etc.
+            payment_method: paymentMethod,
             metadata: {
                 reference,
                 receiptImage,
@@ -1369,54 +1372,62 @@ app.post('/api/manual-payment/submit', auth, async (req, res) => {
             }
         });
 
-        res.json({ message: 'Payment proof submitted. Awaiting admin verification.' });
+        res.json({ message: 'Payment proof submitted. You will be notified once it is verified.' });
     } catch (err) {
         console.error('Manual payment submit error:', err);
-        res.status(500).json({ error: err.message });
+        res.status(500).json({ error: 'Failed to submit payment proof.' });
     }
 });
 
-// Admin: list pending manual payments
 app.get('/api/admin/manual-payments', auth, async (req, res) => {
-    if (req.user.email !== OWNER_EMAIL) return res.status(403).json({ error: 'Admin only' });
+    if (req.user.email !== OWNER_EMAIL) return res.status(403).json({ error: 'Access denied.' });
 
-    const { data, error } = await supabase
-        .from('payments')
-        .select('*')
-        .eq('status', 'pending_manual')
-        .order('created_at', { ascending: false });
-    if (error) return res.status(500).json({ error: error.message });
-    res.json({ payments: data });
+    try {
+        const { data, error } = await supabase
+            .from('payments')
+            .select('*')
+            .eq('status', 'pending_manual')
+            .order('created_at', { ascending: false });
+        if (error) throw error;
+        res.json({ payments: data });
+    } catch (err) {
+        console.error('Admin manual payments error:', err);
+        res.status(500).json({ error: 'Failed to load manual payments.' });
+    }
 });
 
-// Admin: verify/approve manual payment
 app.post('/api/admin/manual-payments/verify', auth, async (req, res) => {
-    if (req.user.email !== OWNER_EMAIL) return res.status(403).json({ error: 'Admin only' });
+    if (req.user.email !== OWNER_EMAIL) return res.status(403).json({ error: 'Access denied.' });
 
-    const { transaction_id, approved } = req.body; // approved: true/false
-    const { data: payment } = await supabase
-        .from('payments')
-        .select('*')
-        .eq('transaction_id', transaction_id)
-        .eq('status', 'pending_manual')
-        .maybeSingle();
+    const { transaction_id, approved } = req.body;
+    try {
+        const { data: payment } = await supabase
+            .from('payments')
+            .select('*')
+            .eq('transaction_id', transaction_id)
+            .eq('status', 'pending_manual')
+            .maybeSingle();
 
-    if (!payment) return res.status(404).json({ error: 'Payment not found' });
+        if (!payment) return res.status(404).json({ error: 'Payment record not found.' });
 
-    if (approved) {
-        await supabase.from('payments').update({ status: 'completed' }).eq('transaction_id', transaction_id);
-        const user = await findUserById(payment.user_id);
-        if (user) {
-            if (payment.tier === 'code_runner') {
-                await supabase.from('users').update({ code_runner_unlocked: true }).eq('id', user.id);
-            } else {
-                await supabase.from('users').update({ tier: payment.tier, usage_count: 0 }).eq('id', user.id);
+        if (approved) {
+            await supabase.from('payments').update({ status: 'completed' }).eq('transaction_id', transaction_id);
+            const user = await findUserById(payment.user_id);
+            if (user) {
+                if (payment.tier === 'code_runner') {
+                    await supabase.from('users').update({ code_runner_unlocked: true }).eq('id', user.id);
+                } else {
+                    await supabase.from('users').update({ tier: payment.tier, usage_count: 0 }).eq('id', user.id);
+                }
             }
+            res.json({ message: 'Payment approved successfully.' });
+        } else {
+            await supabase.from('payments').update({ status: 'failed' }).eq('transaction_id', transaction_id);
+            res.json({ message: 'Payment rejected.' });
         }
-        res.json({ message: 'Payment approved' });
-    } else {
-        await supabase.from('payments').update({ status: 'failed' }).eq('transaction_id', transaction_id);
-        res.json({ message: 'Payment rejected' });
+    } catch (err) {
+        console.error('Admin verify payment error:', err);
+        res.status(500).json({ error: 'Failed to verify payment.' });
     }
 });
 
@@ -1427,12 +1438,12 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
     try {
         const { idempotencyKey } = req.body;
         const user = req.user;
-        if (!idempotencyKey) return res.status(400).json({ error: 'idempotencyKey required' });
+        if (!idempotencyKey) return res.status(400).json({ error: 'Missing payment reference.' });
 
         if (user.code_runner_unlocked) {
             return res.status(200).json({
                 alreadyActive: true,
-                message: 'You already have an active subscription.'
+                message: 'You already have an active Code Runner subscription.'
             });
         }
 
@@ -1447,7 +1458,7 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
         const { data: existing } = await supabase.from('payments').select('*').eq('transaction_id', idempotencyKey).maybeSingle();
         if (existing) {
             if (existing.status === 'completed') return res.json({ alreadyProcessed: true });
-            return res.status(409).json({ error: 'Payment already processing' });
+            return res.status(409).json({ error: 'A payment is already being processed.' });
         }
 
         const planName = `TechNovaphy Code Runner (${currency} ${humanAmount})`;
@@ -1483,7 +1494,8 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
             if (planData.status) {
                 planCode = planData.data.plan_code;
             } else {
-                throw new Error('Failed to create plan: ' + planData.message);
+                console.error('Paystack plan creation error:', planData);
+                return res.status(502).json({ error: 'Unable to set up subscription at this time.' });
             }
         }
 
@@ -1511,8 +1523,8 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
         const data = await response.json();
 
         if (!data.status) {
-            console.error('Code subscription error (Paystack):', data.message);
-            return res.status(502).json({ error: data.message || 'Subscription initialization failed' });
+            console.error('Paystack subscribe error:', data);
+            return res.status(502).json({ error: 'Payment initialization failed. Please try again.' });
         }
 
         await supabase.from('payments').insert({
@@ -1528,7 +1540,7 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
         res.json({ url: data.data.authorization_url, amount: humanAmount, currency: currency, subscription: true });
     } catch (err) {
         console.error('Code subscription error:', err.message);
-        res.status(500).json({ error: err.message });
+        res.status(500).json({ error: 'Unable to process subscription. Please try again later.' });
     }
 });
 
@@ -1543,11 +1555,11 @@ app.post('/api/run-code', auth, async (req, res) => {
         if (!isOwner) await acquireConcurrency();
         if (!isOwner && !user.code_runner_unlocked) {
             releaseConcurrency();
-            return res.status(403).json({ error: '💳 Subscribe to Code Runner to run code.', lock: true });
+            return res.status(403).json({ error: 'Please subscribe to Code Runner to run code.', lock: true });
         }
 
         const { language, version, code } = req.body;
-        if (!code) { releaseConcurrency(); return res.status(400).json({ error: 'No code provided' }); }
+        if (!code) { releaseConcurrency(); return res.status(400).json({ error: 'Please provide some code to run.' }); }
 
         const systemPrompt = `You are MiniMax M3, an expert coding assistant with strong reasoning and critical thinking skills.
 
@@ -1586,7 +1598,8 @@ ${code}
 
         if (!response.ok) {
             const errText = await response.text();
-            throw new Error(`MiniMax error: ${errText}`);
+            console.error('Code execution OpenRouter error:', errText);
+            throw new Error('Code analysis service is temporarily unavailable.');
         }
 
         res.setHeader('Content-Type', 'text/event-stream');
@@ -1625,9 +1638,12 @@ ${code}
 
     } catch (err) {
         console.error('Code execution error:', err);
-        if (!res.headersSent) res.status(500).json({ error: err.message || 'Internal server error' });
-        else res.write(`data: ${JSON.stringify({ type: 'error', message: err.message })}\n\n`);
-        res.end();
+        if (!res.headersSent) {
+            res.status(500).json({ error: 'Failed to analyze code. Please try again later.' });
+        } else {
+            res.write(`data: ${JSON.stringify({ type: 'error', message: 'Code analysis failed. Please try again later.' })}\n\n`);
+            res.end();
+        }
         releaseConcurrency();
     }
 });
@@ -1640,7 +1656,7 @@ app.get('/api/admin/stats', auth, async (req, res) => {
         const user = req.user;
         const isOwner = (OWNER_EMAIL && user.email === OWNER_EMAIL);
         if (!isOwner) {
-            return res.status(403).json({ error: 'Admin access only' });
+            return res.status(403).json({ error: 'Access restricted to administrators.' });
         }
 
         const { count: totalUsers, error: usersErr } = await supabase
@@ -1713,7 +1729,7 @@ app.get('/api/admin/stats', auth, async (req, res) => {
         });
     } catch (err) {
         console.error('Admin stats error:', err);
-        res.status(500).json({ error: err.message });
+        res.status(500).json({ error: 'Unable to load dashboard statistics.' });
     }
 });
 
@@ -1722,7 +1738,7 @@ app.get('/api/admin/users', auth, async (req, res) => {
         const user = req.user;
         const isOwner = (OWNER_EMAIL && user.email === OWNER_EMAIL);
         if (!isOwner) {
-            return res.status(403).json({ error: 'Admin access only' });
+            return res.status(403).json({ error: 'Access restricted to administrators.' });
         }
 
         const { data, error } = await supabase
@@ -1733,8 +1749,18 @@ app.get('/api/admin/users', auth, async (req, res) => {
         if (error) throw error;
         res.json({ users: data || [] });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        console.error('Admin users error:', err);
+        res.status(500).json({ error: 'Failed to load user list.' });
     }
+});
+
+// ============================================================
+//  GLOBAL ERROR HANDLER (catches any uncaught errors)
+// ============================================================
+app.use((err, req, res, next) => {
+    console.error('Unhandled error:', err);
+    if (res.headersSent) return next(err);
+    res.status(500).json({ error: 'An unexpected problem occurred. Please try again later.' });
 });
 
 // ============================================================
