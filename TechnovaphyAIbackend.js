@@ -13,7 +13,7 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcrypt');
 const { createClient } = require('@supabase/supabase-js');
 const crypto = require('crypto');
-const path = require('path'); // <-- for serving admin.html
+const path = require('path');
 
 // ---- Redis (optional) ----
 let redisClient = null;
@@ -221,16 +221,17 @@ function parseThinkingAndAnswer(rawText) {
 }
 
 // ============================================================
-//  SMART FAILOVER: OpenRouter models chain
+//  SMART FAILOVER: OpenRouter models chain (UPDATED)
 // ============================================================
 async function fetchAIResponseWithFailover(messages, userSelectedModel) {
+    // Updated to more reliable models – Groq is now primary
     const fallbackModels = [
-        'minimax/minimax-m3-preview',
-        'zai-org/glm-5.2',
+        'groq/llama-3.3-70b-versatile',   // fastest & most stable
+        'groq/llama3-70b-8192',
+        'anthropic/claude-haiku-4.5',
         'nvidia/nemotron-3-ultra',
-        'nvidia/nemotron-3-super',
-        'groq/llama-3.3-70b-versatile',
-        'anthropic/claude-haiku-4.5'
+        'zai-org/glm-5.2',
+        'minimax/minimax-m3-preview'
     ];
 
     const modelsToTry = [userSelectedModel, ...fallbackModels.filter(m => m !== userSelectedModel)];
@@ -258,12 +259,14 @@ async function fetchAIResponseWithFailover(messages, userSelectedModel) {
                 console.log(`✅ OpenRouter succeeded with ${model}`);
                 return { response, source: model };
             }
-            console.warn(`⚠️ ${model} failed (${response.status}) – trying next...`);
+            // Log failure details for debugging
+            const errorText = await response.text();
+            console.warn(`❌ ${model} failed (${response.status}): ${errorText.slice(0, 200)}`);
         } catch (err) {
-            console.warn(`⚠️ ${model} error: ${err.message}`);
+            console.warn(`⚠️ ${model} network error:`, err.message);
         }
     }
-    throw new Error('All AI models failed. Please try again later.');
+    throw new Error('All AI models failed. Please check OpenRouter API key and model availability.');
 }
 
 // ============================================================
@@ -381,7 +384,7 @@ app.get('/', (req, res) => res.send('TechNovaphy AI Backend'));
 app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 app.get('/api/ping', (req, res) => res.json({ status: 'ok' }));
 
-// ---- Serve admin dashboard (if admin.html exists in the same folder) ----
+// ---- Serve admin dashboard ----
 app.get('/admin', (req, res) => {
     res.sendFile(path.join(__dirname, 'admin.html'));
 });
@@ -727,7 +730,7 @@ app.post('/api/chat/stream', auth, async (req, res) => {
 
         const groqMessages = [{ role: 'system', content: systemPrompt }, ...conversation];
 
-        const userModel = req.body.model || 'minimax/minimax-m3-preview';
+        const userModel = req.body.model || 'groq/llama-3.3-70b-versatile'; // default changed to Groq
 
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
@@ -1088,7 +1091,7 @@ app.post('/api/run-code', auth, async (req, res) => {
             return res.status(400).json({ error: 'No code provided' });
         }
 
-        const systemPrompt = `You are TechNovaphy AI, an expert coding assistant with strong reasoning and critical thinking skills.
+        const systemPrompt = `You are MiniMax M3, an expert coding assistant with strong reasoning and critical thinking skills.
 
 You are helping a developer understand and improve their code.
 
@@ -1118,7 +1121,7 @@ ${code}
                 'HTTP-Referer': 'https://technovaphy.ai'
             },
             body: JSON.stringify({
-                model: 'minimax/minimax-m3-preview',
+                model: 'groq/llama-3.3-70b-versatile', // switch to Groq for reliability
                 messages: messages,
                 temperature: 0.7,
                 stream: true,
@@ -1128,7 +1131,7 @@ ${code}
 
         if (!response.ok) {
             const errText = await response.text();
-            throw new Error(`MiniMax error: ${errText}`);
+            throw new Error(`AI error: ${errText}`);
         }
 
         res.setHeader('Content-Type', 'text/event-stream');
@@ -1255,8 +1258,16 @@ app.get('/api/admin/stats', auth, async (req, res) => {
             .eq('code_runner_unlocked', true);
         if (codeErr) throw codeErr;
 
+        // 7. Count free users (added for admin dashboard)
+        const { count: totalFree, error: freeErr } = await supabase
+            .from('users')
+            .select('*', { count: 'exact', head: true })
+            .eq('tier', 'free');
+        if (freeErr) throw freeErr;
+
         res.json({
             totalUsers: totalUsers || 0,
+            totalFree: totalFree || 0,      // <-- now included
             activeUsers: activeUsers || 0,
             loggedInUsers: loggedInUsers || 0,
             totalRevenue: totalRevenue || 0,
