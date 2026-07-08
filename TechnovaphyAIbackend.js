@@ -1,11 +1,12 @@
 // ============================================================
 //  TECHNOVAPHY AI – PRODUCTION BACKEND
-//  - AI failover (OpenRouter models) preserves conversation
+//  - AI failover (OpenRouter, valid models only)
 //  - Admin dashboard, last_active tracking
 //  - Static route for admin.html
 //  - Payment integrations: Paystack, M‑Pesa, Airtel Money, manual bank
 //  - ALL USER-FACING ERROR MESSAGES SANITIZED
-//  - Code runner: web languages + Python (Pyodide-ready)
+//  - Code runner: web languages + Python (Pyodide‑ready)
+//  - Smart system prompt with company knowledge
 // ============================================================
 
 require('dotenv').config();
@@ -42,17 +43,14 @@ app.use(cors({
     optionsSuccessStatus: 200
 }));
 
-// ---- Environment checks ----
+// ---- Environment checks (only the essential ones) ----
 const required = [
     'SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'JWT_SECRET',
-    'OPENROUTER_API_KEY', 'PAYSTACK_SECRET_KEY',
-    'SAFARICOM_CONSUMER_KEY', 'SAFARICOM_CONSUMER_SECRET', 'SAFARICOM_PASSKEY',
-    'SAFARICOM_SHORTCODE', 'SAFARICOM_BUSINESS_SHORTCODE',
-    'AIRTEL_CLIENT_ID', 'AIRTEL_CLIENT_SECRET'
+    'OPENROUTER_API_KEY', 'PAYSTACK_SECRET_KEY'
 ];
 const missing = required.filter(key => !process.env[key]);
 if (missing.length) {
-    console.error('❌ Missing env variables:', missing.join(', '));
+    console.error('❌ Missing essential env variables:', missing.join(', '));
     process.exit(1);
 }
 
@@ -65,20 +63,20 @@ const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://your-frontend.netlify.app';
 const OWNER_EMAIL = process.env.OWNER_EMAIL || null;
 
-// M‑Pesa config
-const MPESA_CONSUMER_KEY = process.env.SAFARICOM_CONSUMER_KEY;
-const MPESA_CONSUMER_SECRET = process.env.SAFARICOM_CONSUMER_SECRET;
-const MPESA_PASSKEY = process.env.SAFARICOM_PASSKEY;
-const MPESA_SHORTCODE = process.env.SAFARICOM_SHORTCODE;
-const MPESA_BUSINESS_SHORTCODE = process.env.SAFARICOM_BUSINESS_SHORTCODE;
-const MPESA_CALLBACK_URL = process.env.MPESA_CALLBACK_URL || `${process.env.BASE_URL}/api/webhooks/mpesa`;
+// ---- M‑Pesa config (optional – app still starts if missing) ----
+const MPESA_CONSUMER_KEY = process.env.SAFARICOM_CONSUMER_KEY || '';
+const MPESA_CONSUMER_SECRET = process.env.SAFARICOM_CONSUMER_SECRET || '';
+const MPESA_PASSKEY = process.env.SAFARICOM_PASSKEY || '';
+const MPESA_SHORTCODE = process.env.SAFARICOM_SHORTCODE || '';
+const MPESA_BUSINESS_SHORTCODE = process.env.SAFARICOM_BUSINESS_SHORTCODE || '';
+const MPESA_CALLBACK_URL = process.env.MPESA_CALLBACK_URL || '';
 
-// Airtel config
-const AIRTEL_CLIENT_ID = process.env.AIRTEL_CLIENT_ID;
-const AIRTEL_CLIENT_SECRET = process.env.AIRTEL_CLIENT_SECRET;
+// ---- Airtel config (optional) ----
+const AIRTEL_CLIENT_ID = process.env.AIRTEL_CLIENT_ID || '';
+const AIRTEL_CLIENT_SECRET = process.env.AIRTEL_CLIENT_SECRET || '';
 const AIRTEL_COUNTRY = process.env.AIRTEL_COUNTRY || 'KE';
 const AIRTEL_CURRENCY = process.env.AIRTEL_CURRENCY || 'KES';
-const AIRTEL_CALLBACK_URL = process.env.AIRTEL_CALLBACK_URL || `${process.env.BASE_URL}/api/webhooks/airtel`;
+const AIRTEL_CALLBACK_URL = process.env.AIRTEL_CALLBACK_URL || '';
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
@@ -98,21 +96,33 @@ app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), as
     try {
         const signature = req.headers['x-paystack-signature'];
         if (!signature) return res.sendStatus(401);
+
         const expectedHash = crypto.createHmac('sha512', PAYSTACK_SECRET_KEY).update(req.body).digest('hex');
         if (expectedHash !== signature) return res.sendStatus(401);
+
         const payload = JSON.parse(req.body.toString('utf8'));
         const event = payload.event;
         const data = payload.data;
+
         if (event === 'charge.success') {
             const metadata = data.metadata || {};
             const userId = metadata.userId;
             const idempotencyKey = metadata.idempotencyKey;
             const type = metadata.type;
             const paystackStatus = data.status;
+
             if (paystackStatus !== 'success') return res.sendStatus(200);
-            const { data: paymentRecord } = await supabase.from('payments').select('*').eq('transaction_id', idempotencyKey).maybeSingle();
+
+            const { data: paymentRecord } = await supabase
+                .from('payments')
+                .select('*')
+                .eq('transaction_id', idempotencyKey)
+                .maybeSingle();
+
             if (!paymentRecord || paymentRecord.status === 'completed') return res.sendStatus(200);
+
             await supabase.from('payments').update({ status: 'completed' }).eq('transaction_id', idempotencyKey);
+
             if (userId) {
                 if (type === 'code_runner') {
                     await supabase.from('users').update({ code_runner_unlocked: true }).eq('id', userId);
@@ -167,10 +177,10 @@ const PAYMENT_CHANNELS = {
 };
 
 // ============================================================
-//  SYSTEM PROMPT – TECHNovaphy AI (Smart & Disciplined)
+//  SYSTEM PROMPT – Technovaphy AI (Smart & Disciplined)
 // ============================================================
 function buildSystemPrompt({ memoryPrompt, languageInstruction }) {
-  return `You are TechNovaphy AI, the official, highly intelligent assistant of TechNovaphy Solutions (https://technovaphy-solutions-5nz6.onrender.com). You are precise, disciplined, and thorough. You never hallucinate. You only provide information that you are highly confident about, and you always distinguish fact from opinion or uncertainty. When you don't know something, you clearly say "I don't know" and, if applicable, point the user to authoritative sources or the company's website.
+    return `You are TechNovaphy AI, the official, highly intelligent assistant of TechNovaphy Solutions (https://technovaphy-solutions-5nz6.onrender.com). You are precise, disciplined, and thorough. You never hallucinate. You only provide information that you are highly confident about, and you always distinguish fact from opinion or uncertainty. When you don't know something, you clearly say "I don't know" and, if applicable, point the user to authoritative sources or the company's website.
 
 🔗 COMPANY KNOWLEDGE – TechNovaphy Solutions:
 - Based in Nairobi, Kenya, serving 500+ businesses across East Africa.
@@ -221,7 +231,7 @@ function parseThinkingAndAnswer(rawText) {
 }
 
 // ============================================================
-//  AI FAILOVER CHAIN (OpenRouter) – with safe error
+//  AI FAILOVER CHAIN (OpenRouter) – valid models only
 // ============================================================
 async function fetchAIResponseWithFailover(messages, userSelectedModel) {
     if (!OPENROUTER_API_KEY) {
@@ -231,21 +241,18 @@ async function fetchAIResponseWithFailover(messages, userSelectedModel) {
     }
 
     const modelMap = {
-        'minimax/minimax-m3-preview': 'minimax/minimax-m3-preview',
-        'zai-org/glm-5.2': 'zai-org/glm-5.2',
-        'nvidia/nemotron-3-ultra': 'nvidia/nemotron-3-ultra',
-        'nvidia/nemotron-3-super': 'nvidia/nemotron-3-super',
-        'groq/llama-3.3-70b-versatile': 'groq/llama-3.3-70b-versatile',
-        'anthropic/claude-haiku-4.5': 'anthropic/claude-haiku-4.5'
+        'openai/gpt-4o-mini': 'openai/gpt-4o-mini',
+        'anthropic/claude-haiku-4.5': 'anthropic/claude-haiku-4.5',
+        'google/gemini-2.0-flash-001': 'google/gemini-2.0-flash-001',
+        'meta-llama/llama-4-maverick:free': 'meta-llama/llama-4-maverick:free'
     };
 
-    const primary = modelMap[userSelectedModel] || 'minimax/minimax-m3-preview';
+    const primary = modelMap[userSelectedModel] || 'openai/gpt-4o-mini';
     const fallbacks = [
-        'minimax/minimax-m3-preview',
-        'zai-org/glm-5.2',
-        'nvidia/nemotron-3-ultra',
-        'groq/llama-3.3-70b-versatile',
-        'anthropic/claude-haiku-4.5'
+        'openai/gpt-4o-mini',
+        'anthropic/claude-haiku-4.5',
+        'google/gemini-2.0-flash-001',
+        'meta-llama/llama-4-maverick:free'
     ];
     const modelsToTry = [primary, ...fallbacks.filter(m => m !== primary)];
 
@@ -799,7 +806,7 @@ app.post('/api/chat/stream', auth, async (req, res) => {
         const systemPrompt = buildSystemPrompt({ memoryPrompt, languageInstruction });
 
         const groqMessages = [{ role: 'system', content: systemPrompt }, ...conversation];
-        const userModel = req.body.model || 'minimax/minimax-m3-preview';
+        const userModel = req.body.model || 'openai/gpt-4o-mini';
 
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
@@ -940,10 +947,10 @@ app.get('/api/pricing', auth, async (req, res) => {
             interval: 'monthly'
         };
 
+        // tell frontend which direct channels are available (if configured)
         const directChannels = [];
-        if (countryCode === 'KE') {
-            directChannels.push('mpesa', 'airtel_money');
-        }
+        if (MPESA_CONSUMER_KEY && MPESA_CONSUMER_SECRET) directChannels.push('mpesa');
+        if (AIRTEL_CLIENT_ID && AIRTEL_CLIENT_SECRET) directChannels.push('airtel_money');
         directChannels.push('bank_transfer');
 
         res.json({
@@ -1057,9 +1064,12 @@ app.post('/api/create-checkout', auth, async (req, res) => {
 });
 
 // ============================================================
-//  M-PESA DIRECT (SAFARICOM DARAJA)
+//  M-PESA DIRECT (SAFARICOM DARAJA) – only if credentials exist
 // ============================================================
 app.post('/api/mpesa/stkpush', auth, async (req, res) => {
+    if (!MPESA_CONSUMER_KEY || !MPESA_CONSUMER_SECRET) {
+        return res.status(503).json({ error: 'M-Pesa payments are not available at this time.' });
+    }
     try {
         const { idempotencyKey, phone, amount, tier } = req.body;
         const user = req.user;
@@ -1074,6 +1084,7 @@ app.post('/api/mpesa/stkpush', auth, async (req, res) => {
         }
 
         const auth = Buffer.from(`${MPESA_CONSUMER_KEY}:${MPESA_CONSUMER_SECRET}`).toString('base64');
+        // Use sandbox for testing, change to api.safaricom.co.ke for production
         const tokenRes = await fetch('https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials', {
             headers: { Authorization: `Basic ${auth}` }
         });
@@ -1137,7 +1148,7 @@ app.post('/api/mpesa/stkpush', auth, async (req, res) => {
     }
 });
 
-// ---- M-Pesa Webhook ----
+// ---- M-Pesa Webhook (no change needed) ----
 app.post('/api/webhooks/mpesa', express.json(), async (req, res) => {
     try {
         const callback = req.body.Body?.stkCallback;
@@ -1187,9 +1198,12 @@ app.post('/api/webhooks/mpesa', express.json(), async (req, res) => {
 });
 
 // ============================================================
-//  AIRTEL MONEY DIRECT
+//  AIRTEL MONEY DIRECT – only if credentials exist
 // ============================================================
 app.post('/api/airtel/request', auth, async (req, res) => {
+    if (!AIRTEL_CLIENT_ID || !AIRTEL_CLIENT_SECRET) {
+        return res.status(503).json({ error: 'Airtel Money payments are not available at this time.' });
+    }
     try {
         const { idempotencyKey, phone, amount, tier } = req.body;
         const user = req.user;
