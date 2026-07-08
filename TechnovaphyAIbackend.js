@@ -1,9 +1,6 @@
-// ============================================================
-//  TECHNOVAPHY AI – BACKEND (OpenRouter Primary)
-//  OpenRouter (MiniMax M3, Claude Haiku) + Groq Vision
-//  Admin dashboard | last_active tracking | Multer
-// ============================================================
 
+
+// Load environment variables
 require('dotenv').config();
 
 const express = require('express');
@@ -13,7 +10,6 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcrypt');
 const { createClient } = require('@supabase/supabase-js');
 const crypto = require('crypto');
-const multer = require('multer');
 
 // ---- Redis (optional) ----
 let redisClient = null;
@@ -22,11 +18,25 @@ try {
     const redis = require('redis');
     if (process.env.REDIS_URL) {
         redisClient = redis.createClient({ url: process.env.REDIS_URL });
-        redisClient.on('error', () => { redisAvailable = false; });
-        redisClient.connect().then(() => { redisAvailable = true; }).catch(() => { redisAvailable = false; });
+        redisClient.on('error', (err) => {
+            console.warn('⚠️ Redis error, falling back to memory:', err.message);
+            redisAvailable = false;
+        });
+        redisClient.connect().then(() => {
+            redisAvailable = true;
+            console.log('✅ Redis connected');
+        }).catch(() => {
+            redisAvailable = false;
+            console.warn('⚠️ Redis connection failed, using memory fallback');
+        });
+    } else {
+        console.log('ℹ️ REDIS_URL not set, using in‑memory fallback');
     }
-} catch (e) {}
+} catch (e) {
+    console.log('ℹ️ Redis package not installed, using in‑memory fallback');
+}
 
+// ---- Express app ----
 const app = express();
 app.set('trust proxy', 1);
 
@@ -34,11 +44,12 @@ app.use(cors({
     origin: process.env.FRONTEND_URL || '*',
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'Accept'],
-    credentials: true
+    credentials: true,
+    optionsSuccessStatus: 200
 }));
 
 // ---- Environment checks ----
-const required = ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'JWT_SECRET', 'OPENROUTER_API_KEY', 'GROQ_API_KEY', 'PAYSTACK_SECRET_KEY'];
+const required = ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'JWT_SECRET', 'OPENROUTER_API_KEY', 'PAYSTACK_SECRET_KEY'];
 const missing = required.filter(key => !process.env[key]);
 if (missing.length) {
     console.error('❌ Missing env variables:', missing.join(', '));
@@ -50,14 +61,12 @@ const JWT_SECRET = process.env.JWT_SECRET;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
-const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://your-frontend.netlify.app';
 const OWNER_EMAIL = process.env.OWNER_EMAIL || null;
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
-// ---- Database init ----
 (async function initDb() {
     try {
         const { error } = await supabase.from('users').select('id').limit(1);
@@ -68,19 +77,11 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
     }
 })();
 
-// ---- Multer config ----
-const storage = multer.memoryStorage();
-const fileFilter = (req, file, cb) => {
-    const allowedTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'text/plain', 'text/csv', 'application/pdf'];
-    if (allowedTypes.includes(file.mimetype)) {
-        cb(null, true);
-    } else {
-        cb(new Error('Unsupported file type'), false);
-    }
-};
-const upload = multer({ storage, limits: { fileSize: 10 * 1024 * 1024 }, fileFilter });
-
-// ---- PAYSTACK WEBHOOK ----
+// ============================================================
+//  PAYSTACK WEBHOOK (must be before express.json())
+//  This is the ONLY place that ever grants a paid entitlement.
+//  The HMAC signature check below is what proves money actually moved.
+// ============================================================
 app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), async (req, res) => {
     try {
         const signature = req.headers['x-paystack-signature'];
@@ -93,12 +94,15 @@ app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), as
         const event = payload.event;
         const data = payload.data;
 
+        // FIX: we only ever act on a genuinely successful charge event.
+        // 'subscription.create' by itself does NOT prove a payment cleared,
+        // so it is no longer treated as a trigger for unlocking anything.
         if (event === 'charge.success') {
             const metadata = data.metadata || {};
             const userId = metadata.userId;
             const idempotencyKey = metadata.idempotencyKey;
-            const type = metadata.type;
-            const paystackStatus = data.status;
+            const type = metadata.type; // 'code_runner' or undefined
+            const paystackStatus = data.status; // should be 'success'
 
             if (paystackStatus !== 'success') return res.sendStatus(200);
 
@@ -158,78 +162,18 @@ const CODE_RUNNER_PRICE_KES = 1000;
 const MAX_CONVERSATION_HISTORY = 20;
 
 const PAYMENT_CHANNELS = {
-    KE: {
-        country: 'Kenya',
-        currency: 'KES',
-        displayNames: {
-            'card': '💳 Card',
-            'mpesa': '📱 M-Pesa',
-            'mobile_money': '📱 Airtel Money',
-            'bank_transfer': '🏦 Bank Transfer (Paybill)'
-        }
-    },
-    NG: {
-        country: 'Nigeria',
-        currency: 'NGN',
-        displayNames: {
-            'card': '💳 Card',
-            'bank_transfer': '🏦 Bank Transfer'
-        }
-    },
-    GH: {
-        country: 'Ghana',
-        currency: 'GHS',
-        displayNames: {
-            'card': '💳 Card',
-            'bank_transfer': '🏦 Bank Transfer'
-        }
-    },
-    UG: {
-        country: 'Uganda',
-        currency: 'UGX',
-        displayNames: {
-            'card': '💳 Card',
-            'bank_transfer': '🏦 Bank Transfer'
-        }
-    },
-    TZ: {
-        country: 'Tanzania',
-        currency: 'TZS',
-        displayNames: {
-            'card': '💳 Card',
-            'bank_transfer': '🏦 Bank Transfer'
-        }
-    }
+    KE: { country: 'Kenya', currency: 'KES', channels: ['card', 'bank_transfer', 'mpesa'], displayNames: { 'card': '💳 Card', 'bank_transfer': '🏦 Bank Transfer', 'mpesa': '📱 M-Pesa' } },
+    NG: { country: 'Nigeria', currency: 'NGN', channels: ['card', 'bank_transfer', 'ussd', 'bank'], displayNames: { 'card': '💳 Card', 'bank_transfer': '🏦 Bank Transfer', 'ussd': '📞 USSD', 'bank': '📱 Mobile Banking' } },
+    GH: { country: 'Ghana', currency: 'GHS', channels: ['card', 'bank_transfer'], displayNames: { 'card': '💳 Card', 'bank_transfer': '🏦 Bank Transfer' } },
+    UG: { country: 'Uganda', currency: 'UGX', channels: ['card', 'bank_transfer'], displayNames: { 'card': '💳 Card', 'bank_transfer': '🏦 Bank Transfer' } },
+    TZ: { country: 'Tanzania', currency: 'TZS', channels: ['card', 'bank_transfer'], displayNames: { 'card': '💳 Card', 'bank_transfer': '🏦 Bank Transfer' } }
 };
 
 // ============================================================
-//  SYSTEM PROMPT (with TechNovaphy Solutions info)
+//  SYSTEM PROMPT
 // ============================================================
 function buildSystemPrompt({ memoryPrompt, languageInstruction }) {
-    return `You are TechNovaphy AI, the official AI assistant for TechNovaphy Solutions.
-
-🔗 WEBSITE & COMPANY INFO:
-TechNovaphy Solutions (https://technovaphy-solutions-5nz6.onrender.com) is an enterprise IT and web development company based in Nairobi, Kenya.
-We serve over 500 businesses across East Africa, providing:
-- Managed IT Operations (99.9% uptime guarantee)
-- Business Software (custom ERPs and automated workflows)
-- Cloud Solutions (data migration and automated backups)
-- 24/7 Technical Support
-- Web Development (business websites, e-commerce, web apps, PWAs, admin dashboards, APIs)
-- Technology Stack: HTML5, CSS3, JavaScript, React, TypeScript, Tailwind CSS, Node.js, Express.js, Python, Flask, Java, Spring Boot, PostgreSQL, MySQL, MongoDB, SQL Server, Redis, Firebase, Docker, Render, Vercel, AWS, Cloudflare
-
-📋 SUPPORT PLANS (prices in KES):
-Website Maintenance Plans:
-- Bronze: KSh 10k/mo – Updates, security patches, bug fixes, email support (24-48hrs)
-- Silver: KSh 20k/mo – Everything in Bronze + 24/7 uptime monitoring, monthly reports, WhatsApp support (4hrs), SEO monitoring
-- Gold: KSh 35k/mo – Everything in Silver + 24/7 dedicated support, security audits, weekly analytics, feature development (5hrs/mo), phone support
-
-IT Support Plans:
-- Standard IT: KSh 15k/mo – Remote support, cloud backup, monthly reports
-- Managed Pro: KSh 50k/mo – On-site maintenance, software dev support, priority helpdesk
-- Premium Website: KSh 120k (one-time) – Full website development
-
-Free IT Infrastructure Audit (worth KES 50,000) – available at https://technovaphy-solutions-5nz6.onrender.com
+    return `You are TechNovaphy AI, built for African freelancers and businesses.
 
 RESPOND WITH THIS FORMAT:
 
@@ -248,8 +192,6 @@ RULES:
 - If you give advice, clearly state "This is for informational purposes only."
 - For financial/legal topics, flag uncertainty plainly.
 - For code, provide working examples and explain them.
-- Only mention the website (https://technovaphy-solutions-5nz6.onrender.com) and services if the user asks about TechNovaphy, the company, pricing, or support.
-- **Important:** If the user attaches a file, the content of the file will be included in their message. Always read and respond to the file content directly.
 
 ${memoryPrompt}
 ${languageInstruction}`;
@@ -266,101 +208,74 @@ function parseThinkingAndAnswer(rawText) {
     else if (thinkOpen && !answerOpen) thinking = thinkOpen[1];
     if (answerClosed) answer = answerClosed[1];
     else if (answerOpen) answer = answerOpen[1];
-    if (!thinking && !answer && rawText.trim()) answer = rawText;
+
+    // FIX: previously, if the model never emitted an <answer> tag at all
+    // (MiniMax M3 sometimes rambles entirely inside <thinking> and never
+    // opens <answer>, especially on long or truncated streams), `answer`
+    // stayed '' forever - including in the final 'done' event. That
+    // silently produced a genuinely empty response every time this
+    // happened. Now we fall back instead of dropping the content:
+    if (!answer) {
+        if (thinkClosed) {
+            // There IS a closed <thinking> block - anything after it is
+            // the real answer, even if it wasn't wrapped in <answer>.
+            const afterThinking = rawText.slice(rawText.indexOf(thinkClosed[0]) + thinkClosed[0].length).trim();
+            if (afterThinking) answer = afterThinking;
+        }
+        if (!answer && rawText.trim()) {
+            // No usable <answer> tag ever appeared (open or closed), and/or
+            // <thinking> never closed. Rather than show a blank bubble,
+            // surface the raw content with tag markers stripped out.
+            answer = rawText.replace(/<\/?thinking>/gi, '').replace(/<\/?answer>/gi, '').trim();
+        }
+    }
     return { thinking: thinking.trim(), answer: answer.trim() };
 }
 
 // ============================================================
-//  AI CALLERS – OpenRouter (primary) + Groq Vision (images)
+//  SMART FAILOVER: OpenRouter models chain
 // ============================================================
+async function fetchAIResponseWithFailover(messages, userSelectedModel) {
+    const fallbackModels = [
+        'minimax/minimax-m3-preview',
+        'zai-org/glm-5.2',
+        'nvidia/nemotron-3-ultra',
+        'nvidia/nemotron-3-super',
+        'groq/llama-3.3-70b-versatile',
+        'anthropic/claude-haiku-4.5'
+    ];
 
-// ---- OpenRouter call (supports MiniMax, Claude, Groq, etc.) ----
-async function callOpenRouter(messages, model = 'minimax/minimax-m3-preview') {
-    const url = 'https://openrouter.ai/api/v1/chat/completions';
-    const payload = {
-        model: model,
-        messages: messages,
-        temperature: 0.7,
-        top_p: 0.9,
-        stream: true,
-        max_tokens: 2000
-    };
-    const response = await fetch(url, {
-        method: 'POST',
-        headers: {
-            'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
-            'Content-Type': 'application/json',
-            'HTTP-Referer': 'https://technovaphy-solutions-5nz6.onrender.com'
-        },
-        body: JSON.stringify(payload)
-    });
-    if (!response.ok) {
-        const errText = await response.text();
-        throw new Error(`OpenRouter error (${response.status}): ${errText}`);
-    }
-    return response;
-}
+    const modelsToTry = [userSelectedModel, ...fallbackModels.filter(m => m !== userSelectedModel)];
 
-// ---- Groq Vision (for images) ----
-async function callGroqVision(messages) {
-    const url = 'https://api.groq.com/openai/v1/chat/completions';
-    const payload = {
-        model: 'llama-3.2-11b-vision-preview',
-        messages: messages,
-        temperature: 0.7,
-        top_p: 0.9,
-        stream: true,
-        max_tokens: 2000
-    };
-    const response = await fetch(url, {
-        method: 'POST',
-        headers: {
-            'Authorization': `Bearer ${GROQ_API_KEY}`,
-            'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(payload)
-    });
-    if (!response.ok) {
-        const errText = await response.text();
-        throw new Error(`Groq Vision error (${response.status}): ${errText}`);
-    }
-    return response;
-}
+    for (const model of modelsToTry) {
+        try {
+            console.log(`🔄 Attempting OpenRouter (${model})...`);
+            const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
+                    'Content-Type': 'application/json',
+                    'HTTP-Referer': 'https://technovaphy.ai'
+                },
+                body: JSON.stringify({
+                    model: model,
+                    messages: messages,
+                    temperature: 0.7,
+                    top_p: 0.9,
+                    stream: true
+                })
+            });
 
-// ---- Main failover: OpenRouter → Groq Vision → fallback ----
-async function fetchAIResponseWithFailover(messages, userSelectedModel, hasImage = false) {
-    // If there are images, use Groq Vision
-    if (hasImage) {
-        const response = await callGroqVision(messages);
-        return { response, source: 'groq-vision' };
-    }
-
-    // Map frontend model names to OpenRouter model slugs
-    const modelMap = {
-        'minimax/minimax-m3-preview': 'minimax/minimax-m3-preview',
-        'groq/llama-3.3-70b-versatile': 'groq/llama-3.3-70b-versatile'
-    };
-    const primaryModel = modelMap[userSelectedModel] || 'minimax/minimax-m3-preview';
-    const fallbackModels = ['anthropic/claude-haiku-4.5', 'google/gemini-2-flash-lite-preview-02-05'];
-
-    // Try the user's chosen model first
-    try {
-        const response = await callOpenRouter(messages, primaryModel);
-        return { response, source: primaryModel };
-    } catch (primaryErr) {
-        console.warn(`⚠️ ${primaryModel} failed, trying fallbacks:`, primaryErr.message);
-        // Try fallback models
-        for (const fallbackModel of fallbackModels) {
-            try {
-                const response = await callOpenRouter(messages, fallbackModel);
-                console.log(`✅ Fallback succeeded with ${fallbackModel}`);
-                return { response, source: fallbackModel };
-            } catch (fallbackErr) {
-                console.warn(`⚠️ ${fallbackModel} failed:`, fallbackErr.message);
+            if (response.ok) {
+                console.log(`✅ OpenRouter succeeded with ${model}`);
+                return { response, source: model };
             }
+            console.warn(`⚠️ ${model} failed (${response.status}) – trying next...`);
+        } catch (err) {
+            console.warn(`⚠️ ${model} error: ${err.message}`);
         }
-        throw new Error('All AI models failed. Please try again later.');
     }
+    throw new Error('All AI models failed. Please try again later.');
 }
 
 // ============================================================
@@ -391,7 +306,6 @@ async function saveConversation(userId, messages) {
     if (error) throw new Error('Failed to save conversation: ' + error.message);
 }
 
-// ---- Rate limiting ----
 const inMemoryRate = new Map();
 const RATE_LIMIT_WINDOW = 60 * 1000;
 const RATE_LIMIT_MAX = 10;
@@ -428,7 +342,6 @@ if (!redisAvailable) {
     }, 60 * 1000);
 }
 
-// ---- Concurrency ----
 const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT_REQUESTS) || 10000;
 let activeRequests = 0;
 const concurrencyQueue = [];
@@ -465,7 +378,6 @@ const auth = async (req, res, next) => {
         const user = await findUserById(decoded.userId);
         if (!user) return res.status(401).json({ error: 'User not found' });
         req.user = user;
-        await supabase.from('users').update({ last_active: new Date().toISOString() }).eq('id', user.id);
         next();
     } catch (e) {
         res.status(401).json({ error: 'Invalid or expired token' });
@@ -505,8 +417,7 @@ app.post('/api/auth/register', async (req, res) => {
             memory: '',
             role: 'user',
             country: country,
-            code_runner_unlocked: false,
-            last_active: now.toISOString()
+            code_runner_unlocked: false
         }).select().single();
 
         if (error) throw new Error('DB insert: ' + error.message);
@@ -532,7 +443,6 @@ app.post('/api/auth/login', async (req, res) => {
         if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
 
         const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '7d' });
-        await supabase.from('users').update({ last_active: new Date().toISOString() }).eq('id', user.id);
         res.json({ token, verified: true, country: user.country });
     } catch (err) {
         console.error('Login error:', err);
@@ -622,18 +532,6 @@ app.get('/api/conversations/:conversationId', auth, async (req, res) => {
 
 app.post('/api/conversations', auth, async (req, res) => {
     try {
-        const { data: existing, error: findError } = await supabase
-            .from('conversations')
-            .select('*')
-            .eq('user_id', req.user.id)
-            .maybeSingle();
-
-        if (findError && findError.code !== 'PGRST116') throw findError;
-
-        if (existing) {
-            return res.status(200).json({ conversation: existing });
-        }
-
         const { data, error } = await supabase.from('conversations').insert({
             user_id: req.user.id,
             messages: [],
@@ -644,7 +542,6 @@ app.post('/api/conversations', auth, async (req, res) => {
         if (error) throw error;
         res.status(201).json({ conversation: data });
     } catch (err) {
-        console.error('Create conversation error:', err);
         res.status(500).json({ error: err.message });
     }
 });
@@ -663,44 +560,8 @@ app.delete('/api/conversations/:conversationId', auth, async (req, res) => {
     }
 });
 
-app.post('/api/conversations/clear', auth, async (req, res) => {
-    try {
-        const { data: existing, error: findError } = await supabase
-            .from('conversations')
-            .select('*')
-            .eq('user_id', req.user.id)
-            .maybeSingle();
-
-        if (findError && findError.code !== 'PGRST116') throw findError;
-
-        if (!existing) {
-            const { data, error } = await supabase.from('conversations').insert({
-                user_id: req.user.id,
-                messages: [],
-                created_at: new Date().toISOString(),
-                updated_at: new Date().toISOString()
-            }).select().single();
-            if (error) throw error;
-            return res.status(201).json({ conversation: data });
-        }
-
-        const { data, error } = await supabase
-            .from('conversations')
-            .update({ messages: [], updated_at: new Date().toISOString() })
-            .eq('id', existing.id)
-            .select()
-            .single();
-
-        if (error) throw error;
-        res.json({ conversation: data });
-    } catch (err) {
-        console.error('Clear conversation error:', err);
-        res.status(500).json({ error: err.message });
-    }
-});
-
 // ============================================================
-//  PROJECTS
+//  PROJECTS (CRUD)
 // ============================================================
 app.get('/api/projects', auth, async (req, res) => {
     try {
@@ -767,79 +628,44 @@ app.delete('/api/projects/:id', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CHAT STREAM (with OpenRouter)
+//  CHAT STREAM
 // ============================================================
-app.post('/api/chat/stream', auth, upload.array('files', 5), async (req, res) => {
+app.post('/api/chat/stream', auth, async (req, res) => {
     try {
         const user = req.user;
         const isOwner = (OWNER_EMAIL && user.email === OWNER_EMAIL);
 
-        if (!isOwner) await acquireConcurrency();
+        if (!isOwner) {
+            await acquireConcurrency();
+        }
+
         if (!isOwner && !await checkRateLimit(user.id)) {
             releaseConcurrency();
             return res.status(429).json({ error: 'Too many requests' });
         }
+
         const monthlyLimit = getLimit(user.tier);
         if (!isOwner && user.usage_count >= monthlyLimit) {
             releaseConcurrency();
             return res.status(403).json({ error: 'Monthly limit reached' });
         }
 
-        // ---- Parse messages ----
-        let messages;
-        try {
-            messages = JSON.parse(req.body.messages);
-        } catch (e) {
+        let conversation = await getConversation(user.id);
+        let newMessages;
+        try { newMessages = JSON.parse(req.body.messages); } catch (e) {
             releaseConcurrency();
             return res.status(400).json({ error: 'Invalid messages format' });
         }
+        conversation = conversation.concat(newMessages);
 
-        // ---- Handle uploaded files ----
-        const files = req.files || [];
-        const imageUrls = [];
-        let fileTextContent = '';
-
-        console.log(`📎 Received ${files.length} file(s)`);
-
-        for (const file of files) {
-            console.log(`📄 Processing file: ${file.originalname} (${file.mimetype}, ${file.size} bytes)`);
-            if (file.mimetype.startsWith('image/')) {
-                const base64 = file.buffer.toString('base64');
-                const dataUrl = `data:${file.mimetype};base64,${base64}`;
-                imageUrls.push({ type: 'image_url', image_url: { url: dataUrl } });
-            } else {
-                try {
-                    const text = file.buffer.toString('utf-8');
-                    const truncated = text.length > 50000 ? text.substring(0, 50000) + '\n... (truncated)' : text;
-                    fileTextContent += `\n\n--- 📄 File: ${file.originalname} (${file.mimetype}) ---\n${truncated}\n--- End of file ---`;
-                } catch (e) {
-                    fileTextContent += `\n\n[File: ${file.originalname} – could not read as text]`;
-                }
-            }
-        }
-
-        // ---- Build conversation ----
-        let conversation = await getConversation(user.id);
-        let userContent = messages[messages.length - 1]?.content || '';
-
-        const hasImage = imageUrls.length > 0;
-        const finalUserContent = userContent + fileTextContent;
-
-        if (hasImage) {
-            const finalUserMessage = {
-                role: 'user',
-                content: [{ type: 'text', text: finalUserContent || '[Attached image]' }, ...imageUrls]
-            };
-            messages.pop();
-            messages.push(finalUserMessage);
-        } else {
-            messages[messages.length - 1].content = finalUserContent || '[Attached files]';
-        }
-
-        conversation = conversation.concat(messages);
         if (conversation.length > MAX_CONVERSATION_HISTORY) {
             conversation = conversation.slice(-MAX_CONVERSATION_HISTORY);
         }
+
+        const userContent = conversation[conversation.length - 1]?.content || '';
+        const finalUserMessage = { role: 'user', content: userContent };
+        conversation.pop();
+        conversation.push(finalUserMessage);
 
         if (!isOwner) {
             await supabase.from('users').update({ usage_count: (user.usage_count || 0) + 1 }).eq('id', user.id);
@@ -853,14 +679,9 @@ app.post('/api/chat/stream', auth, upload.array('files', 5), async (req, res) =>
         const memoryPrompt = user.memory ? `\n\nUser context: ${user.memory}` : '';
         const systemPrompt = buildSystemPrompt({ memoryPrompt, languageInstruction });
 
-        const userModel = req.body.model || 'minimax/minimax-m3-preview';
         const groqMessages = [{ role: 'system', content: systemPrompt }, ...conversation];
 
-        // ---- Log what we're sending (for debugging) ----
-        const lastUserMsg = groqMessages[groqMessages.length - 1];
-        console.log('📤 Sending to AI – user message length:', lastUserMsg?.content?.length || 0);
-        if (fileTextContent) console.log('📄 File content included (first 200 chars):', fileTextContent.substring(0, 200));
-        if (hasImage) console.log('🖼️ Images detected – using Groq Vision');
+        const userModel = req.body.model || 'minimax/minimax-m3-preview';
 
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
@@ -872,12 +693,16 @@ app.post('/api/chat/stream', auth, upload.array('files', 5), async (req, res) =>
             originalEnd.apply(res, args);
         };
 
-        const { response: aiResponse, source } = await fetchAIResponseWithFailover(groqMessages, userModel, hasImage);
-        if (!aiResponse.ok) throw new Error(`AI error ${aiResponse.status}`);
+        const { response: aiResponse, source } = await fetchAIResponseWithFailover(groqMessages, userModel);
+
+        if (!aiResponse.ok) {
+            throw new Error(`AI error ${aiResponse.status}`);
+        }
 
         const reader = aiResponse.body.getReader();
         const decoder = new TextDecoder();
         let buffer = '', rawContent = '';
+
         while (true) {
             const { done, value } = await reader.read();
             if (done) break;
@@ -902,6 +727,7 @@ app.post('/api/chat/stream', auth, upload.array('files', 5), async (req, res) =>
                 }
             }
         }
+
         const { thinking: finalThinking, answer: finalAnswer } = parseThinkingAndAnswer(rawContent);
         conversation.push({ role: 'assistant', content: finalAnswer });
         await saveConversation(user.id, conversation);
@@ -915,15 +741,18 @@ app.post('/api/chat/stream', auth, upload.array('files', 5), async (req, res) =>
 
     } catch (err) {
         console.error('Chat error:', err);
-        if (!res.headersSent) res.status(500).json({ error: err.message });
-        else res.write(`data: ${JSON.stringify({ type: 'error', message: err.message })}\n\n`);
-        res.end();
+        if (!res.headersSent) {
+            res.status(500).json({ error: err.message });
+        } else {
+            res.write(`data: ${JSON.stringify({ type: 'error', message: err.message })}\n\n`);
+            res.end();
+        }
         releaseConcurrency();
     }
 });
 
 // ============================================================
-//  EXCHANGE RATES
+//  EXCHANGE RATES (shared by pricing + checkout)
 // ============================================================
 let exchangeRates = { KES: 1 };
 let ratesLastFetched = 0;
@@ -944,7 +773,7 @@ async function fetchExchangeRates() {
 }
 
 // ============================================================
-//  PRICING
+//  PRICING – powers the frontend's Upgrade / Pricing screen
 // ============================================================
 app.get('/api/pricing', auth, async (req, res) => {
     try {
@@ -975,7 +804,7 @@ app.get('/api/pricing', auth, async (req, res) => {
             codeRunnerUnlocked: user.code_runner_unlocked || false,
             tiers,
             codeRunner,
-            channels: countryInfo.channels ? Object.keys(countryInfo.displayNames) : ['card', 'bank_transfer'],
+            channels: countryInfo.channels,
             country: countryCode
         });
     } catch (err) {
@@ -985,7 +814,8 @@ app.get('/api/pricing', auth, async (req, res) => {
 });
 
 // ============================================================
-//  PAYMENT STATUS
+//  PAYMENT STATUS – lets the frontend safely poll after redirect
+//  back from Paystack, instead of ever trusting the client.
 // ============================================================
 app.get('/api/payment-status/:key', auth, async (req, res) => {
     try {
@@ -1001,7 +831,7 @@ app.get('/api/payment-status/:key', auth, async (req, res) => {
         if (!data) return res.status(404).json({ error: 'Payment not found' });
 
         res.json({
-            status: data.status,
+            status: data.status, // 'pending' | 'completed'
             tier: data.tier,
             currency: data.currency,
             amount: data.amount
@@ -1043,19 +873,6 @@ app.post('/api/create-checkout', auth, async (req, res) => {
 
         if (!PAYSTACK_SECRET_KEY) return res.status(503).json({ error: 'Payment service not configured' });
 
-        let channels = ['card', 'bank_transfer'];
-        if (countryInfo.displayNames) {
-            for (const ch of Object.keys(countryInfo.displayNames)) {
-                if (!channels.includes(ch)) channels.push(ch);
-            }
-        }
-        if (countryCode === 'KE') {
-            if (!channels.includes('mpesa')) channels.push('mpesa');
-            if (!channels.includes('mobile_money')) channels.push('mobile_money');
-        }
-
-        console.log('🔗 Sending channels (create-checkout):', channels);
-
         const response = await fetch('https://api.paystack.co/transaction/initialize', {
             method: 'POST',
             headers: { 'Authorization': `Bearer ${PAYSTACK_SECRET_KEY}`, 'Content-Type': 'application/json' },
@@ -1063,7 +880,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
                 email: user.email,
                 amount: amount,
                 currency: finalCurrency,
-                channels: channels,
+                channels: countryInfo.channels,
                 metadata: { idempotencyKey, tier, userId: user.id, country: countryCode },
                 callback_url: `${FRONTEND_URL}/?success=true&key=${idempotencyKey}`
             })
@@ -1089,7 +906,19 @@ app.post('/api/create-checkout', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CODE RUNNER SUBSCRIPTION
+//  CODE RUNNER SUBSCRIPTION (fixed price/month)
+//
+//  FIX: this used to call Paystack's raw /subscription endpoint (which
+//  requires the customer to already have a saved card) and, on ANY
+//  Paystack error mentioning "already subscribed", it unlocked the
+//  feature with no payment check at all. That is the bug that let
+//  people get access just by tapping the button.
+//
+//  Now it follows the exact same pattern as /api/create-checkout:
+//  we initialize a real Paystack transaction with the plan attached.
+//  Paystack handles first payment + auto-creates the recurring
+//  subscription on success. The ONLY place access is ever granted is
+//  the signature-verified webhook above, after a real charge.success.
 // ============================================================
 app.post('/api/subscribe-code', auth, async (req, res) => {
     try {
@@ -1100,7 +929,7 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
         if (user.code_runner_unlocked) {
             return res.status(200).json({
                 alreadyActive: true,
-                message: 'You already have an active subscription.'
+                message: 'You already have an active subscription. Enjoy unlimited code execution!'
             });
         }
 
@@ -1144,7 +973,7 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
                     amount: amountInMinor,
                     currency: currency,
                     interval: 'monthly',
-                    description: 'Monthly subscription to unlock code runner'
+                    description: 'Monthly subscription to unlock the code runner'
                 })
             });
             const planData = await createPlan.json();
@@ -1155,19 +984,10 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
             }
         }
 
-        let channels = ['card', 'bank_transfer'];
-        if (countryInfo.displayNames) {
-            for (const ch of Object.keys(countryInfo.displayNames)) {
-                if (!channels.includes(ch)) channels.push(ch);
-            }
-        }
-        if (countryCode === 'KE') {
-            if (!channels.includes('mpesa')) channels.push('mpesa');
-            if (!channels.includes('mobile_money')) channels.push('mobile_money');
-        }
-
-        console.log('🔗 Sending channels (subscribe-code):', channels);
-
+        // FIX: initialize a real transaction with the plan attached.
+        // This requires an actual successful payment before Paystack (and
+        // therefore our webhook) will ever fire. No card-on-file assumption,
+        // no silent "already subscribed" bypass.
         const response = await fetch('https://api.paystack.co/transaction/initialize', {
             method: 'POST',
             headers: {
@@ -1178,7 +998,7 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
                 email: user.email,
                 amount: amountInMinor,
                 currency: currency,
-                channels: channels,
+                channels: countryInfo.channels,
                 plan: planCode,
                 metadata: {
                     userId: user.id,
@@ -1214,23 +1034,34 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CODE RUNNER EXECUTION
+//  CODE EXECUTION – powered by MiniMax M3
 // ============================================================
 app.post('/api/run-code', auth, async (req, res) => {
     try {
         const user = req.user;
         const isOwner = (OWNER_EMAIL && user.email === OWNER_EMAIL);
 
-        if (!isOwner) await acquireConcurrency();
-        if (!isOwner && !user.code_runner_unlocked) {
+        if (!isOwner) {
+            await acquireConcurrency();
+        }
+
+        if (!isOwner && user.tier === 'free' && !user.code_runner_unlocked) {
             releaseConcurrency();
-            return res.status(403).json({ error: '💳 Subscribe to Code Runner to run code.', lock: true });
+            return res.status(403).json({
+                error: '💳 Subscribe to Code Runner to run code.',
+                lock: true
+            });
         }
 
         const { language, version, code } = req.body;
-        if (!code) { releaseConcurrency(); return res.status(400).json({ error: 'No code provided' }); }
+        if (!code) {
+            releaseConcurrency();
+            return res.status(400).json({ error: 'No code provided' });
+        }
 
-        const systemPrompt = `You are an expert coding assistant with strong reasoning and critical thinking skills.
+        const systemPrompt = `You are MiniMax M3, an expert coding assistant with strong reasoning and critical thinking skills.
+
+You are helping a developer understand and improve their code.
 
 Analyse the following code snippet and provide:
 1. A brief summary of what the code does.
@@ -1250,27 +1081,25 @@ ${code}
 
         const messages = [{ role: 'system', content: systemPrompt }];
 
-        // ---- Try OpenRouter (MiniMax M3) first, then fallback to Claude Haiku ----
-        let response;
-        let source;
-        try {
-            response = await callOpenRouter(messages, 'minimax/minimax-m3-preview');
-            source = 'minimax (via OpenRouter)';
-        } catch (err) {
-            console.warn('⚠️ MiniMax failed for code, falling back to Claude Haiku:', err.message);
-            try {
-                response = await callOpenRouter(messages, 'anthropic/claude-haiku-4.5');
-                source = 'claude-haiku (via OpenRouter)';
-            } catch (fallbackErr) {
-                console.error('❌ All models failed for code:', fallbackErr.message);
-                releaseConcurrency();
-                return res.status(500).json({ error: 'All AI models failed. Please try again later.' });
-            }
-        }
+        const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
+                'Content-Type': 'application/json',
+                'HTTP-Referer': 'https://technovaphy.ai'
+            },
+            body: JSON.stringify({
+                model: 'minimax/minimax-m3-preview',
+                messages: messages,
+                temperature: 0.7,
+                stream: true,
+                max_tokens: 2000
+            })
+        });
 
         if (!response.ok) {
             const errText = await response.text();
-            throw new Error(`${source} error: ${errText}`);
+            throw new Error(`MiniMax error: ${errText}`);
         }
 
         res.setHeader('Content-Type', 'text/event-stream');
@@ -1309,102 +1138,13 @@ ${code}
 
     } catch (err) {
         console.error('Code execution error:', err);
-        if (!res.headersSent) res.status(500).json({ error: err.message || 'Internal server error' });
-        else res.write(`data: ${JSON.stringify({ type: 'error', message: err.message })}\n\n`);
-        res.end();
+        if (!res.headersSent) {
+            res.status(500).json({ error: err.message || 'Internal server error' });
+        } else {
+            res.write(`data: ${JSON.stringify({ type: 'error', message: err.message })}\n\n`);
+            res.end();
+        }
         releaseConcurrency();
-    }
-});
-
-// ============================================================
-//  ADMIN DASHBOARD ROUTES
-// ============================================================
-app.get('/api/admin/stats', auth, async (req, res) => {
-    try {
-        const user = req.user;
-        const isOwner = (OWNER_EMAIL && user.email === OWNER_EMAIL);
-        if (!isOwner) {
-            return res.status(403).json({ error: 'Admin access only' });
-        }
-
-        const { count: totalUsers, error: usersErr } = await supabase
-            .from('users')
-            .select('*', { count: 'exact', head: true });
-        if (usersErr) throw usersErr;
-
-        const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-        const { count: activeUsers, error: activeErr } = await supabase
-            .from('users')
-            .select('*', { count: 'exact', head: true })
-            .gte('last_active', twentyFourHoursAgo);
-        if (activeErr) throw activeErr;
-
-        const fifteenMinutesAgo = new Date(Date.now() - 15 * 60 * 1000).toISOString();
-        const { count: loggedInUsers, error: loggedErr } = await supabase
-            .from('users')
-            .select('*', { count: 'exact', head: true })
-            .gte('last_active', fifteenMinutesAgo);
-        if (loggedErr) throw loggedErr;
-
-        const { data: payments, error: payErr } = await supabase
-            .from('payments')
-            .select('amount, currency, tier, status, created_at')
-            .eq('status', 'completed');
-        if (payErr) throw payErr;
-
-        const totalRevenue = payments.reduce((sum, p) => sum + p.amount, 0);
-        const revenueByTier = {};
-        payments.forEach(p => {
-            revenueByTier[p.tier] = (revenueByTier[p.tier] || 0) + p.amount;
-        });
-
-        const { data: recentPayments, error: recentErr } = await supabase
-            .from('payments')
-            .select('amount, currency, tier, status, created_at, user_id')
-            .eq('status', 'completed')
-            .order('created_at', { ascending: false })
-            .limit(5);
-        if (recentErr) throw recentErr;
-
-        const { count: codeRunnerCount, error: codeErr } = await supabase
-            .from('users')
-            .select('*', { count: 'exact', head: true })
-            .eq('code_runner_unlocked', true);
-        if (codeErr) throw codeErr;
-
-        res.json({
-            totalUsers,
-            activeUsers,
-            loggedInUsers,
-            totalRevenue,
-            revenueByTier,
-            recentPayments,
-            codeRunnerCount,
-            timestamp: new Date().toISOString()
-        });
-    } catch (err) {
-        console.error('Admin stats error:', err);
-        res.status(500).json({ error: err.message });
-    }
-});
-
-app.get('/api/admin/users', auth, async (req, res) => {
-    try {
-        const user = req.user;
-        const isOwner = (OWNER_EMAIL && user.email === OWNER_EMAIL);
-        if (!isOwner) {
-            return res.status(403).json({ error: 'Admin access only' });
-        }
-
-        const { data, error } = await supabase
-            .from('users')
-            .select('id, email, tier, usage_count, code_runner_unlocked, created_at, last_active')
-            .order('created_at', { ascending: false })
-            .limit(50);
-        if (error) throw error;
-        res.json({ users: data });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
     }
 });
 
