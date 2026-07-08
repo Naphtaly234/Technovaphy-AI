@@ -1,4 +1,13 @@
-
+// ============================================================
+//  TECHNOVAPHY AI – PRODUCTION BACKEND
+//  - AI failover (OpenRouter, valid models only)
+//  - Admin dashboard, last_active tracking
+//  - Static route for admin.html
+//  - Payment integrations: Paystack (card, bank, M‑Pesa, Airtel Money)
+//  - ALL USER-FACING ERROR MESSAGES SANITIZED
+//  - Code runner: web languages + Python (Pyodide‑ready)
+//  - Smart system prompt: Technovaphy AI with company knowledge
+// ============================================================
 
 require('dotenv').config();
 
@@ -34,7 +43,7 @@ app.use(cors({
     optionsSuccessStatus: 200
 }));
 
-// ---- Environment checks (only essential) ----
+// ---- Environment checks (only the absolute essentials) ----
 const required = [
     'SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'JWT_SECRET',
     'OPENROUTER_API_KEY', 'PAYSTACK_SECRET_KEY'
@@ -54,21 +63,6 @@ const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://your-frontend.netlify.app';
 const OWNER_EMAIL = process.env.OWNER_EMAIL || null;
 
-// ---- M‑Pesa config (optional – app starts without them) ----
-const MPESA_CONSUMER_KEY = process.env.SAFARICOM_CONSUMER_KEY || '';
-const MPESA_CONSUMER_SECRET = process.env.SAFARICOM_CONSUMER_SECRET || '';
-const MPESA_PASSKEY = process.env.SAFARICOM_PASSKEY || '';
-const MPESA_SHORTCODE = process.env.SAFARICOM_SHORTCODE || '';
-const MPESA_BUSINESS_SHORTCODE = process.env.SAFARICOM_BUSINESS_SHORTCODE || '';
-const MPESA_CALLBACK_URL = process.env.MPESA_CALLBACK_URL || '';
-
-// ---- Airtel config (optional) ----
-const AIRTEL_CLIENT_ID = process.env.AIRTEL_CLIENT_ID || '';
-const AIRTEL_CLIENT_SECRET = process.env.AIRTEL_CLIENT_SECRET || '';
-const AIRTEL_COUNTRY = process.env.AIRTEL_COUNTRY || 'KE';
-const AIRTEL_CURRENCY = process.env.AIRTEL_CURRENCY || 'KES';
-const AIRTEL_CALLBACK_URL = process.env.AIRTEL_CALLBACK_URL || '';
-
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 // ---- Database init ----
@@ -87,33 +81,21 @@ app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), as
     try {
         const signature = req.headers['x-paystack-signature'];
         if (!signature) return res.sendStatus(401);
-
         const expectedHash = crypto.createHmac('sha512', PAYSTACK_SECRET_KEY).update(req.body).digest('hex');
         if (expectedHash !== signature) return res.sendStatus(401);
-
         const payload = JSON.parse(req.body.toString('utf8'));
         const event = payload.event;
         const data = payload.data;
-
         if (event === 'charge.success') {
             const metadata = data.metadata || {};
             const userId = metadata.userId;
             const idempotencyKey = metadata.idempotencyKey;
             const type = metadata.type;
             const paystackStatus = data.status;
-
             if (paystackStatus !== 'success') return res.sendStatus(200);
-
-            const { data: paymentRecord } = await supabase
-                .from('payments')
-                .select('*')
-                .eq('transaction_id', idempotencyKey)
-                .maybeSingle();
-
+            const { data: paymentRecord } = await supabase.from('payments').select('*').eq('transaction_id', idempotencyKey).maybeSingle();
             if (!paymentRecord || paymentRecord.status === 'completed') return res.sendStatus(200);
-
             await supabase.from('payments').update({ status: 'completed' }).eq('transaction_id', idempotencyKey);
-
             if (userId) {
                 if (type === 'code_runner') {
                     await supabase.from('users').update({ code_runner_unlocked: true }).eq('id', userId);
@@ -159,22 +141,59 @@ const TIER_FEATURES = {
 const CODE_RUNNER_PRICE_KES = 1000;
 const MAX_CONVERSATION_HISTORY = 20;
 
-// ---- Payment channels exactly as you originally had them ----
+// ---- Payment channels declared simply, just like bank and PesaLink ----
 const PAYMENT_CHANNELS = {
-    KE: { country: 'Kenya', currency: 'KES', channels: ['card', 'bank_transfer', 'mpesa'], displayNames: { 'card': '💳 Card', 'bank_transfer': '🏦 Bank Transfer', 'mpesa': '📱 M-Pesa', 'mobile_money': '📱 Airtel Money' } },
-    NG: { country: 'Nigeria', currency: 'NGN', channels: ['card', 'bank_transfer', 'ussd', 'bank'], displayNames: { 'card': '💳 Card', 'bank_transfer': '🏦 Bank Transfer', 'ussd': '📞 USSD', 'bank': '📱 Mobile Banking' } },
-    GH: { country: 'Ghana', currency: 'GHS', channels: ['card', 'bank_transfer'], displayNames: { 'card': '💳 Card', 'bank_transfer': '🏦 Bank Transfer' } },
-    UG: { country: 'Uganda', currency: 'UGX', channels: ['card', 'bank_transfer'], displayNames: { 'card': '💳 Card', 'bank_transfer': '🏦 Bank Transfer' } },
-    TZ: { country: 'Tanzania', currency: 'TZS', channels: ['card', 'bank_transfer'], displayNames: { 'card': '💳 Card', 'bank_transfer': '🏦 Bank Transfer' } }
+    KE: {
+        country: 'Kenya',
+        currency: 'KES',
+        displayNames: {
+            'card': '💳 Card',
+            'bank_transfer': '🏦 Bank Transfer',
+            'mpesa': '📱 M-Pesa',
+            'mobile_money': '📱 Airtel Money'
+        }
+    },
+    NG: {
+        country: 'Nigeria',
+        currency: 'NGN',
+        displayNames: {
+            'card': '💳 Card',
+            'bank_transfer': '🏦 Bank Transfer',
+            'ussd': '📞 USSD',
+            'bank': '📱 Mobile Banking'
+        }
+    },
+    GH: {
+        country: 'Ghana',
+        currency: 'GHS',
+        displayNames: {
+            'card': '💳 Card',
+            'bank_transfer': '🏦 Bank Transfer'
+        }
+    },
+    UG: {
+        country: 'Uganda',
+        currency: 'UGX',
+        displayNames: {
+            'card': '💳 Card',
+            'bank_transfer': '🏦 Bank Transfer'
+        }
+    },
+    TZ: {
+        country: 'Tanzania',
+        currency: 'TZS',
+        displayNames: {
+            'card': '💳 Card',
+            'bank_transfer': '🏦 Bank Transfer'
+        }
+    }
 };
 
 // ============================================================
 //  SYSTEM PROMPT – Technovaphy AI (Smart & Disciplined)
 // ============================================================
 function buildSystemPrompt({ memoryPrompt, languageInstruction }) {
-    return `You are TechNovaphy AI, the official, highly intelligent assistant of TechNovaphy Solutions (https://technovaphy-solutions-5nz6.onrender.com).
-
-You are a research‑capable AI. You provide thoroughly reasoned, evidence‑based answers using your extensive training data. When more recent or specific information would help, you confidently say so and guide the user to reliable sources, including the company website. You never hallucinate, always distinguish fact from opinion, and cite sources when possible.
+    return `You are TechNovaphy AI, the official, highly intelligent assistant of TechNovaphy Solutions (https://technovaphy-solutions-5nz6.onrender.com). You are precise, disciplined, and thorough. You never hallucinate. You only provide information that you are highly confident about, and you always distinguish fact from opinion or uncertainty. When you don't know something, you clearly say "I don't know" and, if applicable, point the user to authoritative sources or the company's website.
 
 🔗 COMPANY KNOWLEDGE – TechNovaphy Solutions:
 - Based in Nairobi, Kenya, serving 500+ businesses across East Africa.
@@ -186,14 +205,14 @@ You are a research‑capable AI. You provide thoroughly reasoned, evidence‑bas
 - IT Support Plans: Standard IT (KSh 15k/mo), Managed Pro (KSh 50k/mo), Premium Website (one‑time KSh 120k).
 - Free IT Infrastructure Audit (worth KES 50,000) available on the website.
 
-Always point users to https://technovaphy-solutions-5nz6.onrender.com for the latest details and offers.
+When discussing the company, always mention the website: https://technovaphy-solutions-5nz6.onrender.com. For detailed plan features, direct the user there.
 
 🧠 BEHAVIOUR & TONE:
-- You are smart, analytical, and concise. No filler words, no marketing fluff.
-- For complex questions, break down your reasoning before delivering the final answer.
-- Use the <thinking> / <answer> tags to separate your internal analysis from the final response.
+- Be smart, analytical, and concise. No filler words, no marketing fluff.
+- If the user asks a complex or research‑oriented question, leverage your training data to provide a well‑structured, evidence‑based answer. If appropriate, suggest where the user can verify the information (e.g., official documentation, reputable sites).
+- Always separate your reasoning from the final answer using the <thinking> / <answer> tags.
 - For code, provide clean, working examples and explain them.
-- For legal/financial matters, include the disclaimer: "This is for informational purposes only, not professional advice."
+- For legal/financial matters, include a disclaimer: "This is for informational purposes only, not professional advice."
 - If the user's language preference is provided, respond in that language.
 
 ${memoryPrompt}
@@ -940,21 +959,12 @@ app.get('/api/pricing', auth, async (req, res) => {
             interval: 'monthly'
         };
 
-        // Only advertise direct channels if the credentials are set
-        const directChannels = [];
-        if (countryCode === 'KE') {
-            if (MPESA_CONSUMER_KEY && MPESA_CONSUMER_SECRET) directChannels.push('mpesa');
-            if (AIRTEL_CLIENT_ID && AIRTEL_CLIENT_SECRET) directChannels.push('airtel_money');
-        }
-        directChannels.push('bank_transfer');
-
         res.json({
             currentTier: user.tier,
             codeRunnerUnlocked: user.code_runner_unlocked || false,
             tiers,
             codeRunner,
-            channels: countryInfo.channels,
-            directChannels: directChannels,
+            channels: countryInfo.channels ? Object.keys(countryInfo.displayNames) : ['card', 'bank_transfer'],
             country: countryCode
         });
     } catch (err) {
@@ -992,7 +1002,7 @@ app.get('/api/payment-status/:key', auth, async (req, res) => {
 });
 
 // ============================================================
-//  TIER UPGRADE CHECKOUT (Paystack) – with channels for M‑Pesa
+//  TIER UPGRADE CHECKOUT (Paystack – channels sent explicitly)
 // ============================================================
 app.post('/api/create-checkout', auth, async (req, res) => {
     try {
@@ -1020,9 +1030,17 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             if (existing.status === 'completed') return res.json({ alreadyProcessed: true });
             return res.status(409).json({ error: 'A payment is already being processed for this transaction.' });
         }
-        // payment channels
 
         if (!PAYSTACK_SECRET_KEY) return res.status(503).json({ error: 'Payment service is not available at the moment.' });
+
+        // ---- Build channels from displayNames (just like bank and PesaLink) ----
+        let channels = ['card', 'bank_transfer'];
+        if (countryInfo.displayNames) {
+            for (const ch of Object.keys(countryInfo.displayNames)) {
+                if (!channels.includes(ch)) channels.push(ch);
+            }
+        }
+        console.log('🔗 Sending channels to Paystack:', channels);
 
         const response = await fetch('https://api.paystack.co/transaction/initialize', {
             method: 'POST',
@@ -1030,9 +1048,8 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             body: JSON.stringify({
                 email: user.email,
                 amount: amount,
-                currency: finalCurrency,channels: countryCode === 'KE'
-                 ? ['card', 'bank_transfer', 'mpesa','Airtel Money]
-            : countryInfo.channels,
+                currency: finalCurrency,
+                channels: channels,
                 metadata: { idempotencyKey, tier, userId: user.id, country: countryCode },
                 callback_url: `${FRONTEND_URL}/?success=true&key=${idempotencyKey}`
             })
@@ -1061,379 +1078,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
 });
 
 // ============================================================
-//  M-PESA DIRECT (SAFARICOM DARAJA) – only if keys are set
-// ============================================================
-app.post('/api/mpesa/stkpush', auth, async (req, res) => {
-    if (!MPESA_CONSUMER_KEY || !MPESA_CONSUMER_SECRET) {
-        return res.status(503).json({ error: 'M-Pesa payments are not available at this time.' });
-    }
-    try {
-        const { idempotencyKey, phone, amount, tier } = req.body;
-        const user = req.user;
-
-        if (!idempotencyKey || !phone || !amount || !tier) {
-            return res.status(400).json({ error: 'Please provide all payment details.' });
-        }
-
-        let formattedPhone = phone.replace(/^0/, '254').replace(/^\+/, '');
-        if (!/^254\d{9}$/.test(formattedPhone)) {
-            return res.status(400).json({ error: 'Please enter a valid M-Pesa phone number (e.g., 2547XXXXXXXX).' });
-        }
-
-        const auth = Buffer.from(`${MPESA_CONSUMER_KEY}:${MPESA_CONSUMER_SECRET}`).toString('base64');
-        const tokenRes = await fetch('https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials', {
-            headers: { Authorization: `Basic ${auth}` }
-        });
-        const tokenData = await tokenRes.json();
-        if (!tokenData.access_token) {
-            console.error('M-Pesa token error:', tokenData);
-            return res.status(502).json({ error: 'M-Pesa service is temporarily unavailable.' });
-        }
-        const accessToken = tokenData.access_token;
-
-        const timestamp = new Date().toISOString().replace(/[-:T.Z]/g, '').slice(0, 14);
-        const password = Buffer.from(`${MPESA_SHORTCODE}${MPESA_PASSKEY}${timestamp}`).toString('base64');
-
-        const stkRes = await fetch('https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest', {
-            method: 'POST',
-            headers: {
-                Authorization: `Bearer ${accessToken}`,
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-                BusinessShortCode: MPESA_BUSINESS_SHORTCODE,
-                Password: password,
-                Timestamp: timestamp,
-                TransactionType: 'CustomerPayBillOnline',
-                Amount: Math.round(amount),
-                PartyA: formattedPhone,
-                PartyB: MPESA_SHORTCODE,
-                PhoneNumber: formattedPhone,
-                CallBackURL: MPESA_CALLBACK_URL,
-                AccountReference: idempotencyKey,
-                TransactionDesc: `TechNovaphy ${tier} upgrade`
-            })
-        });
-        const stkData = await stkRes.json();
-
-        if (stkData.ResponseCode !== '0') {
-            console.error('STK push failed:', stkData);
-            return res.status(400).json({ error: 'M-Pesa payment request was not successful. Please try again.' });
-        }
-
-        await supabase.from('payments').insert({
-            user_id: user.id,
-            transaction_id: idempotencyKey,
-            amount: Math.round(amount * 100),
-            currency: 'KES',
-            status: 'pending',
-            tier: tier,
-            country: user.country || 'KE',
-            payment_method: 'mpesa_direct',
-            metadata: { checkoutRequestID: stkData.CheckoutRequestID }
-        });
-
-        res.json({
-            success: true,
-            checkoutRequestID: stkData.CheckoutRequestID,
-            message: 'Check your phone to complete the M-Pesa payment.'
-        });
-    } catch (err) {
-        console.error('M-Pesa STK error:', err);
-        res.status(500).json({ error: 'M-Pesa payment could not be initiated. Please try again later.' });
-    }
-});
-
-// ---- M-Pesa Webhook ----
-app.post('/api/webhooks/mpesa', express.json(), async (req, res) => {
-    try {
-        const callback = req.body.Body?.stkCallback;
-        if (!callback) return res.sendStatus(400);
-
-        const resultCode = callback.ResultCode;
-        const metadata = callback.CallbackMetadata?.Item || [];
-        const idempotencyKey = callback.AccountReference;
-
-        if (idempotencyKey) {
-            const { data: payment } = await supabase
-                .from('payments')
-                .select('*')
-                .eq('transaction_id', idempotencyKey)
-                .eq('status', 'pending')
-                .maybeSingle();
-
-            if (payment) {
-                if (resultCode === 0) {
-                    await supabase.from('payments').update({
-                        status: 'completed',
-                        payment_method: 'mpesa_direct',
-                        metadata: { ...payment.metadata, mpesaReceipt: metadata.find(i => i.Name === 'MpesaReceiptNumber')?.Value }
-                    }).eq('transaction_id', idempotencyKey);
-
-                    const user = await findUserById(payment.user_id);
-                    if (user) {
-                        if (payment.tier === 'code_runner') {
-                            await supabase.from('users').update({ code_runner_unlocked: true }).eq('id', user.id);
-                        } else {
-                            await supabase.from('users').update({ tier: payment.tier, usage_count: 0 }).eq('id', user.id);
-                        }
-                    }
-                } else {
-                    await supabase.from('payments').update({
-                        status: 'failed',
-                        metadata: { ...payment.metadata, failureReason: callback.ResultDesc }
-                    }).eq('transaction_id', idempotencyKey);
-                }
-            }
-        }
-        res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
-    } catch (err) {
-        console.error('M-Pesa callback error:', err);
-        res.status(200).json({ ResultCode: 0, ResultDesc: 'Error but accepted' });
-    }
-});
-
-// ============================================================
-//  AIRTEL MONEY DIRECT – only if keys are set
-// ============================================================
-app.post('/api/airtel/request', auth, async (req, res) => {
-    if (!AIRTEL_CLIENT_ID || !AIRTEL_CLIENT_SECRET) {
-        return res.status(503).json({ error: 'Airtel Money payments are not available at this time.' });
-    }
-    try {
-        const { idempotencyKey, phone, amount, tier } = req.body;
-        const user = req.user;
-
-        if (!idempotencyKey || !phone || !amount || !tier) {
-            return res.status(400).json({ error: 'Please provide all payment details.' });
-        }
-
-        const auth = Buffer.from(`${AIRTEL_CLIENT_ID}:${AIRTEL_CLIENT_SECRET}`).toString('base64');
-        const tokenRes = await fetch('https://openapi.airtel.africa/auth/oauth2/token', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                Authorization: `Basic ${auth}`
-            },
-            body: JSON.stringify({ grant_type: 'client_credentials' })
-        });
-        const tokenJson = await tokenRes.json();
-        if (!tokenJson.access_token) {
-            console.error('Airtel auth error:', tokenJson);
-            return res.status(502).json({ error: 'Airtel Money service is temporarily unavailable.' });
-        }
-        const accessToken = tokenJson.access_token;
-
-        const payload = {
-            reference: idempotencyKey,
-            subscriber: {
-                country: AIRTEL_COUNTRY,
-                currency: AIRTEL_CURRENCY,
-                msisdn: phone
-            },
-            transaction: {
-                amount: Math.round(amount),
-                country: AIRTEL_COUNTRY,
-                currency: AIRTEL_CURRENCY,
-                id: idempotencyKey
-            }
-        };
-        if (AIRTEL_CALLBACK_URL) {
-            payload.transaction.callback_url = AIRTEL_CALLBACK_URL;
-        }
-
-        const paymentRes = await fetch('https://openapi.airtel.africa/merchant/v2/payments/', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${accessToken}`,
-                'X-Country': AIRTEL_COUNTRY,
-                'X-Currency': AIRTEL_CURRENCY
-            },
-            body: JSON.stringify(payload)
-        });
-        const paymentData = await paymentRes.json();
-
-        if (paymentData.status?.code !== '200' && paymentData.status?.code !== 200) {
-            console.error('Airtel payment error:', paymentData);
-            return res.status(400).json({ error: 'Airtel Money payment request was not successful. Please try again.' });
-        }
-
-        await supabase.from('payments').insert({
-            user_id: user.id,
-            transaction_id: idempotencyKey,
-            amount: Math.round(amount * 100),
-            currency: AIRTEL_CURRENCY,
-            status: 'pending',
-            tier: tier,
-            country: user.country || 'KE',
-            payment_method: 'airtel_money',
-            metadata: { airtelTransactionId: paymentData.data?.transaction?.id }
-        });
-
-        res.json({
-            success: true,
-            transactionId: paymentData.data?.transaction?.id,
-            message: 'Airtel Money request sent. Please complete on your phone.'
-        });
-    } catch (err) {
-        console.error('Airtel payment error:', err);
-        res.status(500).json({ error: 'Airtel Money payment failed. Please try again later.' });
-    }
-});
-
-// ---- Airtel Webhook ----
-app.post('/api/webhooks/airtel', express.json(), async (req, res) => {
-    try {
-        const { reference, status } = req.body;
-        if (!reference) return res.sendStatus(400);
-
-        if (status === 'SUCCESS' || status === 'TS') {
-            const { data: payment } = await supabase
-                .from('payments')
-                .select('*')
-                .eq('transaction_id', reference)
-                .eq('status', 'pending')
-                .maybeSingle();
-
-            if (payment) {
-                await supabase.from('payments').update({
-                    status: 'completed',
-                    metadata: { ...payment.metadata, airtelWebhook: req.body }
-                }).eq('transaction_id', reference);
-
-                const user = await findUserById(payment.user_id);
-                if (user) {
-                    if (payment.tier === 'code_runner') {
-                        await supabase.from('users').update({ code_runner_unlocked: true }).eq('id', user.id);
-                    } else {
-                        await supabase.from('users').update({ tier: payment.tier, usage_count: 0 }).eq('id', user.id);
-                    }
-                }
-            }
-        } else if (status === 'FAILED') {
-            await supabase.from('payments')
-                .update({ status: 'failed' })
-                .eq('transaction_id', reference);
-        }
-
-        res.sendStatus(200);
-    } catch (err) {
-        console.error('Airtel webhook error:', err);
-        res.sendStatus(200);
-    }
-});
-
-// ============================================================
-//  MANUAL BANK / PAYBILL PAYMENTS
-// ============================================================
-app.get('/api/manual-payment-instructions', auth, async (req, res) => {
-    const user = req.user;
-    const country = user.country || 'KE';
-
-    const instructions = {
-        KE: {
-            paybill: 'Paybill Number: 247247',
-            accountNumber: `TechNovaphy-${user.id}`,
-            bank: 'Bank: Equity Bank, Account: 1234567890',
-            note: 'After sending, submit your payment reference below.'
-        },
-        NG: {
-            bank: 'Bank: GTBank, Account: 0123456789',
-            accountName: 'TechNovaphy Ltd',
-            note: 'After transfer, upload your receipt.'
-        },
-    };
-
-    res.json(instructions[country] || instructions.KE);
-});
-
-app.post('/api/manual-payment/submit', auth, async (req, res) => {
-    try {
-        const { idempotencyKey, paymentMethod, reference, amount, tier, receiptImage } = req.body;
-        const user = req.user;
-
-        if (!idempotencyKey || !paymentMethod || !amount || !tier) {
-            return res.status(400).json({ error: 'Please provide all required payment details.' });
-        }
-
-        await supabase.from('payments').insert({
-            user_id: user.id,
-            transaction_id: idempotencyKey,
-            amount: Math.round(amount * 100),
-            currency: (user.country === 'KE') ? 'KES' : 'NGN',
-            status: 'pending_manual',
-            tier: tier,
-            country: user.country || 'KE',
-            payment_method: paymentMethod,
-            metadata: {
-                reference,
-                receiptImage,
-                submitted_at: new Date().toISOString()
-            }
-        });
-
-        res.json({ message: 'Payment proof submitted. You will be notified once it is verified.' });
-    } catch (err) {
-        console.error('Manual payment submit error:', err);
-        res.status(500).json({ error: 'Failed to submit payment proof.' });
-    }
-});
-
-app.get('/api/admin/manual-payments', auth, async (req, res) => {
-    if (req.user.email !== OWNER_EMAIL) return res.status(403).json({ error: 'Access denied.' });
-
-    try {
-        const { data, error } = await supabase
-            .from('payments')
-            .select('*')
-            .eq('status', 'pending_manual')
-            .order('created_at', { ascending: false });
-        if (error) throw error;
-        res.json({ payments: data });
-    } catch (err) {
-        console.error('Admin manual payments error:', err);
-        res.status(500).json({ error: 'Failed to load manual payments.' });
-    }
-});
-
-app.post('/api/admin/manual-payments/verify', auth, async (req, res) => {
-    if (req.user.email !== OWNER_EMAIL) return res.status(403).json({ error: 'Access denied.' });
-
-    const { transaction_id, approved } = req.body;
-    try {
-        const { data: payment } = await supabase
-            .from('payments')
-            .select('*')
-            .eq('transaction_id', transaction_id)
-            .eq('status', 'pending_manual')
-            .maybeSingle();
-
-        if (!payment) return res.status(404).json({ error: 'Payment record not found.' });
-
-        if (approved) {
-            await supabase.from('payments').update({ status: 'completed' }).eq('transaction_id', transaction_id);
-            const user = await findUserById(payment.user_id);
-            if (user) {
-                if (payment.tier === 'code_runner') {
-                    await supabase.from('users').update({ code_runner_unlocked: true }).eq('id', user.id);
-                } else {
-                    await supabase.from('users').update({ tier: payment.tier, usage_count: 0 }).eq('id', user.id);
-                }
-            }
-            res.json({ message: 'Payment approved successfully.' });
-        } else {
-            await supabase.from('payments').update({ status: 'failed' }).eq('transaction_id', transaction_id);
-            res.json({ message: 'Payment rejected.' });
-        }
-    } catch (err) {
-        console.error('Admin verify payment error:', err);
-        res.status(500).json({ error: 'Failed to verify payment.' });
-    }
-});
-
-// ============================================================
-//  CODE RUNNER SUBSCRIPTION – also with channels for M‑Pesa
+//  CODE RUNNER SUBSCRIPTION
 // ============================================================
 app.post('/api/subscribe-code', auth, async (req, res) => {
     try {
@@ -1500,6 +1145,14 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
             }
         }
 
+        // ---- Build channels from displayNames ----
+        let channels = ['card', 'bank_transfer'];
+        if (countryInfo.displayNames) {
+            for (const ch of Object.keys(countryInfo.displayNames)) {
+                if (!channels.includes(ch)) channels.push(ch);
+            }
+        }
+
         const response = await fetch('https://api.paystack.co/transaction/initialize', {
             method: 'POST',
             headers: {
@@ -1510,7 +1163,7 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
                 email: user.email,
                 amount: amountInMinor,
                 currency: currency,
-                channels: countryInfo.channels,
+                channels: channels,
                 plan: planCode,
                 metadata: {
                     userId: user.id,
@@ -1565,13 +1218,11 @@ app.post('/api/run-code', auth, async (req, res) => {
             return res.status(400).json({ error: 'Please provide some code.' });
         }
 
-        // ---- Smart language detection ----
         const webLangs = ['html', 'css', 'javascript', 'js', 'typescript', 'ts'];
         const pythonLangs = ['python', 'py'];
         const allAllowed = [...webLangs, ...pythonLangs];
         let langNormalized = (language || '').toLowerCase().trim();
 
-        // Auto‑detect Python if not specified
         if (!allAllowed.includes(langNormalized)) {
             const looksLikePython = /\b(print|def |import |class |elif |try:|except |from |lambda |__name__)\b/.test(code);
             if (looksLikePython) {
@@ -1589,10 +1240,10 @@ app.post('/api/run-code', auth, async (req, res) => {
             ? `You are an expert Python developer. Analyze the following Python code and provide:
 1. A brief explanation of what the code does.
 2. Any potential bugs, logical errors, or best‑practice violations.
-3. Suggestions for improvement.
-4. Expected output.
+3. Suggestions for improvement (performance, readability, Pythonic style).
+4. If the code would produce output, describe what it would print or return.
 
-Be clear and concise. No markdown, just plain text.
+Be clear and concise. No markdown, just plain text with line breaks.
 
 CODE:
 \`\`\`python
@@ -1601,10 +1252,10 @@ ${code}
             : `You are an expert web development assistant. Analyze the following ${languageName} code snippet and provide:
 1. A brief summary of what the code does.
 2. Any potential issues, bugs, or best‑practice violations.
-3. Suggestions for improvement.
-4. Expected visual output/behaviour.
+3. Suggestions for improvement (performance, accessibility, semantics).
+4. If applicable, describe the expected visual output or behaviour in a browser.
 
-Be clear and concise. No markdown, just plain text.
+Be clear and concise. No markdown, just plain text with line breaks.
 
 CODE:
 \`\`\`${langNormalized}
@@ -1613,7 +1264,6 @@ ${code}
 
         const messages = [{ role: 'system', content: systemPrompt }];
 
-        // ---- Stable model ----
         const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
             method: 'POST',
             headers: {
@@ -1789,7 +1439,7 @@ app.get('/api/admin/users', auth, async (req, res) => {
 });
 
 // ============================================================
-//  GLOBAL ERROR HANDLER
+//  GLOBAL ERROR HANDLER (catches any uncaught errors)
 // ============================================================
 app.use((err, req, res, next) => {
     console.error('Unhandled error:', err);
