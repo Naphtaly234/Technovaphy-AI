@@ -1,5 +1,9 @@
+// ============================================================
+//  TECHNOVAPHY AI – COMPLETE BACKEND (with Admin Dashboard)
+//  Admin routes: /api/admin/stats, /api/admin/users
+//  Static route: /admin (serves admin.html)
+// ============================================================
 
-// Load environment variables
 require('dotenv').config();
 
 const express = require('express');
@@ -9,6 +13,7 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcrypt');
 const { createClient } = require('@supabase/supabase-js');
 const crypto = require('crypto');
+const path = require('path'); // <-- for serving admin.html
 
 // ---- Redis (optional) ----
 let redisClient = null;
@@ -35,7 +40,6 @@ try {
     console.log('ℹ️ Redis package not installed, using in‑memory fallback');
 }
 
-// ---- Express app ----
 const app = express();
 app.set('trust proxy', 1);
 
@@ -78,8 +82,6 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 // ============================================================
 //  PAYSTACK WEBHOOK (must be before express.json())
-//  This is the ONLY place that ever grants a paid entitlement.
-//  The HMAC signature check below is what proves money actually moved.
 // ============================================================
 app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), async (req, res) => {
     try {
@@ -93,15 +95,12 @@ app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), as
         const event = payload.event;
         const data = payload.data;
 
-        // FIX: we only ever act on a genuinely successful charge event.
-        // 'subscription.create' by itself does NOT prove a payment cleared,
-        // so it is no longer treated as a trigger for unlocking anything.
         if (event === 'charge.success') {
             const metadata = data.metadata || {};
             const userId = metadata.userId;
             const idempotencyKey = metadata.idempotencyKey;
-            const type = metadata.type; // 'code_runner' or undefined
-            const paystackStatus = data.status; // should be 'success'
+            const type = metadata.type;
+            const paystackStatus = data.status;
 
             if (paystackStatus !== 'success') return res.sendStatus(200);
 
@@ -208,23 +207,13 @@ function parseThinkingAndAnswer(rawText) {
     if (answerClosed) answer = answerClosed[1];
     else if (answerOpen) answer = answerOpen[1];
 
-    // FIX: previously, if the model never emitted an <answer> tag at all
-    // (MiniMax M3 sometimes rambles entirely inside <thinking> and never
-    // opens <answer>, especially on long or truncated streams), `answer`
-    // stayed '' forever - including in the final 'done' event. That
-    // silently produced a genuinely empty response every time this
-    // happened. Now we fall back instead of dropping the content:
+    // FIX: fallback if no <answer> tag present
     if (!answer) {
         if (thinkClosed) {
-            // There IS a closed <thinking> block - anything after it is
-            // the real answer, even if it wasn't wrapped in <answer>.
             const afterThinking = rawText.slice(rawText.indexOf(thinkClosed[0]) + thinkClosed[0].length).trim();
             if (afterThinking) answer = afterThinking;
         }
         if (!answer && rawText.trim()) {
-            // No usable <answer> tag ever appeared (open or closed), and/or
-            // <thinking> never closed. Rather than show a blank bubble,
-            // surface the raw content with tag markers stripped out.
             answer = rawText.replace(/<\/?thinking>/gi, '').replace(/<\/?answer>/gi, '').trim();
         }
     }
@@ -377,6 +366,8 @@ const auth = async (req, res, next) => {
         const user = await findUserById(decoded.userId);
         if (!user) return res.status(401).json({ error: 'User not found' });
         req.user = user;
+        // Update last_active for tracking
+        await supabase.from('users').update({ last_active: new Date().toISOString() }).eq('id', user.id);
         next();
     } catch (e) {
         res.status(401).json({ error: 'Invalid or expired token' });
@@ -389,6 +380,11 @@ const auth = async (req, res, next) => {
 app.get('/', (req, res) => res.send('TechNovaphy AI Backend'));
 app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 app.get('/api/ping', (req, res) => res.json({ status: 'ok' }));
+
+// ---- Serve admin dashboard (if admin.html exists in the same folder) ----
+app.get('/admin', (req, res) => {
+    res.sendFile(path.join(__dirname, 'admin.html'));
+});
 
 app.post('/api/auth/register', async (req, res) => {
     try {
@@ -416,7 +412,8 @@ app.post('/api/auth/register', async (req, res) => {
             memory: '',
             role: 'user',
             country: country,
-            code_runner_unlocked: false
+            code_runner_unlocked: false,
+            last_active: now.toISOString()
         }).select().single();
 
         if (error) throw new Error('DB insert: ' + error.message);
@@ -442,6 +439,7 @@ app.post('/api/auth/login', async (req, res) => {
         if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
 
         const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '7d' });
+        await supabase.from('users').update({ last_active: new Date().toISOString() }).eq('id', user.id);
         res.json({ token, verified: true, country: user.country });
     } catch (err) {
         console.error('Login error:', err);
@@ -531,6 +529,18 @@ app.get('/api/conversations/:conversationId', auth, async (req, res) => {
 
 app.post('/api/conversations', auth, async (req, res) => {
     try {
+        const { data: existing, error: findError } = await supabase
+            .from('conversations')
+            .select('*')
+            .eq('user_id', req.user.id)
+            .maybeSingle();
+
+        if (findError && findError.code !== 'PGRST116') throw findError;
+
+        if (existing) {
+            return res.status(200).json({ conversation: existing });
+        }
+
         const { data, error } = await supabase.from('conversations').insert({
             user_id: req.user.id,
             messages: [],
@@ -541,6 +551,7 @@ app.post('/api/conversations', auth, async (req, res) => {
         if (error) throw error;
         res.status(201).json({ conversation: data });
     } catch (err) {
+        console.error('Create conversation error:', err);
         res.status(500).json({ error: err.message });
     }
 });
@@ -555,6 +566,42 @@ app.delete('/api/conversations/:conversationId', auth, async (req, res) => {
         if (error) throw error;
         res.json({ message: 'Deleted' });
     } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/conversations/clear', auth, async (req, res) => {
+    try {
+        const { data: existing, error: findError } = await supabase
+            .from('conversations')
+            .select('*')
+            .eq('user_id', req.user.id)
+            .maybeSingle();
+
+        if (findError && findError.code !== 'PGRST116') throw findError;
+
+        if (!existing) {
+            const { data, error } = await supabase.from('conversations').insert({
+                user_id: req.user.id,
+                messages: [],
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString()
+            }).select().single();
+            if (error) throw error;
+            return res.status(201).json({ conversation: data });
+        }
+
+        const { data, error } = await supabase
+            .from('conversations')
+            .update({ messages: [], updated_at: new Date().toISOString() })
+            .eq('id', existing.id)
+            .select()
+            .single();
+
+        if (error) throw error;
+        res.json({ conversation: data });
+    } catch (err) {
+        console.error('Clear conversation error:', err);
         res.status(500).json({ error: err.message });
     }
 });
@@ -814,7 +861,6 @@ app.get('/api/pricing', auth, async (req, res) => {
 
 // ============================================================
 //  PAYMENT STATUS – lets the frontend safely poll after redirect
-//  back from Paystack, instead of ever trusting the client.
 // ============================================================
 app.get('/api/payment-status/:key', auth, async (req, res) => {
     try {
@@ -830,7 +876,7 @@ app.get('/api/payment-status/:key', auth, async (req, res) => {
         if (!data) return res.status(404).json({ error: 'Payment not found' });
 
         res.json({
-            status: data.status, // 'pending' | 'completed'
+            status: data.status,
             tier: data.tier,
             currency: data.currency,
             amount: data.amount
@@ -906,18 +952,6 @@ app.post('/api/create-checkout', auth, async (req, res) => {
 
 // ============================================================
 //  CODE RUNNER SUBSCRIPTION (fixed price/month)
-//
-//  FIX: this used to call Paystack's raw /subscription endpoint (which
-//  requires the customer to already have a saved card) and, on ANY
-//  Paystack error mentioning "already subscribed", it unlocked the
-//  feature with no payment check at all. That is the bug that let
-//  people get access just by tapping the button.
-//
-//  Now it follows the exact same pattern as /api/create-checkout:
-//  we initialize a real Paystack transaction with the plan attached.
-//  Paystack handles first payment + auto-creates the recurring
-//  subscription on success. The ONLY place access is ever granted is
-//  the signature-verified webhook above, after a real charge.success.
 // ============================================================
 app.post('/api/subscribe-code', auth, async (req, res) => {
     try {
@@ -983,10 +1017,6 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
             }
         }
 
-        // FIX: initialize a real transaction with the plan attached.
-        // This requires an actual successful payment before Paystack (and
-        // therefore our webhook) will ever fire. No card-on-file assumption,
-        // no silent "already subscribed" bypass.
         const response = await fetch('https://api.paystack.co/transaction/initialize', {
             method: 'POST',
             headers: {
@@ -1058,7 +1088,7 @@ app.post('/api/run-code', auth, async (req, res) => {
             return res.status(400).json({ error: 'No code provided' });
         }
 
-        const systemPrompt = `You are MiniMax M3, an expert coding assistant with strong reasoning and critical thinking skills.
+        const systemPrompt = `You are TechNovaphy AI, an expert coding assistant with strong reasoning and critical thinking skills.
 
 You are helping a developer understand and improve their code.
 
@@ -1144,6 +1174,121 @@ ${code}
             res.end();
         }
         releaseConcurrency();
+    }
+});
+
+// ============================================================
+//  ADMIN DASHBOARD ROUTES (owner only)
+// ============================================================
+
+// ---- Admin stats ----
+app.get('/api/admin/stats', auth, async (req, res) => {
+    try {
+        const user = req.user;
+        const isOwner = (OWNER_EMAIL && user.email === OWNER_EMAIL);
+        if (!isOwner) {
+            return res.status(403).json({ error: 'Admin access only' });
+        }
+
+        // 1. Total users
+        const { count: totalUsers, error: usersErr } = await supabase
+            .from('users')
+            .select('*', { count: 'exact', head: true });
+        if (usersErr) throw usersErr;
+
+        // 2. Active users (last 24 hours)
+        const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+        let activeUsers = 0;
+        const { count: activeCount, error: activeErr } = await supabase
+            .from('users')
+            .select('*', { count: 'exact', head: true })
+            .gte('last_active', twentyFourHoursAgo);
+        if (activeErr) {
+            // Fallback: if last_active doesn't exist, use created_at
+            const { count: fallbackCount, error: fallbackErr } = await supabase
+                .from('users')
+                .select('*', { count: 'exact', head: true })
+                .gte('created_at', twentyFourHoursAgo);
+            if (fallbackErr) throw fallbackErr;
+            activeUsers = fallbackCount || 0;
+        } else {
+            activeUsers = activeCount || 0;
+        }
+
+        // 3. Users active in last 15 minutes (approx "logged in")
+        const fifteenMinutesAgo = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+        let loggedInUsers = 0;
+        const { count: loggedCount, error: loggedErr } = await supabase
+            .from('users')
+            .select('*', { count: 'exact', head: true })
+            .gte('last_active', fifteenMinutesAgo);
+        if (!loggedErr) {
+            loggedInUsers = loggedCount || 0;
+        }
+
+        // 4. Payments summary
+        const { data: payments, error: payErr } = await supabase
+            .from('payments')
+            .select('amount, currency, tier, status, created_at')
+            .eq('status', 'completed');
+        if (payErr) throw payErr;
+
+        const totalRevenue = payments.reduce((sum, p) => sum + p.amount, 0);
+        const revenueByTier = {};
+        payments.forEach(p => {
+            revenueByTier[p.tier] = (revenueByTier[p.tier] || 0) + p.amount;
+        });
+
+        // 5. Recent payments (last 5)
+        const { data: recentPayments, error: recentErr } = await supabase
+            .from('payments')
+            .select('amount, currency, tier, status, created_at, user_id')
+            .eq('status', 'completed')
+            .order('created_at', { ascending: false })
+            .limit(5);
+        if (recentErr) throw recentErr;
+
+        // 6. Total code runner unlocks
+        const { count: codeRunnerCount, error: codeErr } = await supabase
+            .from('users')
+            .select('*', { count: 'exact', head: true })
+            .eq('code_runner_unlocked', true);
+        if (codeErr) throw codeErr;
+
+        res.json({
+            totalUsers: totalUsers || 0,
+            activeUsers: activeUsers || 0,
+            loggedInUsers: loggedInUsers || 0,
+            totalRevenue: totalRevenue || 0,
+            revenueByTier: revenueByTier || {},
+            recentPayments: recentPayments || [],
+            codeRunnerCount: codeRunnerCount || 0,
+            timestamp: new Date().toISOString()
+        });
+    } catch (err) {
+        console.error('Admin stats error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ---- Admin – list all users (with pagination) ----
+app.get('/api/admin/users', auth, async (req, res) => {
+    try {
+        const user = req.user;
+        const isOwner = (OWNER_EMAIL && user.email === OWNER_EMAIL);
+        if (!isOwner) {
+            return res.status(403).json({ error: 'Admin access only' });
+        }
+
+        const { data, error } = await supabase
+            .from('users')
+            .select('id, email, tier, usage_count, code_runner_unlocked, created_at, last_active')
+            .order('created_at', { ascending: false })
+            .limit(50);
+        if (error) throw error;
+        res.json({ users: data || [] });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
     }
 });
 
