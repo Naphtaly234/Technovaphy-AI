@@ -1,7 +1,8 @@
 // ============================================================
-//  TECHNOVAPHY AI – COMPLETE BACKEND (with Admin Dashboard)
-//  Admin routes: /api/admin/stats, /api/admin/users
-//  Static route: /admin (serves admin.html)
+//  TECHNOVAPHY AI – PRODUCTION BACKEND
+//  - AI failover (OpenRouter models) preserves conversation
+//  - Admin dashboard, last_active tracking
+//  - Static route for admin.html
 // ============================================================
 
 require('dotenv').config();
@@ -22,23 +23,10 @@ try {
     const redis = require('redis');
     if (process.env.REDIS_URL) {
         redisClient = redis.createClient({ url: process.env.REDIS_URL });
-        redisClient.on('error', (err) => {
-            console.warn('⚠️ Redis error, falling back to memory:', err.message);
-            redisAvailable = false;
-        });
-        redisClient.connect().then(() => {
-            redisAvailable = true;
-            console.log('✅ Redis connected');
-        }).catch(() => {
-            redisAvailable = false;
-            console.warn('⚠️ Redis connection failed, using memory fallback');
-        });
-    } else {
-        console.log('ℹ️ REDIS_URL not set, using in‑memory fallback');
+        redisClient.on('error', () => { redisAvailable = false; });
+        redisClient.connect().then(() => { redisAvailable = true; }).catch(() => { redisAvailable = false; });
     }
-} catch (e) {
-    console.log('ℹ️ Redis package not installed, using in‑memory fallback');
-}
+} catch (e) {}
 
 const app = express();
 app.set('trust proxy', 1);
@@ -70,6 +58,7 @@ const OWNER_EMAIL = process.env.OWNER_EMAIL || null;
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
+// ---- Database init ----
 (async function initDb() {
     try {
         const { error } = await supabase.from('users').select('id').limit(1);
@@ -80,9 +69,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
     }
 })();
 
-// ============================================================
-//  PAYSTACK WEBHOOK (must be before express.json())
-// ============================================================
+// ---- PAYSTACK WEBHOOK ----
 app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), async (req, res) => {
     try {
         const signature = req.headers['x-paystack-signature'];
@@ -207,7 +194,7 @@ function parseThinkingAndAnswer(rawText) {
     if (answerClosed) answer = answerClosed[1];
     else if (answerOpen) answer = answerOpen[1];
 
-    // FIX: fallback if no <answer> tag present
+    // Fallback: if no <answer> tag, extract everything after the thinking block
     if (!answer) {
         if (thinkClosed) {
             const afterThinking = rawText.slice(rawText.indexOf(thinkClosed[0]) + thinkClosed[0].length).trim();
@@ -221,21 +208,35 @@ function parseThinkingAndAnswer(rawText) {
 }
 
 // ============================================================
-//  SMART FAILOVER: OpenRouter models chain (UPDATED)
+//  AI FAILOVER CHAIN (OpenRouter) – preserves conversation
 // ============================================================
 async function fetchAIResponseWithFailover(messages, userSelectedModel) {
-    // Updated to more reliable models – Groq is now primary
-    const fallbackModels = [
-        'groq/llama-3.3-70b-versatile',   // fastest & most stable
-        'groq/llama3-70b-8192',
-        'anthropic/claude-haiku-4.5',
-        'nvidia/nemotron-3-ultra',
+    if (!OPENROUTER_API_KEY) {
+        throw new Error('OpenRouter API key is not set.');
+    }
+
+    // Map frontend model names to OpenRouter model IDs
+    const modelMap = {
+        'minimax/minimax-m3-preview': 'minimax/minimax-m3-preview',
+        'zai-org/glm-5.2': 'zai-org/glm-5.2',
+        'nvidia/nemotron-3-ultra': 'nvidia/nemotron-3-ultra',
+        'nvidia/nemotron-3-super': 'nvidia/nemotron-3-super',
+        'groq/llama-3.3-70b-versatile': 'groq/llama-3.3-70b-versatile',
+        'anthropic/claude-haiku-4.5': 'anthropic/claude-haiku-4.5'
+    };
+
+    // Build order: user's choice first, then fallbacks (ensuring no duplicates)
+    const primary = modelMap[userSelectedModel] || 'minimax/minimax-m3-preview';
+    const fallbacks = [
+        'minimax/minimax-m3-preview',
         'zai-org/glm-5.2',
-        'minimax/minimax-m3-preview'
+        'nvidia/nemotron-3-ultra',
+        'groq/llama-3.3-70b-versatile',
+        'anthropic/claude-haiku-4.5'
     ];
+    const modelsToTry = [primary, ...fallbacks.filter(m => m !== primary)];
 
-    const modelsToTry = [userSelectedModel, ...fallbackModels.filter(m => m !== userSelectedModel)];
-
+    let lastError = null;
     for (const model of modelsToTry) {
         try {
             console.log(`🔄 Attempting OpenRouter (${model})...`);
@@ -251,7 +252,8 @@ async function fetchAIResponseWithFailover(messages, userSelectedModel) {
                     messages: messages,
                     temperature: 0.7,
                     top_p: 0.9,
-                    stream: true
+                    stream: true,
+                    max_tokens: 2000
                 })
             });
 
@@ -259,14 +261,29 @@ async function fetchAIResponseWithFailover(messages, userSelectedModel) {
                 console.log(`✅ OpenRouter succeeded with ${model}`);
                 return { response, source: model };
             }
-            // Log failure details for debugging
-            const errorText = await response.text();
-            console.warn(`❌ ${model} failed (${response.status}): ${errorText.slice(0, 200)}`);
+
+            const errText = await response.text();
+            let errorMessage = `OpenRouter error (${model}): ${response.status}`;
+            try {
+                const errJson = JSON.parse(errText);
+                if (errJson.error) {
+                    errorMessage += ` - ${errJson.error.message || JSON.stringify(errJson.error)}`;
+                } else {
+                    errorMessage += ` - ${errText}`;
+                }
+            } catch (e) {
+                errorMessage += ` - ${errText}`;
+            }
+            console.warn(`⚠️ ${model} failed: ${errorMessage}`);
+            lastError = new Error(errorMessage);
         } catch (err) {
-            console.warn(`⚠️ ${model} network error:`, err.message);
+            console.warn(`⚠️ ${model} error: ${err.message}`);
+            lastError = err;
         }
     }
-    throw new Error('All AI models failed. Please check OpenRouter API key and model availability.');
+
+    // All models failed – throw the last error (the frontend will show it)
+    throw new Error(`All AI models failed. ${lastError ? lastError.message : 'Unknown error'}`);
 }
 
 // ============================================================
@@ -297,6 +314,7 @@ async function saveConversation(userId, messages) {
     if (error) throw new Error('Failed to save conversation: ' + error.message);
 }
 
+// ---- Rate limiting (Redis or memory) ----
 const inMemoryRate = new Map();
 const RATE_LIMIT_WINDOW = 60 * 1000;
 const RATE_LIMIT_MAX = 10;
@@ -333,6 +351,7 @@ if (!redisAvailable) {
     }, 60 * 1000);
 }
 
+// ---- Concurrency ----
 const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT_REQUESTS) || 10000;
 let activeRequests = 0;
 const concurrencyQueue = [];
@@ -358,7 +377,7 @@ function releaseConcurrency() {
 }
 
 // ============================================================
-//  AUTH MIDDLEWARE
+//  AUTH MIDDLEWARE (updates last_active)
 // ============================================================
 const auth = async (req, res, next) => {
     const authHeader = req.headers.authorization;
@@ -384,11 +403,32 @@ app.get('/', (req, res) => res.send('TechNovaphy AI Backend'));
 app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 app.get('/api/ping', (req, res) => res.json({ status: 'ok' }));
 
-// ---- Serve admin dashboard ----
+// ---- Serve admin dashboard (if admin.html exists) ----
 app.get('/admin', (req, res) => {
     res.sendFile(path.join(__dirname, 'admin.html'));
 });
 
+// ---- Test OpenRouter key (for debugging) ----
+app.get('/api/test-key', async (req, res) => {
+    try {
+        if (!OPENROUTER_API_KEY) {
+            return res.status(400).json({ error: 'OPENROUTER_API_KEY not set' });
+        }
+        const response = await fetch('https://openrouter.ai/api/v1/auth/key', {
+            headers: { 'Authorization': `Bearer ${OPENROUTER_API_KEY}` }
+        });
+        const data = await response.json();
+        if (response.ok) {
+            res.json({ valid: true, credits: data.credits || 'unknown' });
+        } else {
+            res.status(response.status).json({ valid: false, error: data.error || 'Invalid key' });
+        }
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ---- Register ----
 app.post('/api/auth/register', async (req, res) => {
     try {
         const { email, password, ageConfirmed, country } = req.body;
@@ -430,6 +470,7 @@ app.post('/api/auth/register', async (req, res) => {
     }
 });
 
+// ---- Login ----
 app.post('/api/auth/login', async (req, res) => {
     try {
         const { email, password } = req.body;
@@ -450,6 +491,7 @@ app.post('/api/auth/login', async (req, res) => {
     }
 });
 
+// ---- Profile ----
 app.get('/api/user/profile', auth, async (req, res) => {
     try {
         const user = req.user;
@@ -472,6 +514,7 @@ app.get('/api/user/profile', auth, async (req, res) => {
     }
 });
 
+// ---- Update Memory ----
 app.post('/api/auth/update-memory', auth, async (req, res) => {
     try {
         const { memory } = req.body;
@@ -677,28 +720,25 @@ app.delete('/api/projects/:id', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CHAT STREAM
+//  CHAT STREAM (with failover and conversation preservation)
 // ============================================================
 app.post('/api/chat/stream', auth, async (req, res) => {
     try {
         const user = req.user;
         const isOwner = (OWNER_EMAIL && user.email === OWNER_EMAIL);
 
-        if (!isOwner) {
-            await acquireConcurrency();
-        }
-
+        if (!isOwner) await acquireConcurrency();
         if (!isOwner && !await checkRateLimit(user.id)) {
             releaseConcurrency();
             return res.status(429).json({ error: 'Too many requests' });
         }
-
         const monthlyLimit = getLimit(user.tier);
         if (!isOwner && user.usage_count >= monthlyLimit) {
             releaseConcurrency();
             return res.status(403).json({ error: 'Monthly limit reached' });
         }
 
+        // ---- Parse messages ----
         let conversation = await getConversation(user.id);
         let newMessages;
         try { newMessages = JSON.parse(req.body.messages); } catch (e) {
@@ -706,20 +746,21 @@ app.post('/api/chat/stream', auth, async (req, res) => {
             return res.status(400).json({ error: 'Invalid messages format' });
         }
         conversation = conversation.concat(newMessages);
-
         if (conversation.length > MAX_CONVERSATION_HISTORY) {
             conversation = conversation.slice(-MAX_CONVERSATION_HISTORY);
         }
 
-        const userContent = conversation[conversation.length - 1]?.content || '';
-        const finalUserMessage = { role: 'user', content: userContent };
-        conversation.pop();
-        conversation.push(finalUserMessage);
+        // ---- Merge the last user message (already in conversation) ----
+        // The conversation array already has the user message, so we don't need to pop/push.
+        // But we need to ensure the last message is from the user (it should be).
+        // We'll just pass the conversation as-is.
 
+        // ---- Increment usage (non‑owners) ----
         if (!isOwner) {
             await supabase.from('users').update({ usage_count: (user.usage_count || 0) + 1 }).eq('id', user.id);
         }
 
+        // ---- Build system prompt ----
         const language = req.body.language || 'auto';
         let languageInstruction = '';
         if (language !== 'auto') {
@@ -729,8 +770,7 @@ app.post('/api/chat/stream', auth, async (req, res) => {
         const systemPrompt = buildSystemPrompt({ memoryPrompt, languageInstruction });
 
         const groqMessages = [{ role: 'system', content: systemPrompt }, ...conversation];
-
-        const userModel = req.body.model || 'groq/llama-3.3-70b-versatile'; // default changed to Groq
+        const userModel = req.body.model || 'minimax/minimax-m3-preview';
 
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
@@ -742,12 +782,40 @@ app.post('/api/chat/stream', auth, async (req, res) => {
             originalEnd.apply(res, args);
         };
 
-        const { response: aiResponse, source } = await fetchAIResponseWithFailover(groqMessages, userModel);
-
-        if (!aiResponse.ok) {
-            throw new Error(`AI error ${aiResponse.status}`);
+        let aiResponse, source;
+        try {
+            const result = await fetchAIResponseWithFailover(groqMessages, userModel);
+            aiResponse = result.response;
+            source = result.source;
+        } catch (err) {
+            // If all models fail, we still want to save the conversation (so the user can retry)
+            // and return an error message.
+            console.error('All AI models failed:', err.message);
+            // Save the conversation as-is (with user message, no assistant response yet)
+            await saveConversation(user.id, conversation);
+            res.write(`data: ${JSON.stringify({
+                type: 'error',
+                message: 'All AI models failed. Please try again later. ' + err.message
+            })}\n\n`);
+            res.end();
+            releaseConcurrency();
+            return;
         }
 
+        if (!aiResponse.ok) {
+            // If the API call succeeded but returned an error, we still save the conversation
+            const errText = await aiResponse.text();
+            await saveConversation(user.id, conversation);
+            res.write(`data: ${JSON.stringify({
+                type: 'error',
+                message: `AI error: ${errText}`
+            })}\n\n`);
+            res.end();
+            releaseConcurrency();
+            return;
+        }
+
+        // ---- Stream the response ----
         const reader = aiResponse.body.getReader();
         const decoder = new TextDecoder();
         let buffer = '', rawContent = '';
@@ -777,13 +845,16 @@ app.post('/api/chat/stream', auth, async (req, res) => {
             }
         }
 
+        // ---- Finalise conversation ----
         const { thinking: finalThinking, answer: finalAnswer } = parseThinkingAndAnswer(rawContent);
-        conversation.push({ role: 'assistant', content: finalAnswer });
+        // If no answer was extracted, use raw content as fallback
+        const finalText = finalAnswer || rawContent || 'No response generated.';
+        conversation.push({ role: 'assistant', content: finalText });
         await saveConversation(user.id, conversation);
 
         res.write(`data: ${JSON.stringify({
             type: 'done',
-            text: finalAnswer,
+            text: finalText,
             model: source
         })}\n\n`);
         res.end();
@@ -801,7 +872,7 @@ app.post('/api/chat/stream', auth, async (req, res) => {
 });
 
 // ============================================================
-//  EXCHANGE RATES (shared by pricing + checkout)
+//  EXCHANGE RATES
 // ============================================================
 let exchangeRates = { KES: 1 };
 let ratesLastFetched = 0;
@@ -822,7 +893,7 @@ async function fetchExchangeRates() {
 }
 
 // ============================================================
-//  PRICING – powers the frontend's Upgrade / Pricing screen
+//  PRICING
 // ============================================================
 app.get('/api/pricing', auth, async (req, res) => {
     try {
@@ -863,7 +934,7 @@ app.get('/api/pricing', auth, async (req, res) => {
 });
 
 // ============================================================
-//  PAYMENT STATUS – lets the frontend safely poll after redirect
+//  PAYMENT STATUS
 // ============================================================
 app.get('/api/payment-status/:key', auth, async (req, res) => {
     try {
@@ -954,7 +1025,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CODE RUNNER SUBSCRIPTION (fixed price/month)
+//  CODE RUNNER SUBSCRIPTION
 // ============================================================
 app.post('/api/subscribe-code', auth, async (req, res) => {
     try {
@@ -965,7 +1036,7 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
         if (user.code_runner_unlocked) {
             return res.status(200).json({
                 alreadyActive: true,
-                message: 'You already have an active subscription. Enjoy unlimited code execution!'
+                message: 'You already have an active subscription.'
             });
         }
 
@@ -1009,7 +1080,7 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
                     amount: amountInMinor,
                     currency: currency,
                     interval: 'monthly',
-                    description: 'Monthly subscription to unlock the code runner'
+                    description: 'Monthly subscription to unlock code runner'
                 })
             });
             const planData = await createPlan.json();
@@ -1066,34 +1137,23 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CODE EXECUTION – powered by MiniMax M3
+//  CODE EXECUTION – powered by OpenRouter (MiniMax M3)
 // ============================================================
 app.post('/api/run-code', auth, async (req, res) => {
     try {
         const user = req.user;
         const isOwner = (OWNER_EMAIL && user.email === OWNER_EMAIL);
 
-        if (!isOwner) {
-            await acquireConcurrency();
-        }
-
-        if (!isOwner && user.tier === 'free' && !user.code_runner_unlocked) {
+        if (!isOwner) await acquireConcurrency();
+        if (!isOwner && !user.code_runner_unlocked) {
             releaseConcurrency();
-            return res.status(403).json({
-                error: '💳 Subscribe to Code Runner to run code.',
-                lock: true
-            });
+            return res.status(403).json({ error: '💳 Subscribe to Code Runner to run code.', lock: true });
         }
 
         const { language, version, code } = req.body;
-        if (!code) {
-            releaseConcurrency();
-            return res.status(400).json({ error: 'No code provided' });
-        }
+        if (!code) { releaseConcurrency(); return res.status(400).json({ error: 'No code provided' }); }
 
         const systemPrompt = `You are MiniMax M3, an expert coding assistant with strong reasoning and critical thinking skills.
-
-You are helping a developer understand and improve their code.
 
 Analyse the following code snippet and provide:
 1. A brief summary of what the code does.
@@ -1110,7 +1170,6 @@ CODE:
 ${code}
 \`\`\`
 `;
-
         const messages = [{ role: 'system', content: systemPrompt }];
 
         const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
@@ -1121,7 +1180,7 @@ ${code}
                 'HTTP-Referer': 'https://technovaphy.ai'
             },
             body: JSON.stringify({
-                model: 'groq/llama-3.3-70b-versatile', // switch to Groq for reliability
+                model: 'minimax/minimax-m3-preview',
                 messages: messages,
                 temperature: 0.7,
                 stream: true,
@@ -1131,7 +1190,7 @@ ${code}
 
         if (!response.ok) {
             const errText = await response.text();
-            throw new Error(`AI error: ${errText}`);
+            throw new Error(`MiniMax error: ${errText}`);
         }
 
         res.setHeader('Content-Type', 'text/event-stream');
@@ -1170,21 +1229,16 @@ ${code}
 
     } catch (err) {
         console.error('Code execution error:', err);
-        if (!res.headersSent) {
-            res.status(500).json({ error: err.message || 'Internal server error' });
-        } else {
-            res.write(`data: ${JSON.stringify({ type: 'error', message: err.message })}\n\n`);
-            res.end();
-        }
+        if (!res.headersSent) res.status(500).json({ error: err.message || 'Internal server error' });
+        else res.write(`data: ${JSON.stringify({ type: 'error', message: err.message })}\n\n`);
+        res.end();
         releaseConcurrency();
     }
 });
 
 // ============================================================
-//  ADMIN DASHBOARD ROUTES (owner only)
+//  ADMIN DASHBOARD ROUTES
 // ============================================================
-
-// ---- Admin stats ----
 app.get('/api/admin/stats', auth, async (req, res) => {
     try {
         const user = req.user;
@@ -1193,13 +1247,11 @@ app.get('/api/admin/stats', auth, async (req, res) => {
             return res.status(403).json({ error: 'Admin access only' });
         }
 
-        // 1. Total users
         const { count: totalUsers, error: usersErr } = await supabase
             .from('users')
             .select('*', { count: 'exact', head: true });
         if (usersErr) throw usersErr;
 
-        // 2. Active users (last 24 hours)
         const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
         let activeUsers = 0;
         const { count: activeCount, error: activeErr } = await supabase
@@ -1207,7 +1259,6 @@ app.get('/api/admin/stats', auth, async (req, res) => {
             .select('*', { count: 'exact', head: true })
             .gte('last_active', twentyFourHoursAgo);
         if (activeErr) {
-            // Fallback: if last_active doesn't exist, use created_at
             const { count: fallbackCount, error: fallbackErr } = await supabase
                 .from('users')
                 .select('*', { count: 'exact', head: true })
@@ -1218,7 +1269,6 @@ app.get('/api/admin/stats', auth, async (req, res) => {
             activeUsers = activeCount || 0;
         }
 
-        // 3. Users active in last 15 minutes (approx "logged in")
         const fifteenMinutesAgo = new Date(Date.now() - 15 * 60 * 1000).toISOString();
         let loggedInUsers = 0;
         const { count: loggedCount, error: loggedErr } = await supabase
@@ -1229,7 +1279,6 @@ app.get('/api/admin/stats', auth, async (req, res) => {
             loggedInUsers = loggedCount || 0;
         }
 
-        // 4. Payments summary
         const { data: payments, error: payErr } = await supabase
             .from('payments')
             .select('amount, currency, tier, status, created_at')
@@ -1242,7 +1291,6 @@ app.get('/api/admin/stats', auth, async (req, res) => {
             revenueByTier[p.tier] = (revenueByTier[p.tier] || 0) + p.amount;
         });
 
-        // 5. Recent payments (last 5)
         const { data: recentPayments, error: recentErr } = await supabase
             .from('payments')
             .select('amount, currency, tier, status, created_at, user_id')
@@ -1251,23 +1299,14 @@ app.get('/api/admin/stats', auth, async (req, res) => {
             .limit(5);
         if (recentErr) throw recentErr;
 
-        // 6. Total code runner unlocks
         const { count: codeRunnerCount, error: codeErr } = await supabase
             .from('users')
             .select('*', { count: 'exact', head: true })
             .eq('code_runner_unlocked', true);
         if (codeErr) throw codeErr;
 
-        // 7. Count free users (added for admin dashboard)
-        const { count: totalFree, error: freeErr } = await supabase
-            .from('users')
-            .select('*', { count: 'exact', head: true })
-            .eq('tier', 'free');
-        if (freeErr) throw freeErr;
-
         res.json({
             totalUsers: totalUsers || 0,
-            totalFree: totalFree || 0,      // <-- now included
             activeUsers: activeUsers || 0,
             loggedInUsers: loggedInUsers || 0,
             totalRevenue: totalRevenue || 0,
@@ -1282,7 +1321,6 @@ app.get('/api/admin/stats', auth, async (req, res) => {
     }
 });
 
-// ---- Admin – list all users (with pagination) ----
 app.get('/api/admin/users', auth, async (req, res) => {
     try {
         const user = req.user;
