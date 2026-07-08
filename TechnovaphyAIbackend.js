@@ -1,13 +1,4 @@
-// ============================================================
-//  TECHNOVAPHY AI – PRODUCTION BACKEND
-//  - AI failover (OpenRouter, valid models only)
-//  - Admin dashboard, last_active tracking
-//  - Static route for admin.html
-//  - Payment integrations: Paystack (auto M‑Pesa), M‑Pesa STK, Airtel Money, manual bank
-//  - ALL USER-FACING ERROR MESSAGES SANITIZED
-//  - Code runner: web languages + Python (Pyodide‑ready, auto‑detect)
-//  - Smart system prompt: Technovaphy AI with company research capability
-// ============================================================
+
 
 require('dotenv').config();
 
@@ -1029,6 +1020,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             if (existing.status === 'completed') return res.json({ alreadyProcessed: true });
             return res.status(409).json({ error: 'A payment is already being processed for this transaction.' });
         }
+        // payment channels
 
         if (!PAYSTACK_SECRET_KEY) return res.status(503).json({ error: 'Payment service is not available at the moment.' });
 
@@ -1038,8 +1030,9 @@ app.post('/api/create-checkout', auth, async (req, res) => {
             body: JSON.stringify({
                 email: user.email,
                 amount: amount,
-                currency: finalCurrency,
-                channels: countryInfo.channels,
+                currency: finalCurrency,channels: countryCode === 'KE'
+                 ? ['card', 'bank_transfer', 'mpesa','Airtel Money]
+            : countryInfo.channels,
                 metadata: { idempotencyKey, tier, userId: user.id, country: countryCode },
                 callback_url: `${FRONTEND_URL}/?success=true&key=${idempotencyKey}`
             })
