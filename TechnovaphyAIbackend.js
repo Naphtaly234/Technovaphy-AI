@@ -5,6 +5,7 @@
 //  - Static route for admin.html
 //  - Payment integrations: Paystack, M‑Pesa, Airtel Money, manual bank
 //  - ALL USER-FACING ERROR MESSAGES SANITIZED
+//  - Code runner: web languages + Python (Pyodide-ready)
 // ============================================================
 
 require('dotenv').config();
@@ -92,38 +93,26 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
     }
 })();
 
-// ---- PAYSTACK WEBHOOK (no changes needed – webhook doesn't talk to user) ----
+// ---- PAYSTACK WEBHOOK ----
 app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), async (req, res) => {
     try {
         const signature = req.headers['x-paystack-signature'];
         if (!signature) return res.sendStatus(401);
-
         const expectedHash = crypto.createHmac('sha512', PAYSTACK_SECRET_KEY).update(req.body).digest('hex');
         if (expectedHash !== signature) return res.sendStatus(401);
-
         const payload = JSON.parse(req.body.toString('utf8'));
         const event = payload.event;
         const data = payload.data;
-
         if (event === 'charge.success') {
             const metadata = data.metadata || {};
             const userId = metadata.userId;
             const idempotencyKey = metadata.idempotencyKey;
             const type = metadata.type;
             const paystackStatus = data.status;
-
             if (paystackStatus !== 'success') return res.sendStatus(200);
-
-            const { data: paymentRecord } = await supabase
-                .from('payments')
-                .select('*')
-                .eq('transaction_id', idempotencyKey)
-                .maybeSingle();
-
+            const { data: paymentRecord } = await supabase.from('payments').select('*').eq('transaction_id', idempotencyKey).maybeSingle();
             if (!paymentRecord || paymentRecord.status === 'completed') return res.sendStatus(200);
-
             await supabase.from('payments').update({ status: 'completed' }).eq('transaction_id', idempotencyKey);
-
             if (userId) {
                 if (type === 'code_runner') {
                     await supabase.from('users').update({ code_runner_unlocked: true }).eq('id', userId);
@@ -178,28 +167,30 @@ const PAYMENT_CHANNELS = {
 };
 
 // ============================================================
-//  SYSTEM PROMPT
+//  SYSTEM PROMPT – TECHNovaphy AI (Smart & Disciplined)
 // ============================================================
 function buildSystemPrompt({ memoryPrompt, languageInstruction }) {
-    return `You are TechNovaphy AI, built for African freelancers and businesses.
+  return `You are TechNovaphy AI, the official, highly intelligent assistant of TechNovaphy Solutions (https://technovaphy-solutions-5nz6.onrender.com). You are precise, disciplined, and thorough. You never hallucinate. You only provide information that you are highly confident about, and you always distinguish fact from opinion or uncertainty. When you don't know something, you clearly say "I don't know" and, if applicable, point the user to authoritative sources or the company's website.
 
-RESPOND WITH THIS FORMAT:
+🔗 COMPANY KNOWLEDGE – TechNovaphy Solutions:
+- Based in Nairobi, Kenya, serving 500+ businesses across East Africa.
+- Core services: Managed IT Operations (99.9% uptime guarantee), Business Software (custom ERPs, automated workflows), Cloud Solutions (data migration, automated backups), 24/7 Technical Support, and Web Development (business websites, e‑commerce, web apps, PWAs, admin dashboards, APIs).
+- Technology stack: HTML5, CSS3, JavaScript, React, TypeScript, Tailwind CSS, Node.js, Express.js, Python, Flask, Java, Spring Boot, PostgreSQL, MySQL, MongoDB, SQL Server, Redis, Firebase, Docker, Render, Vercel, AWS, Cloudflare.
 
-<thinking>
-Brief thoughts on the question.
-</thinking>
-<answer>
-Your response here.
-</answer>
+📋 SUPPORT PLANS (prices in KES):
+- Website Maintenance: Bronze (KSh 10k/mo), Silver (KSh 20k/mo), Gold (KSh 35k/mo).
+- IT Support Plans: Standard IT (KSh 15k/mo), Managed Pro (KSh 50k/mo), Premium Website (one‑time KSh 120k).
+- Free IT Infrastructure Audit (worth KES 50,000) available on the website.
 
-RULES:
-- Match length to the question – short answers for short questions.
-- Be direct. No throat‑clearing ("Great question!").
-- If uncertain, say "I don't know" and suggest where to find accurate info.
-- Never invent facts, statistics, or legal advice.
-- If you give advice, clearly state "This is for informational purposes only."
-- For financial/legal topics, flag uncertainty plainly.
-- For code, provide working examples and explain them.
+When discussing the company, always mention the website: https://technovaphy-solutions-5nz6.onrender.com. For detailed plan features, direct the user there.
+
+🧠 BEHAVIOUR & TONE:
+- Be smart, analytical, and concise. No filler words, no marketing fluff.
+- If the user asks a complex or research‑oriented question, leverage your training data to provide a well‑structured, evidence‑based answer. If appropriate, suggest where the user can verify the information (e.g., official documentation, reputable sites).
+- Always separate your reasoning from the final answer using the <thinking> / <answer> tags.
+- For code, provide clean, working examples and explain them.
+- For legal/financial matters, include a disclaimer: "This is for informational purposes only, not professional advice."
+- If the user's language preference is provided, respond in that language.
 
 ${memoryPrompt}
 ${languageInstruction}`;
@@ -230,7 +221,7 @@ function parseThinkingAndAnswer(rawText) {
 }
 
 // ============================================================
-//  AI FAILOVER CHAIN (OpenRouter) – now with safe error
+//  AI FAILOVER CHAIN (OpenRouter) – with safe error
 // ============================================================
 async function fetchAIResponseWithFailover(messages, userSelectedModel) {
     if (!OPENROUTER_API_KEY) {
@@ -1146,7 +1137,7 @@ app.post('/api/mpesa/stkpush', auth, async (req, res) => {
     }
 });
 
-// ---- M-Pesa Webhook (no user‑facing response needed) ----
+// ---- M-Pesa Webhook ----
 app.post('/api/webhooks/mpesa', express.json(), async (req, res) => {
     try {
         const callback = req.body.Body?.stkCallback;
@@ -1253,7 +1244,7 @@ app.post('/api/airtel/request', auth, async (req, res) => {
         });
         const paymentData = await paymentRes.json();
 
-        if (paymentData.status?.code !== '200') {
+        if (paymentData.status?.code !== '200' && paymentData.status?.code !== 200) {
             console.error('Airtel payment error:', paymentData);
             return res.status(400).json({ error: 'Airtel Money payment request was not successful. Please try again.' });
         }
@@ -1545,7 +1536,7 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CODE EXECUTION – powered by OpenRouter (MiniMax M3)
+//  CODE ANALYSIS – web languages + Python (Pyodide‑ready)
 // ============================================================
 app.post('/api/run-code', auth, async (req, res) => {
     try {
@@ -1559,27 +1550,53 @@ app.post('/api/run-code', auth, async (req, res) => {
         }
 
         const { language, version, code } = req.body;
-        if (!code) { releaseConcurrency(); return res.status(400).json({ error: 'Please provide some code to run.' }); }
+        if (!code) {
+            releaseConcurrency();
+            return res.status(400).json({ error: 'Please provide some code.' });
+        }
 
-        const systemPrompt = `You are MiniMax M3, an expert coding assistant with strong reasoning and critical thinking skills.
+        // ---- Only allow web languages and Python (Pyodide) ----
+        const webLangs = ['html', 'css', 'javascript', 'js', 'typescript', 'ts'];
+        const pythonLangs = ['python', 'py'];
+        const allowedLanguages = [...webLangs, ...pythonLangs];
+        const langNormalized = (language || '').toLowerCase().trim();
+        if (!allowedLanguages.includes(langNormalized)) {
+            releaseConcurrency();
+            return res.status(400).json({ error: 'This editor supports HTML, CSS, JavaScript, TypeScript, and Python.' });
+        }
 
-Analyse the following code snippet and provide:
-1. A brief summary of what the code does.
-2. Any potential issues or bugs.
-3. Suggestions for improvement (optimisation, readability, best practices).
-4. A simulation of the output (if it's a runnable script, explain what it would output when executed).
+        const isPython = pythonLangs.includes(langNormalized);
+        const languageName = isPython ? 'Python' : langNormalized.toUpperCase();
 
-Format your response as a clear, structured explanation – no markdown, just plain text with line breaks.
+        const systemPrompt = isPython
+            ? `You are an expert Python developer. Analyze the following Python code and provide:
+1. A brief explanation of what the code does.
+2. Any potential bugs, logical errors, or best‑practice violations.
+3. Suggestions for improvement (performance, readability, Pythonic style).
+4. If the code would produce output, describe what it would print or return.
 
-LANGUAGE: ${language} (version ${version})
+Be clear and concise. No markdown, just plain text with line breaks.
 
 CODE:
-\`\`\`
+\`\`\`python
 ${code}
-\`\`\`
-`;
+\`\`\``
+            : `You are an expert web development assistant. Analyze the following ${languageName} code snippet and provide:
+1. A brief summary of what the code does.
+2. Any potential issues, bugs, or best‑practice violations.
+3. Suggestions for improvement (performance, accessibility, semantics).
+4. If applicable, describe the expected visual output or behaviour in a browser.
+
+Be clear and concise. No markdown, just plain text with line breaks.
+
+CODE:
+\`\`\`${langNormalized}
+${code}
+\`\`\``;
+
         const messages = [{ role: 'system', content: systemPrompt }];
 
+        // ---- Use a stable model (GPT-4o mini is cheap and always available) ----
         const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
             method: 'POST',
             headers: {
@@ -1588,7 +1605,7 @@ ${code}
                 'HTTP-Referer': 'https://technovaphy.ai'
             },
             body: JSON.stringify({
-                model: 'minimax/minimax-m3-preview',
+                model: 'openai/gpt-4o-mini',
                 messages: messages,
                 temperature: 0.7,
                 stream: true,
@@ -1598,7 +1615,7 @@ ${code}
 
         if (!response.ok) {
             const errText = await response.text();
-            console.error('Code execution OpenRouter error:', errText);
+            console.error('Code analysis API error:', errText);
             throw new Error('Code analysis service is temporarily unavailable.');
         }
 
