@@ -5,7 +5,7 @@
 //  - Static route for admin.html
 //  - Payment integrations: Paystack, M‑Pesa, Airtel Money, manual bank
 //  - ALL USER-FACING ERROR MESSAGES SANITIZED
-//  - Code runner: web languages + Python (Pyodide‑ready)
+//  - Code runner: web languages + Python (Pyodide‑ready, auto‑detect)
 //  - Smart system prompt with company knowledge
 // ============================================================
 
@@ -43,7 +43,7 @@ app.use(cors({
     optionsSuccessStatus: 200
 }));
 
-// ---- Environment checks (only the essential ones) ----
+// ---- Environment checks (only essential) ----
 const required = [
     'SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'JWT_SECRET',
     'OPENROUTER_API_KEY', 'PAYSTACK_SECRET_KEY'
@@ -63,7 +63,7 @@ const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://your-frontend.netlify.app';
 const OWNER_EMAIL = process.env.OWNER_EMAIL || null;
 
-// ---- M‑Pesa config (optional – app still starts if missing) ----
+// ---- M‑Pesa config (optional – app starts without them) ----
 const MPESA_CONSUMER_KEY = process.env.SAFARICOM_CONSUMER_KEY || '';
 const MPESA_CONSUMER_SECRET = process.env.SAFARICOM_CONSUMER_SECRET || '';
 const MPESA_PASSKEY = process.env.SAFARICOM_PASSKEY || '';
@@ -240,6 +240,7 @@ async function fetchAIResponseWithFailover(messages, userSelectedModel) {
         throw err;
     }
 
+    // ---------- Only currently available OpenRouter models ----------
     const modelMap = {
         'openai/gpt-4o-mini': 'openai/gpt-4o-mini',
         'anthropic/claude-haiku-4.5': 'anthropic/claude-haiku-4.5',
@@ -440,7 +441,7 @@ app.get('/admin', (req, res) => {
     res.sendFile(path.join(__dirname, 'admin.html'));
 });
 
-// Test key (admin only – keep safe message)
+// Test key
 app.get('/api/test-key', async (req, res) => {
     try {
         if (!OPENROUTER_API_KEY) {
@@ -947,10 +948,12 @@ app.get('/api/pricing', auth, async (req, res) => {
             interval: 'monthly'
         };
 
-        // tell frontend which direct channels are available (if configured)
+        // Only advertise direct channels if the credentials are set
         const directChannels = [];
-        if (MPESA_CONSUMER_KEY && MPESA_CONSUMER_SECRET) directChannels.push('mpesa');
-        if (AIRTEL_CLIENT_ID && AIRTEL_CLIENT_SECRET) directChannels.push('airtel_money');
+        if (countryCode === 'KE') {
+            if (MPESA_CONSUMER_KEY && MPESA_CONSUMER_SECRET) directChannels.push('mpesa');
+            if (AIRTEL_CLIENT_ID && AIRTEL_CLIENT_SECRET) directChannels.push('airtel_money');
+        }
         directChannels.push('bank_transfer');
 
         res.json({
@@ -1064,7 +1067,7 @@ app.post('/api/create-checkout', auth, async (req, res) => {
 });
 
 // ============================================================
-//  M-PESA DIRECT (SAFARICOM DARAJA) – only if credentials exist
+//  M-PESA DIRECT (SAFARICOM DARAJA) – only if keys are set
 // ============================================================
 app.post('/api/mpesa/stkpush', auth, async (req, res) => {
     if (!MPESA_CONSUMER_KEY || !MPESA_CONSUMER_SECRET) {
@@ -1084,7 +1087,6 @@ app.post('/api/mpesa/stkpush', auth, async (req, res) => {
         }
 
         const auth = Buffer.from(`${MPESA_CONSUMER_KEY}:${MPESA_CONSUMER_SECRET}`).toString('base64');
-        // Use sandbox for testing, change to api.safaricom.co.ke for production
         const tokenRes = await fetch('https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials', {
             headers: { Authorization: `Basic ${auth}` }
         });
@@ -1148,7 +1150,7 @@ app.post('/api/mpesa/stkpush', auth, async (req, res) => {
     }
 });
 
-// ---- M-Pesa Webhook (no change needed) ----
+// ---- M-Pesa Webhook ----
 app.post('/api/webhooks/mpesa', express.json(), async (req, res) => {
     try {
         const callback = req.body.Body?.stkCallback;
@@ -1198,7 +1200,7 @@ app.post('/api/webhooks/mpesa', express.json(), async (req, res) => {
 });
 
 // ============================================================
-//  AIRTEL MONEY DIRECT – only if credentials exist
+//  AIRTEL MONEY DIRECT – only if keys are set
 // ============================================================
 app.post('/api/airtel/request', auth, async (req, res) => {
     if (!AIRTEL_CLIENT_ID || !AIRTEL_CLIENT_SECRET) {
@@ -1550,7 +1552,7 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CODE ANALYSIS – web languages + Python (Pyodide‑ready)
+//  CODE ANALYSIS – web languages + Python (Pyodide‑ready, auto‑detect)
 // ============================================================
 app.post('/api/run-code', auth, async (req, res) => {
     try {
@@ -1569,14 +1571,21 @@ app.post('/api/run-code', auth, async (req, res) => {
             return res.status(400).json({ error: 'Please provide some code.' });
         }
 
-        // ---- Only allow web languages and Python (Pyodide) ----
+        // ---- Smart language detection ----
         const webLangs = ['html', 'css', 'javascript', 'js', 'typescript', 'ts'];
         const pythonLangs = ['python', 'py'];
-        const allowedLanguages = [...webLangs, ...pythonLangs];
-        const langNormalized = (language || '').toLowerCase().trim();
-        if (!allowedLanguages.includes(langNormalized)) {
-            releaseConcurrency();
-            return res.status(400).json({ error: 'This editor supports HTML, CSS, JavaScript, TypeScript, and Python.' });
+        const allAllowed = [...webLangs, ...pythonLangs];
+        let langNormalized = (language || '').toLowerCase().trim();
+
+        // If the frontend didn't send a valid language, try to guess Python
+        if (!allAllowed.includes(langNormalized)) {
+            const looksLikePython = /\b(print|def |import |class |elif |try:|except |from |lambda |__name__)\b/.test(code);
+            if (looksLikePython) {
+                langNormalized = 'python';
+            } else {
+                releaseConcurrency();
+                return res.status(400).json({ error: 'This editor supports HTML, CSS, JavaScript, TypeScript, and Python.' });
+            }
         }
 
         const isPython = pythonLangs.includes(langNormalized);
@@ -1610,7 +1619,7 @@ ${code}
 
         const messages = [{ role: 'system', content: systemPrompt }];
 
-        // ---- Use a stable model (GPT-4o mini is cheap and always available) ----
+        // ---- Stable model (always available) ----
         const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
             method: 'POST',
             headers: {
