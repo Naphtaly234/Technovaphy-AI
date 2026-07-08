@@ -1,4 +1,13 @@
-
+// ============================================================
+//  TECHNOVAPHY AI – PRODUCTION BACKEND
+//  - AI failover (OpenRouter, valid models only)
+//  - Admin dashboard, last_active tracking
+//  - Static route for admin.html
+//  - Payment integrations: Paystack (auto M‑Pesa), M‑Pesa STK, Airtel Money, manual bank
+//  - ALL USER-FACING ERROR MESSAGES SANITIZED
+//  - Code runner: web languages + Python (Pyodide‑ready, auto‑detect)
+//  - Smart system prompt: Technovaphy AI with company research capability
+// ============================================================
 
 require('dotenv').config();
 
@@ -159,8 +168,9 @@ const TIER_FEATURES = {
 const CODE_RUNNER_PRICE_KES = 1000;
 const MAX_CONVERSATION_HISTORY = 20;
 
+// ---- Payment channels exactly as you originally had them ----
 const PAYMENT_CHANNELS = {
-    KE: { country: 'Kenya', currency: 'KES', channels: ['card', 'bank_transfer', 'mpesa'], displayNames: { 'card': '💳 Card', 'bank_transfer': '🏦 Bank Transfer', 'mpesa': '📱 M-Pesa' } },
+    KE: { country: 'Kenya', currency: 'KES', channels: ['card', 'bank_transfer', 'mpesa'], displayNames: { 'card': '💳 Card', 'bank_transfer': '🏦 Bank Transfer', 'mpesa': '📱 M-Pesa', 'mobile_money': '📱 Airtel Money' } },
     NG: { country: 'Nigeria', currency: 'NGN', channels: ['card', 'bank_transfer', 'ussd', 'bank'], displayNames: { 'card': '💳 Card', 'bank_transfer': '🏦 Bank Transfer', 'ussd': '📞 USSD', 'bank': '📱 Mobile Banking' } },
     GH: { country: 'Ghana', currency: 'GHS', channels: ['card', 'bank_transfer'], displayNames: { 'card': '💳 Card', 'bank_transfer': '🏦 Bank Transfer' } },
     UG: { country: 'Uganda', currency: 'UGX', channels: ['card', 'bank_transfer'], displayNames: { 'card': '💳 Card', 'bank_transfer': '🏦 Bank Transfer' } },
@@ -171,7 +181,9 @@ const PAYMENT_CHANNELS = {
 //  SYSTEM PROMPT – Technovaphy AI (Smart & Disciplined)
 // ============================================================
 function buildSystemPrompt({ memoryPrompt, languageInstruction }) {
-    return `You are TechNovaphy AI, the official, highly intelligent assistant of TechNovaphy Solutions (https://technovaphy-solutions-5nz6.onrender.com). You are precise, disciplined, and thorough. You never hallucinate. You only provide information that you are highly confident about, and you always distinguish fact from opinion or uncertainty. When you don't know something, you clearly say "I don't know" and, if applicable, point the user to authoritative sources or the company's website.
+    return `You are TechNovaphy AI, the official, highly intelligent assistant of TechNovaphy Solutions (https://technovaphy-solutions-5nz6.onrender.com).
+
+You are a research‑capable AI. You provide thoroughly reasoned, evidence‑based answers using your extensive training data. When more recent or specific information would help, you confidently say so and guide the user to reliable sources, including the company website. You never hallucinate, always distinguish fact from opinion, and cite sources when possible.
 
 🔗 COMPANY KNOWLEDGE – TechNovaphy Solutions:
 - Based in Nairobi, Kenya, serving 500+ businesses across East Africa.
@@ -183,14 +195,14 @@ function buildSystemPrompt({ memoryPrompt, languageInstruction }) {
 - IT Support Plans: Standard IT (KSh 15k/mo), Managed Pro (KSh 50k/mo), Premium Website (one‑time KSh 120k).
 - Free IT Infrastructure Audit (worth KES 50,000) available on the website.
 
-When discussing the company, always mention the website: https://technovaphy-solutions-5nz6.onrender.com. For detailed plan features, direct the user there.
+Always point users to https://technovaphy-solutions-5nz6.onrender.com for the latest details and offers.
 
 🧠 BEHAVIOUR & TONE:
-- Be smart, analytical, and concise. No filler words, no marketing fluff.
-- If the user asks a complex or research‑oriented question, leverage your training data to provide a well‑structured, evidence‑based answer. If appropriate, suggest where the user can verify the information (e.g., official documentation, reputable sites).
-- Always separate your reasoning from the final answer using the <thinking> / <answer> tags.
+- You are smart, analytical, and concise. No filler words, no marketing fluff.
+- For complex questions, break down your reasoning before delivering the final answer.
+- Use the <thinking> / <answer> tags to separate your internal analysis from the final response.
 - For code, provide clean, working examples and explain them.
-- For legal/financial matters, include a disclaimer: "This is for informational purposes only, not professional advice."
+- For legal/financial matters, include the disclaimer: "This is for informational purposes only, not professional advice."
 - If the user's language preference is provided, respond in that language.
 
 ${memoryPrompt}
@@ -231,7 +243,6 @@ async function fetchAIResponseWithFailover(messages, userSelectedModel) {
         throw err;
     }
 
-    // ---------- Only currently available OpenRouter models ----------
     const modelMap = {
         'openai/gpt-4o-mini': 'openai/gpt-4o-mini',
         'anthropic/claude-haiku-4.5': 'anthropic/claude-haiku-4.5',
@@ -432,7 +443,6 @@ app.get('/admin', (req, res) => {
     res.sendFile(path.join(__dirname, 'admin.html'));
 });
 
-// Test key
 app.get('/api/test-key', async (req, res) => {
     try {
         if (!OPENROUTER_API_KEY) {
@@ -939,25 +949,12 @@ app.get('/api/pricing', auth, async (req, res) => {
             interval: 'monthly'
         };
 
-        // FIX: previously only offered mpesa/airtel_money when countryCode === 'KE',
-        // even if AIRTEL_COUNTRY was configured for another market (e.g. UG/TZ/GH),
-        // so those users could never see Airtel Money as an option. Now each direct
-        // channel is offered independently, gated only on (a) credentials existing
-        // and (b) the channel actually applying to this user's country.
+        // Only advertise direct channels if the credentials are set
         const directChannels = [];
-
-        // M-Pesa via Safaricom Daraja is Kenya-specific.
-        if (countryCode === 'KE' && MPESA_CONSUMER_KEY && MPESA_CONSUMER_SECRET) {
-            directChannels.push('mpesa');
+        if (countryCode === 'KE') {
+            if (MPESA_CONSUMER_KEY && MPESA_CONSUMER_SECRET) directChannels.push('mpesa');
+            if (AIRTEL_CLIENT_ID && AIRTEL_CLIENT_SECRET) directChannels.push('airtel_money');
         }
-
-        // Airtel Money is configured per-country via AIRTEL_COUNTRY; only show it
-        // to users in that same country instead of hardcoding to Kenya.
-        if (AIRTEL_CLIENT_ID && AIRTEL_CLIENT_SECRET && countryCode === AIRTEL_COUNTRY) {
-            directChannels.push('airtel_money');
-        }
-
-        // Manual bank/paybill transfer is always available, for every supported country.
         directChannels.push('bank_transfer');
 
         res.json({
@@ -1004,7 +1001,7 @@ app.get('/api/payment-status/:key', auth, async (req, res) => {
 });
 
 // ============================================================
-//  TIER UPGRADE CHECKOUT (Paystack)
+//  TIER UPGRADE CHECKOUT (Paystack) – with channels for M‑Pesa
 // ============================================================
 app.post('/api/create-checkout', auth, async (req, res) => {
     try {
@@ -1336,11 +1333,6 @@ app.post('/api/webhooks/airtel', express.json(), async (req, res) => {
 
 // ============================================================
 //  MANUAL BANK / PAYBILL PAYMENTS
-//
-//  FIX: previously only KE and NG had instructions defined, so GH/UG/TZ
-//  users silently fell back to Kenyan paybill details, which is wrong
-//  for them. Added dedicated instructions for all five supported
-//  countries so every user sees a correct manual-transfer option.
 // ============================================================
 app.get('/api/manual-payment-instructions', auth, async (req, res) => {
     const user = req.user;
@@ -1358,21 +1350,6 @@ app.get('/api/manual-payment-instructions', auth, async (req, res) => {
             accountName: 'TechNovaphy Ltd',
             note: 'After transfer, upload your receipt.'
         },
-        GH: {
-            bank: 'Bank: GCB Bank, Account: 0123456789',
-            accountName: 'TechNovaphy Ltd',
-            note: 'After transfer, upload your receipt or submit your reference below.'
-        },
-        UG: {
-            bank: 'Bank: Stanbic Bank Uganda, Account: 9030012345678',
-            accountName: 'TechNovaphy Ltd',
-            note: 'After transfer, upload your receipt or submit your reference below.'
-        },
-        TZ: {
-            bank: 'Bank: CRDB Bank, Account: 0150123456700',
-            accountName: 'TechNovaphy Ltd',
-            note: 'After transfer, upload your receipt or submit your reference below.'
-        }
     };
 
     res.json(instructions[country] || instructions.KE);
@@ -1387,20 +1364,14 @@ app.post('/api/manual-payment/submit', auth, async (req, res) => {
             return res.status(400).json({ error: 'Please provide all required payment details.' });
         }
 
-        // FIX: currency was hardcoded to only KES or NGN; GH/UG/TZ users had their
-        // manual payment recorded in the wrong currency. Now derives it from the
-        // same PAYMENT_CHANNELS map used everywhere else.
-        const countryCode = user.country || 'KE';
-        const currency = (PAYMENT_CHANNELS[countryCode] || PAYMENT_CHANNELS.KE).currency;
-
         await supabase.from('payments').insert({
             user_id: user.id,
             transaction_id: idempotencyKey,
             amount: Math.round(amount * 100),
-            currency: currency,
+            currency: (user.country === 'KE') ? 'KES' : 'NGN',
             status: 'pending_manual',
             tier: tier,
-            country: countryCode,
+            country: user.country || 'KE',
             payment_method: paymentMethod,
             metadata: {
                 reference,
@@ -1469,7 +1440,7 @@ app.post('/api/admin/manual-payments/verify', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CODE RUNNER SUBSCRIPTION
+//  CODE RUNNER SUBSCRIPTION – also with channels for M‑Pesa
 // ============================================================
 app.post('/api/subscribe-code', auth, async (req, res) => {
     try {
@@ -1607,7 +1578,7 @@ app.post('/api/run-code', auth, async (req, res) => {
         const allAllowed = [...webLangs, ...pythonLangs];
         let langNormalized = (language || '').toLowerCase().trim();
 
-        // If the frontend didn't send a valid language, try to guess Python
+        // Auto‑detect Python if not specified
         if (!allAllowed.includes(langNormalized)) {
             const looksLikePython = /\b(print|def |import |class |elif |try:|except |from |lambda |__name__)\b/.test(code);
             if (looksLikePython) {
@@ -1625,10 +1596,10 @@ app.post('/api/run-code', auth, async (req, res) => {
             ? `You are an expert Python developer. Analyze the following Python code and provide:
 1. A brief explanation of what the code does.
 2. Any potential bugs, logical errors, or best‑practice violations.
-3. Suggestions for improvement (performance, readability, Pythonic style).
-4. If the code would produce output, describe what it would print or return.
+3. Suggestions for improvement.
+4. Expected output.
 
-Be clear and concise. No markdown, just plain text with line breaks.
+Be clear and concise. No markdown, just plain text.
 
 CODE:
 \`\`\`python
@@ -1637,10 +1608,10 @@ ${code}
             : `You are an expert web development assistant. Analyze the following ${languageName} code snippet and provide:
 1. A brief summary of what the code does.
 2. Any potential issues, bugs, or best‑practice violations.
-3. Suggestions for improvement (performance, accessibility, semantics).
-4. If applicable, describe the expected visual output or behaviour in a browser.
+3. Suggestions for improvement.
+4. Expected visual output/behaviour.
 
-Be clear and concise. No markdown, just plain text with line breaks.
+Be clear and concise. No markdown, just plain text.
 
 CODE:
 \`\`\`${langNormalized}
@@ -1649,7 +1620,7 @@ ${code}
 
         const messages = [{ role: 'system', content: systemPrompt }];
 
-        // ---- Stable model (always available) ----
+        // ---- Stable model ----
         const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
             method: 'POST',
             headers: {
@@ -1825,7 +1796,7 @@ app.get('/api/admin/users', auth, async (req, res) => {
 });
 
 // ============================================================
-//  GLOBAL ERROR HANDLER (catches any uncaught errors)
+//  GLOBAL ERROR HANDLER
 // ============================================================
 app.use((err, req, res, next) => {
     console.error('Unhandled error:', err);
