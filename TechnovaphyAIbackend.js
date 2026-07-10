@@ -1,4 +1,3 @@
-
 require('dotenv').config();
 
 const express = require('express');
@@ -33,7 +32,7 @@ app.use(cors({
     optionsSuccessStatus: 200
 }));
 
-// ---- Environment checks (only the absolute essentials) ----
+// ---- Environment checks ----
 const required = [
     'SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'JWT_SECRET',
     'OPENROUTER_API_KEY', 'PAYSTACK_SECRET_KEY'
@@ -65,6 +64,44 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
         console.warn('⚠️ Could not connect to Supabase:', e.message);
     }
 })();
+
+// ============================================================
+//  GLOBAL RESET (safety net – every 4 hours)
+// ============================================================
+const RESET_INTERVAL = 4 * 60 * 60 * 1000; // 4 hours
+
+async function resetFreeTierUsage() {
+    try {
+        const now = new Date();
+        const nextReset = new Date(now.getTime() + RESET_INTERVAL);
+        const nextResetISO = nextReset.toISOString();
+
+        const { data, error } = await supabase
+            .from('users')
+            .update({
+                usage_count: 0,
+                monthly_reset_date: nextResetISO
+            })
+            .eq('tier', 'free')
+            .select('email');
+
+        if (error) {
+            console.error('❌ Reset free tier usage failed:', error.message);
+            return;
+        }
+
+        console.log(`✅ Reset usage for ${data?.length || 0} free users. Next reset at ${nextResetISO}`);
+    } catch (err) {
+        console.error('❌ Unexpected error in resetFreeTierUsage:', err.message);
+    }
+}
+
+// Run once on startup
+resetFreeTierUsage();
+
+// Schedule every 4 hours
+setInterval(resetFreeTierUsage, RESET_INTERVAL);
+console.log(`⏰ Free tier usage will reset every ${RESET_INTERVAL / 60000} minutes.`);
 
 // ---- PAYSTACK WEBHOOK ----
 app.post('/api/webhooks/paystack', express.raw({ type: 'application/json' }), async (req, res) => {
@@ -122,7 +159,7 @@ const TIER_PRICES_KES = { starter: 200, pro: 1700, enterprise: 17000, ultimate: 
 const TIER_LIMITS = { free: 200, starter: 200, pro: 2500, enterprise: Infinity, ultimate: 1000000 };
 const TIER_NAMES = { free: 'Free', starter: 'Starter', pro: 'Pro', enterprise: 'Enterprise', ultimate: 'Ultimate' };
 const TIER_FEATURES = {
-    free: ['200 messages / month', 'Standard models', 'Community support'],
+    free: ['200 messages / 4 hours', 'Standard models', 'Community support'],
     starter: ['200 messages / month', 'Priority queueing', 'Email support'],
     pro: ['2,500 messages / month', 'All AI models', 'Priority support'],
     enterprise: ['Unlimited messages', 'All AI models', 'Dedicated support'],
@@ -131,7 +168,7 @@ const TIER_FEATURES = {
 const CODE_RUNNER_PRICE_KES = 1000;
 const MAX_CONVERSATION_HISTORY = 20;
 
-// ---- Payment channels declared simply, just like bank and PesaLink ----
+// ---- Payment channels ----
 const PAYMENT_CHANNELS = {
     KE: {
         country: 'Kenya',
@@ -180,7 +217,7 @@ const PAYMENT_CHANNELS = {
 };
 
 // ============================================================
-//  SYSTEM PROMPT – Technovaphy AI (Smart & Disciplined)
+//  SYSTEM PROMPT (full version – keep as you have)
 // ============================================================
 function buildSystemPrompt({ memoryPrompt, languageInstruction }) {
     return `TechNovaphy AI Assistant - System Prompt
@@ -521,7 +558,7 @@ function parseThinkingAndAnswer(rawText) {
 }
 
 // ============================================================
-//  AI FAILOVER CHAIN (OpenRouter) – valid models only
+//  AI FAILOVER CHAIN (OpenRouter)
 // ============================================================
 async function fetchAIResponseWithFailover(messages, userSelectedModel) {
     if (!OPENROUTER_API_KEY) {
@@ -598,7 +635,7 @@ async function fetchAIResponseWithFailover(messages, userSelectedModel) {
 }
 
 // ============================================================
-//  HELPERS (sanitized)
+//  HELPERS
 // ============================================================
 async function findUser(email) {
     const { data, error } = await supabase.from('users').select('*').eq('email', email).maybeSingle();
@@ -637,7 +674,7 @@ async function saveConversation(userId, messages) {
     }
 }
 
-// ---- Rate limiting (Redis or memory) ----
+// ---- Rate limiting ----
 const inMemoryRate = new Map();
 const RATE_LIMIT_WINDOW = 60 * 1000;
 const RATE_LIMIT_MAX = 10;
@@ -700,7 +737,7 @@ function releaseConcurrency() {
 }
 
 // ============================================================
-//  AUTH MIDDLEWARE (updates last_active)
+//  AUTH MIDDLEWARE
 // ============================================================
 const auth = async (req, res, next) => {
     const authHeader = req.headers.authorization;
@@ -763,15 +800,15 @@ app.post('/api/auth/register', async (req, res) => {
 
         const hashed = await bcrypt.hash(password, 10);
         const now = new Date();
-        const nextMonth = new Date(now);
-        nextMonth.setMonth(nextMonth.getMonth() + 1);
+        const nextReset = new Date(now.getTime() + RESET_INTERVAL);
+        const nextResetISO = nextReset.toISOString();
 
         const { data, error } = await supabase.from('users').insert({
             email,
             password_hash: hashed,
             tier: 'free',
             usage_count: 0,
-            monthly_reset_date: nextMonth.toISOString().split('T')[0],
+            monthly_reset_date: nextResetISO,
             verified: true,
             free_session_start: now.toISOString(),
             memory: '',
@@ -831,7 +868,8 @@ app.get('/api/user/profile', auth, async (req, res) => {
             verified: true,
             country: user.country || 'KE',
             code_runner_unlocked: isOwner ? true : (user.code_runner_unlocked || false),
-            is_owner: isOwner
+            is_owner: isOwner,
+            reset_date: user.monthly_reset_date // so frontend can show next reset time
         });
     } catch (err) {
         console.error('Profile error:', err);
@@ -1053,12 +1091,41 @@ app.delete('/api/projects/:id', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CHAT STREAM (with failover and safe user messages)
+//  CHAT STREAM (with per‑user 4‑hour reset)
 // ============================================================
 app.post('/api/chat/stream', auth, async (req, res) => {
     try {
         const user = req.user;
         const isOwner = (OWNER_EMAIL && user.email === OWNER_EMAIL);
+
+        // ---- PER-USER 4-HOUR RESET FOR FREE USERS ----
+        if (user.tier === 'free' && !isOwner) {
+            const now = new Date();
+            const resetDate = new Date(user.monthly_reset_date);
+            if (now > resetDate) {
+                // Reset usage and update reset date to now + 4 hours
+                const newReset = new Date(now.getTime() + RESET_INTERVAL);
+                const { error } = await supabase
+                    .from('users')
+                    .update({
+                        usage_count: 0,
+                        monthly_reset_date: newReset.toISOString()
+                    })
+                    .eq('id', user.id);
+                if (error) {
+                    console.error('Per-user reset error:', error);
+                    // Continue with old usage if reset fails
+                } else {
+                    // Refresh user object
+                    const updated = await findUserById(user.id);
+                    if (updated) {
+                        req.user = updated;
+                        user.usage_count = updated.usage_count;
+                        user.monthly_reset_date = updated.monthly_reset_date;
+                    }
+                }
+            }
+        }
 
         if (!isOwner) await acquireConcurrency();
         if (!isOwner && !await checkRateLimit(user.id)) {
@@ -1068,7 +1135,7 @@ app.post('/api/chat/stream', auth, async (req, res) => {
         const monthlyLimit = getLimit(user.tier);
         if (!isOwner && user.usage_count >= monthlyLimit) {
             releaseConcurrency();
-            return res.status(403).json({ error: 'You have reached your monthly message limit.' });
+            return res.status(403).json({ error: 'You have reached your message limit. It will reset automatically in a few hours.' });
         }
 
         let conversation = await getConversation(user.id);
@@ -1279,7 +1346,7 @@ app.get('/api/payment-status/:key', auth, async (req, res) => {
 });
 
 // ============================================================
-//  TIER UPGRADE CHECKOUT (Paystack – channels sent explicitly)
+//  TIER UPGRADE CHECKOUT (Paystack)
 // ============================================================
 app.post('/api/create-checkout', auth, async (req, res) => {
     try {
@@ -1310,7 +1377,6 @@ app.post('/api/create-checkout', auth, async (req, res) => {
 
         if (!PAYSTACK_SECRET_KEY) return res.status(503).json({ error: 'Payment service is not available at the moment.' });
 
-        // ---- Build channels from displayNames (just like bank and PesaLink) ----
         let channels = ['card', 'bank_transfer'];
         if (countryInfo.displayNames) {
             for (const ch of Object.keys(countryInfo.displayNames)) {
@@ -1422,7 +1488,6 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
             }
         }
 
-        // ---- Build channels from displayNames ----
         let channels = ['card', 'bank_transfer'];
         if (countryInfo.displayNames) {
             for (const ch of Object.keys(countryInfo.displayNames)) {
@@ -1476,7 +1541,7 @@ app.post('/api/subscribe-code', auth, async (req, res) => {
 });
 
 // ============================================================
-//  CODE ANALYSIS – web languages + Python (Pyodide‑ready, auto‑detect)
+//  CODE ANALYSIS – web languages + Python (auto‑detect)
 // ============================================================
 app.post('/api/run-code', auth, async (req, res) => {
     try {
@@ -1678,8 +1743,15 @@ app.get('/api/admin/stats', auth, async (req, res) => {
             .eq('code_runner_unlocked', true);
         if (codeErr) throw codeErr;
 
+        const { count: totalFree, error: freeErr } = await supabase
+            .from('users')
+            .select('*', { count: 'exact', head: true })
+            .eq('tier', 'free');
+        if (freeErr) throw freeErr;
+
         res.json({
             totalUsers: totalUsers || 0,
+            totalFree: totalFree || 0,
             activeUsers: activeUsers || 0,
             loggedInUsers: loggedInUsers || 0,
             totalRevenue: totalRevenue || 0,
@@ -1715,8 +1787,23 @@ app.get('/api/admin/users', auth, async (req, res) => {
     }
 });
 
+// ---- Admin: manual reset trigger ----
+app.post('/api/admin/reset-free', auth, async (req, res) => {
+    try {
+        const user = req.user;
+        const isOwner = (OWNER_EMAIL && user.email === OWNER_EMAIL);
+        if (!isOwner) return res.status(403).json({ error: 'Administrator access required.' });
+
+        await resetFreeTierUsage();
+        res.json({ message: 'Free tier usage reset triggered successfully.' });
+    } catch (err) {
+        console.error('Manual reset error:', err);
+        res.status(500).json({ error: 'Failed to reset free tier usage.' });
+    }
+});
+
 // ============================================================
-//  GLOBAL ERROR HANDLER (catches any uncaught errors)
+//  GLOBAL ERROR HANDLER
 // ============================================================
 app.use((err, req, res, next) => {
     console.error('Unhandled error:', err);
